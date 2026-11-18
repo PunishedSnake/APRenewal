@@ -159,6 +159,16 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
 - Menu: Video (sub-tabs Image/Colour/Effects/Shadows & AO/View/HDR), Audio, Game, Diagnostics, Miscellaneous.
 - User (0.11.0 log): both final blends + shadows recognised and used; logged shadow offsets ×1.000
   (Softness at 100) → "difference not noticeable".
+- 0.13.0: soft shadows = generated replacement of the shadow projection (kShadowBodyHLSL: depth from
+  scene alpha, ScreenToShadowMatrix as float4[4] column-major → dot per register, Vogel disc NTAPS
+  rotated by IGN(VPOS), HW = tex2Dproj compare, else tex2Dlod compare; MODSHADOW/ATTEN/SPOT/CUBE/
+  CLAMPUV from the CTAB). Built lazily in PreDraw per [hw][quality]; HW decided by the bound texture's
+  format; re-bound with o_SetPS before every draw. Beast area / non-mod branching keep the game's.
+  Character lighting: material shaders with c_SHCoefficients_A*/B*/Cc (AP irradiance volumes, D3DX SH
+  layout, base pass) and Upper/LowerSkyColor — constants scaled per draw (even = directional ×(1−e),
+  fill = constant ×(1+f)). 2687 SH + 8786 sky shaders in RefShaderCache.
+  Census: Diagnostics button → next frame's PS list (ptr, FNV hash of bytecode, draws, CTAB names).
+  Glass: material CTABs only have generic names (UniformVector_N, Texture2D_N) — needs census + hash.
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 

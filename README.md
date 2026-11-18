@@ -1,4 +1,4 @@
-# APRenewal 0.12.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.13.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,18 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.13.0
+- **Soft shadows** (Video → Lighting & shadows, `[Shadows] Filter/Radius`). The game's shadow
+  projection is rebuilt with a rotated 16/32/48-sample disc filter (hardware PCF per sample when the
+  shadow map is a depth texture), so shadow edges are smooth instead of grainy. Radius slider sets
+  how soft. Built on first use per light type; failures fall back to the game's filter (log: `shaders:`).
+- **Character lighting** (`[Lighting]`). Characters and moving objects are lit from Obsidian's baked
+  light probes (spherical harmonics) plus a sky term. When a probe misses a lamp, Mike's front goes
+  dark. *Even out lighting* removes part of the directional term (dark side lifted), *Fill light*
+  adds ambient. Off by default.
+- **Shader census** (Diagnostics): logs every pixel shader one frame uses, with draw counts, a hash
+  and its constant names — the tool for finding specific materials (glass) to patch next.
 
 ## New in 0.12.0
 **New menu layout:** Video (Image, Colour, Effects, Shadows & AO, View, HDR), Audio, Game,

@@ -137,7 +137,11 @@ struct Config {
     int  fogDensity    = 100;
     int  motionBlur    = 100;
     int  edgeAA        = 100; // the game's directional edge blur (inside its motion blur pass)
-    int  gameSharpen   = 100; // the game's unsharp mask (same pass)   // HDR on native Windows (never got above SDR white there)
+    int  gameSharpen   = 100; // the game's unsharp mask (same pass)
+    int  shadowFilter  = 2;   // 0 game's PCF, 1 soft (16 taps), 2 softer (32), 3 smoothest (48)
+    int  shadowRadius  = 25;  // soft filter radius in 1/10 texels of the game's 2048 map
+    int  charEven      = 0;   // % flattening of the character/dynamic-object lighting (dark side lifted)
+    int  charFill      = 0;   // % extra ambient on characters/dynamic objects   // HDR on native Windows (never got above SDR white there)
     int  hdrPaper      = 200;   // nits for UI / SDR white
     int  hdrPeak       = 0;     // nits, 0 = what the display reports
     int  hdrHighlights = 100;   // percent highlight expansion
@@ -238,6 +242,11 @@ static void LoadConfig()
     cfg.motionBlur    = GetPrivateProfileIntA("Effects", "MotionBlur", 100, g_ini);
     cfg.edgeAA        = GetPrivateProfileIntA("Effects", "GameEdgeAA", 100, g_ini);
     cfg.gameSharpen   = GetPrivateProfileIntA("Effects", "GameSharpen", 100, g_ini);
+    cfg.shadowFilter  = GetPrivateProfileIntA("Shadows", "Filter", 2, g_ini);
+    if (cfg.shadowFilter < 0 || cfg.shadowFilter > 3) cfg.shadowFilter = 2;
+    cfg.shadowRadius  = GetPrivateProfileIntA("Shadows", "Radius", 25, g_ini);
+    cfg.charEven      = GetPrivateProfileIntA("Lighting", "CharacterEven", 0, g_ini);
+    cfg.charFill      = GetPrivateProfileIntA("Lighting", "CharacterFill", 0, g_ini);
     cfg.hdrPaper      = GetPrivateProfileIntA("HDR", "PaperWhite", 0, g_ini);   // 0 = Windows' SDR content brightness
     cfg.hdrCurve      = GetPrivateProfileIntA("HDR", "Curve", 0, g_ini) ? 1 : 0;
     cfg.hdrCompensate = GetPrivateProfileIntA("HDR", "CompensateSRGB", 0, g_ini) ? 1 : 0;
@@ -2673,7 +2682,7 @@ static const CtabConst* CtabFind(const std::vector<CtabConst>& v, const char* na
     return nullptr;
 }
 
-enum { SK_BLEND_BLOOM = 1, SK_BLEND_DOF = 2, SK_SHADOW = 3, SK_FOG = 4, SK_MBLUR = 5, SK_BLOOMGATHER = 6, SK_COUNT = 7 };
+enum { SK_BLEND_BLOOM = 1, SK_BLEND_DOF = 2, SK_SHADOW = 3, SK_FOG = 4, SK_MBLUR = 5, SK_BLOOMGATHER = 6, SK_CHARLIGHT = 7, SK_COUNT = 8 };
 struct GameShader {
     int kind = 0;
     IDirect3DPixelShader9* repl = nullptr;   // our replacement (blend shaders)
@@ -2684,6 +2693,15 @@ struct GameShader {
     int fogScaleReg = -1;
     int velStaticReg = -1, velDynReg = -1, edgeTableReg = -1, unsharpReg = -1;
     int bloomThrReg = -1;
+    // shadows: our soft filter, built on first use ([hardware PCF?][quality 1..3])
+    std::vector<CtabConst> ct;
+    IDirect3DPixelShader9* soft[2][4] = {};
+    bool softTried[2][4] = {};
+    int shadowTexReg = -1;
+    bool softOk = false;                     // a variant we understand (modulated or plain uniform)
+    // character / dynamic object lighting
+    int shReg[7] = { -1, -1, -1, -1, -1, -1, -1 };   // c_SHCoefficients_Ar Ag Ab Br Bg Bb Cc
+    int skyUpReg = -1, skyLoReg = -1, ambReg = -1;
     int uses = 0;
 };
 static std::unordered_map<IDirect3DPixelShader9*, GameShader> g_gameShaders;
@@ -2803,7 +2821,7 @@ void main(float2 UV : TEXCOORD0, float2 SceneUV : TEXCOORD1, out float4 OutColor
 )HLSL";
 
 static IDirect3DPixelShader9* BuildReplacement(IDirect3DDevice9* dev, const std::vector<CtabConst>& ct, const char* body,
-                                               int& paramReg, const char* name)
+                                               int& paramReg, const char* name, const char* common = nullptr, const char* defines = nullptr)
 {
     std::string src;
     int maxC = -1;
@@ -2821,7 +2839,8 @@ static IDirect3DPixelShader9* BuildReplacement(IDirect3DDevice9* dev, const std:
     snprintf(line, sizeof line, "float4 apTM : register(c%d);\nfloat4 apTM2 : register(c%d);\nfloat4 apTM3 : register(c%d);\n",
              paramReg, paramReg + 1, paramReg + 2);
     src += line;
-    src += kBlendCommonHLSL;
+    if (defines) src = std::string(defines) + src;
+    src += common ? common : kBlendCommonHLSL;
     src += body;
     void* code = CompileBlob(src.c_str(), "ps_3_0", name);
     if (!code) return nullptr;
@@ -2829,7 +2848,7 @@ static IDirect3DPixelShader9* BuildReplacement(IDirect3DDevice9* dev, const std:
     std::vector<CtabConst> mine;
     ParseCtab((const DWORD*)BufPtr(code), mine);
     for (auto& k : mine) {
-        if (k.name == "apTM" || k.name == "apTM2" || k.name == "apTM3") {
+        if ((k.name == "apTM" || k.name == "apTM2" || k.name == "apTM3") && !CtabFind(ct, k.name.c_str())) {
             const int want = paramReg + (k.name == "apTM" ? 0 : k.name == "apTM2" ? 1 : 2);
             if (k.reg != want) { Log("shaders: %s parameter register moved - keeping the game's shader", name); BufRelease(code); return nullptr; }
             continue;
@@ -2846,6 +2865,113 @@ static IDirect3DPixelShader9* BuildReplacement(IDirect3DDevice9* dev, const std:
     g_ownShaderCreate = false;
     BufRelease(code);
     return SUCCEEDED(hr) ? ps : nullptr;
+}
+
+// Soft shadows: the game's shadow projection with its PCF replaced by a rotated Vogel-disc filter.
+// Each tap is hardware PCF (bilinear depth compare) when the shadow map is a depth texture.
+// Defines (set per shader): HW, NTAPS, MODSHADOW, ATTEN, SPOT, CUBE (coverage^3 like the branching
+// variants), CLAMPUV. apTM.x = radius in shadow-map UV.
+static const char* kShadowCommonHLSL = R"HLSL(
+float apIGN(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
+float4 apMul(float4 v, float4 m0, float4 m1, float4 m2, float4 m3) { return float4(dot(v, m0), dot(v, m1), dot(v, m2), dot(v, m3)); }
+float apTap(float2 uv, float z)
+{
+#if CLAMPUV
+    uv = clamp(uv, apTextureCoordsClampParameter.xy, apTextureCoordsClampParameter.zw);
+#endif
+#if HW
+    return tex2Dproj(ShadowDepthTexture, float4(uv, z, 1)).r;
+#else
+    return z < tex2Dlod(ShadowDepthTexture, float4(uv, 0, 0)).r ? 1.0 : 0.0;
+#endif
+}
+)HLSL";
+static const char* kShadowBodyHLSL = R"HLSL(
+void main(float4 ScreenPosition : TEXCOORD0, float2 vp : VPOS, out float4 OutColor : COLOR0)
+{
+    float2 suv = ScreenPosition.xy / ScreenPosition.w * ScreenPositionScaleBias.xy + ScreenPositionScaleBias.wz;
+    float W = tex2D(SceneColorTexture, suv).a;                       // depth lives in scene alpha
+    float4 p = float4(ScreenPosition.xy / ScreenPosition.w * W, W, 1);
+    float4 sp = apMul(p, ScreenToShadowMatrix[0], ScreenToShadowMatrix[1], ScreenToShadowMatrix[2], ScreenToShadowMatrix[3]);
+    sp.xy /= sp.w;
+    sp.z = min(sp.z, 0.999);
+    float rot = apIGN(vp) * 6.2831853;
+    float sum = 0;
+    [unroll] for (int i = 0; i < NTAPS; i++) {
+        float r = sqrt((i + 0.5) / NTAPS);
+        float s, c;
+        sincos(i * 2.3999632 + rot, s, c);
+        sum += apTap(sp.xy + float2(c, s) * (r * apTM.x), sp.z);
+    }
+    float cov = sum / NTAPS;
+#if CUBE
+    cov = cov * cov * cov;
+#else
+    cov = cov * cov;
+#endif
+#if MODSHADOW
+    float att = 1;
+#if ATTEN
+    float4 wp = apMul(p, ScreenToWorld[0], ScreenToWorld[1], ScreenToWorld[2], ScreenToWorld[3]);
+    float4 lv = float4(LightPosition.xyz - wp.xyz, 0) * LightPosition.w;
+    float d = max(0, length(lv) * FalloffParameters.y + FalloffParameters.z);
+    att = pow(saturate(1 - d * d), FalloffParameters.x);
+#if SPOT
+    float sa = saturate((dot(normalize(lv.xyz), -SpotDirection.xyz) - SpotAngles.x) * SpotAngles.y);
+    att *= sa * sa;
+#endif
+#endif
+    float4 shadowed = lerp(float4(1, 1, 1, 1), ShadowModulateColor, att);
+    OutColor = lerp(shadowed, float4(1, 1, 1, 1), cov);
+#else
+    OutColor = cov;
+#endif
+}
+)HLSL";
+
+static IDirect3DPixelShader9* BuildSoftShadow(IDirect3DDevice9* dev, GameShader& gs, bool hw, int q)
+{
+    static const int taps[4] = { 0, 16, 32, 48 };
+    const auto& ct = gs.ct;
+    char defs[320];
+    snprintf(defs, sizeof defs,
+             "#define HW %d\n#define NTAPS %d\n#define MODSHADOW %d\n#define ATTEN %d\n#define SPOT %d\n#define CUBE %d\n#define CLAMPUV %d\n",
+             hw ? 1 : 0, taps[q], CtabFind(ct, "ShadowModulateColor") ? 1 : 0,
+             (CtabFind(ct, "LightPosition") && CtabFind(ct, "ScreenToWorld") && CtabFind(ct, "FalloffParameters")) ? 1 : 0,
+             (CtabFind(ct, "SpotDirection") && CtabFind(ct, "SpotAngles")) ? 1 : 0,
+             CtabFind(ct, "EdgeSampleOffsets") ? 1 : 0, CtabFind(ct, "apTextureCoordsClampParameter") ? 1 : 0);
+    char name[64]; snprintf(name, sizeof name, "soft shadow (%s, %d taps)", hw ? "hardware PCF" : "manual", taps[q]);
+    int reg = -1;
+    IDirect3DPixelShader9* ps = BuildReplacement(dev, ct, kShadowBodyHLSL, reg, name, kShadowCommonHLSL, defs);
+    if (ps && reg != gs.paramReg) gs.paramReg = reg;
+    Log("shaders: %s %s", name, ps ? "built" : "FAILED - game's filter kept for this light");
+    return ps;
+}
+
+// Shader census: one frame's pixel shaders with draw counts and constant names (Diagnostics).
+static volatile bool g_censusArm = false;
+static bool g_censusOn = false;
+static IDirect3DPixelShader9* g_curGamePS = nullptr;
+static std::unordered_map<IDirect3DPixelShader9*, int> g_census;
+static void CensusDump()
+{
+    Log("census: %u pixel shaders drew this frame", (unsigned)g_census.size());
+    for (auto& e : g_census) {
+        UINT sz = 0;
+        if (FAILED(e.first->GetFunction(nullptr, &sz)) || !sz || sz > (1u << 20)) continue;
+        std::vector<DWORD> code(sz / 4 + 1);
+        if (FAILED(e.first->GetFunction(code.data(), &sz))) continue;
+        uint32_t h = 2166136261u;
+        for (UINT i = 0; i < sz; i++) { h ^= ((const BYTE*)code.data())[i]; h *= 16777619u; }
+        std::vector<CtabConst> ct;
+        ParseCtab(code.data(), ct);
+        std::string names;
+        for (auto& k : ct) { if (names.size() > 300) { names += " ..."; break; } names += k.name; names += ' '; }
+        auto it = g_gameShaders.find(e.first);
+        Log("census:   ps %p hash %08x %4d draws %s| %s", (void*)e.first, h, e.second,
+            it != g_gameShaders.end() ? "[patched] " : "", names.c_str());
+    }
+    g_census.clear();
 }
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CreatePS)(IDirect3DDevice9*, const DWORD*, IDirect3DPixelShader9**);
@@ -2881,8 +3007,22 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
     } else if (CtabFind(ct, "BloomThreshold") && CtabFind(ct, "SceneColorTexture") && ct.size() == 2) {
         gs.kind = SK_BLOOMGATHER;
         gs.bloomThrReg = CtabFind(ct, "BloomThreshold")->reg;
+    } else if (CtabFind(ct, "c_SHCoefficients_Ar") || (CtabFind(ct, "UpperSkyColor") && CtabFind(ct, "LowerSkyColor"))) {
+        gs.kind = SK_CHARLIGHT;
+        static const char* shn[7] = { "c_SHCoefficients_Ar", "c_SHCoefficients_Ag", "c_SHCoefficients_Ab", "c_SHCoefficients_Br",
+                                      "c_SHCoefficients_Bg", "c_SHCoefficients_Bb", "c_SHCoefficients_Cc" };
+        for (int i = 0; i < 7; i++) if (auto k = CtabFind(ct, shn[i])) gs.shReg[i] = k->reg;
+        if (auto k = CtabFind(ct, "UpperSkyColor")) gs.skyUpReg = k->reg;
+        if (auto k = CtabFind(ct, "LowerSkyColor")) gs.skyLoReg = k->reg;
+        if (auto k = CtabFind(ct, "AmbientColorAndSkyFactor")) gs.ambReg = k->reg;
     } else if (CtabFind(ct, "ScreenToShadowMatrix") && CtabFind(ct, "ShadowDepthTexture")) {
         gs.kind = SK_SHADOW;
+        gs.ct = ct;
+        gs.shadowTexReg = CtabFind(ct, "ShadowDepthTexture")->reg;
+        // the soft filter covers what we can reproduce: modulated shadows (all light types) and the
+        // plain uniform projection; others (e.g. Beast area lights) keep the game's filter
+        gs.softOk = CtabFind(ct, "SceneColorTexture") && CtabFind(ct, "ScreenPositionScaleBias") &&
+                    (CtabFind(ct, "ShadowModulateColor") || !CtabFind(ct, "EdgeSampleOffsets"));
         const char* names[3] = { "SampleOffsets", "RefiningSampleOffsets", "EdgeSampleOffsets" };
         for (int i = 0; i < 3; i++)
             if (const CtabConst* k = CtabFind(ct, names[i])) if (k->set == 2) { gs.offReg[i] = k->reg; gs.offCnt[i] = k->count; }
@@ -2892,8 +3032,8 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
     (*out)->AddRef();   // keep the game's shader alive so its pointer is never reused for another one
     g_gameShaders[*out] = gs;
     g_shCount[gs.kind]++;
-    static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather" };
-    if (gs.kind >= SK_FOG) Log("shaders: %s recognised (%p)", kn[gs.kind], (void*)*out);
+    static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather", "character lighting" };
+    if (gs.kind >= SK_FOG && gs.kind != SK_CHARLIGHT) Log("shaders: %s recognised (%p)", kn[gs.kind], (void*)*out);
     return hr;
 }
 
@@ -2920,12 +3060,13 @@ static bool BlendReplaced() { return cfg.fxBlend != 0; }
 static void PreDraw(IDirect3DDevice9* d)
 {
     g_preDrawLo = g_preDrawHi = -1;
+    if (g_censusOn && !g_inPostFX && g_curGamePS) g_census[g_curGamePS]++;
     GameShader* gs = g_curGS;
     if (!gs || g_inPostFX || !o_SetPSConstF) return;
     g_preDrawDev = d;
     if (!gs->uses++) {
-        static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather" };
-        Log("shaders: %s %p in use", kn[gs->kind], (void*)gs);
+        static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather", "character lighting" };
+        if (gs->kind != SK_CHARLIGHT || !g_shUsed[SK_CHARLIGHT]) Log("shaders: %s %p in use", kn[gs->kind], (void*)gs);
         g_shUsed[gs->kind]++;
     }
     auto clamp01 = [](int v) { return std::min(std::max(v, 0), 100) / 100.0f; };
@@ -2941,6 +3082,28 @@ static void PreDraw(IDirect3DDevice9* d)
         return;
     }
     case SK_SHADOW: {
+        if (cfg.shadowFilter > 0 && gs->softOk) {
+            // which kind of shadow map is bound: depth texture = hardware PCF, R32F = manual compare
+            bool hw = false;
+            IDirect3DBaseTexture9* bt = nullptr;
+            if (gs->shadowTexReg >= 0 && SUCCEEDED(d->GetTexture(gs->shadowTexReg, &bt)) && bt) {
+                if (bt->GetType() == D3DRTYPE_TEXTURE) {
+                    D3DSURFACE_DESC td;
+                    if (SUCCEEDED(((IDirect3DTexture9*)bt)->GetLevelDesc(0, &td))) hw = IsDepthFmt(td.Format);
+                }
+                bt->Release();
+            }
+            const int q = cfg.shadowFilter;
+            if (!gs->softTried[hw][q]) { gs->softTried[hw][q] = true; gs->soft[hw][q] = BuildSoftShadow(d, *gs, hw, q); }
+            if (IDirect3DPixelShader9* ps = gs->soft[hw][q]) {
+                o_SetPS(d, ps);     // re-bound before every draw: the game believes its own shader is set
+                const float mapPx = (float)(g_shadowBig ? g_shadowBig : (g_shadowSize ? g_shadowSize : 2048));
+                const float base  = (float)(g_shadowSize ? g_shadowSize : 2048);
+                const float r[4] = { std::max(cfg.shadowRadius, 1) / 10.0f / base, mapPx, 0, 0 };
+                o_SetPSConstF(d, gs->paramReg, r, 1);
+                return;
+            }
+        }
         if (!g_shadowBig || !g_shadowSize || cfg.shadowScale <= 1) return;
         const float k = (float)cfg.shadowScale;
         const float f = (1.0f / k) + (1.0f - 1.0f / k) * clamp01(cfg.shadowSoft);
@@ -2983,6 +3146,33 @@ static void PreDraw(IDirect3DDevice9* d)
         }
         return;
     }
+    case SK_CHARLIGHT: {
+        if (!cfg.charEven && !cfg.charFill) return;
+        const float e = 1.0f - clamp01(cfg.charEven), f = 1.0f + std::max(cfg.charFill, 0) / 100.0f;
+        // irradiance-volume SH (D3DX layout): A* = linear xyz + constant w, B* / C = quadratic terms.
+        // "Even" scales the directional terms down (dark side lifted, bright side lowered), "fill"
+        // raises the constant term.
+        for (int i = 0; i < 7; i++) {
+            const int r = gs->shReg[i];
+            if (r < 0) continue;
+            const float* o = g_psc[r];
+            float v[4];
+            if (i < 3) { v[0] = o[0] * e; v[1] = o[1] * e; v[2] = o[2] * e; v[3] = o[3] * f; }
+            else       { v[0] = o[0] * e; v[1] = o[1] * e; v[2] = o[2] * e; v[3] = o[3] * e; }
+            PdSet(r, v);
+        }
+        if (gs->skyUpReg >= 0 && gs->skyLoReg >= 0) {   // sky hemisphere: pull upper/lower towards their mean
+            const float* u = g_psc[gs->skyUpReg]; const float* l = g_psc[gs->skyLoReg];
+            float nu[4], nl[4];
+            for (int c = 0; c < 4; c++) {
+                const float m = 0.5f * (u[c] + l[c]);
+                nu[c] = (m + (u[c] - m) * e) * (c < 3 ? f : 1.0f);
+                nl[c] = (m + (l[c] - m) * e) * (c < 3 ? f : 1.0f);
+            }
+            PdSet(gs->skyUpReg, nu); PdSet(gs->skyLoReg, nl);
+        }
+        return;
+    }
     case SK_BLOOMGATHER: {
         if (cfg.bloomThreshold == 0 || gs->bloomThrReg < 0) return;
         const float* o = g_psc[gs->bloomThrReg];
@@ -3017,6 +3207,7 @@ static HRESULT STDMETHODCALLTYPE hk_SetPS(IDirect3DDevice9* d, IDirect3DPixelSha
 {
     if (g_tracing && !g_inPostFX) g_segPS++;
     g_curGS = nullptr;
+    if (!g_inPostFX) g_curGamePS = ps;
     if (ps && !g_inPostFX && !g_gameShaders.empty()) {
         auto it = g_gameShaders.find(ps);
         if (it != g_gameShaders.end()) {
@@ -3053,6 +3244,8 @@ static void HookTraceVtbl(IDirect3DDevice9* dev)
 // Called at every Present (before PostFX). Ends a running trace, starts an armed one.
 static void TraceFrameBoundary(IDirect3DDevice9* dev)
 {
+    if (g_censusOn) { g_censusOn = false; CensusDump(); }
+    if (g_censusArm) { g_censusArm = false; g_census.clear(); g_censusOn = true; }
     const bool key = (GetAsyncKeyState(cfg.toggleKey) & 0x8000) && (GetAsyncKeyState(VK_CONTROL) & 0x8000);
     const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     bool down = key && !shift, capDown = key && shift;
@@ -3607,6 +3800,10 @@ static bool SaveConfig()
     WriteIniInt("Effects", "MotionBlur", cfg.motionBlur);
     WriteIniInt("Effects", "GameEdgeAA", cfg.edgeAA);
     WriteIniInt("Effects", "GameSharpen", cfg.gameSharpen);
+    WriteIniInt("Shadows", "Filter", cfg.shadowFilter);
+    WriteIniInt("Shadows", "Radius", cfg.shadowRadius);
+    WriteIniInt("Lighting", "CharacterEven", cfg.charEven);
+    WriteIniInt("Lighting", "CharacterFill", cfg.charFill);
     WriteIniInt("Display", "VSync", cfg.vsync);
     WriteIniInt("Display", "FPSLimit", cfg.fpsLimit);
     WriteIniInt("Focus", "PauseOnFocusLoss", cfg.pauseOnFocusLoss);
@@ -3725,7 +3922,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.12.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.13.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -3805,17 +4002,25 @@ static void DrawMenu()
                 if (!cfg.fxBlend) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Bloom and DOF tuning need \"Use APRenewal's final pass\" (Colour tab).");
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Shadows & AO")) {
+            if (ImGui::BeginTabItem("Lighting & shadows")) {
                 ImGui::SeparatorText("Shadows");
+                static const char* sf[] = { "Game's (sharp, grainy)", "Soft (16 samples)", "Softer (32 samples)", "Smoothest (48 samples)" };
+                ImGui::Combo("Shadow filter", &cfg.shadowFilter, sf, 4);
+                if (cfg.shadowFilter > 0) ImGui::SliderInt("Shadow softness radius", &cfg.shadowRadius, 5, 120, "%d (1/10 texel)");
                 static const char* sh[] = { "1x (game default)", "2x", "4x" };
                 int si = cfg.shadowScale == 4 ? 2 : cfg.shadowScale == 2 ? 1 : 0;
                 if (ImGui::Combo("Shadow resolution", &si, sh, 3)) cfg.shadowScale = si == 2 ? 4 : si == 1 ? 2 : 1;
-                if (cfg.shadowScale > 1) {
+                if (cfg.shadowScale > 1 && cfg.shadowFilter == 0) {
                     ImGui::SliderInt("Shadow edge softness", &cfg.shadowSoft, 0, 100, cfg.shadowSoft ? "%d %%" : "sharp (matches the map)");
                     ImGui::TextDisabled("0 = filter sized for the bigger map, 100 = the game's original soft edges. %d shadow shaders adjusted.", g_shCount[SK_SHADOW]);
                 }
                 if (g_shadowBig) ImGui::TextDisabled("Now: shadow map %ux%u (game asked for %ux%u). Applies at next launch.", g_shadowBig, g_shadowBig, g_shadowSize, g_shadowSize);
                 else ImGui::TextDisabled("Applies at next launch.");
+                ImGui::SeparatorText("Character lighting");
+                ImGui::SliderInt("Even out lighting", &cfg.charEven, 0, 100, cfg.charEven ? "%d %%" : "game's");
+                ImGui::SliderInt("Fill light", &cfg.charFill, 0, 150, cfg.charFill ? "+%d %%" : "game's");
+                ImGui::TextDisabled("Characters and moving objects are lit from baked light probes; when a probe misses a lamp,");
+                ImGui::TextDisabled("their front goes dark. Evening out lifts the dark side, fill adds ambient light.");
                 ImGui::SeparatorText("Ambient occlusion");
                 CheckboxInt("SSAO enabled", &cfg.aoEnable);
                 static const char* modes[] = { "Off", "On", "Debug view (AO only)" };
@@ -3944,11 +4149,14 @@ static void DrawMenu()
             }
             ImGui::Text("Input: DirectInput mouse %s, window hook %s",
                         g_diMouse ? "captured" : "not seen", g_origWndProc ? "ok" : "missing");
+            if (ImGui::Button("Shader census (one frame)")) { g_censusArm = true; MenuNote("Shader list written to the log (census:)."); }
+            ImGui::SameLine();
             if (ImGui::Button("Trace one frame")) { g_traceArmed = true; g_wantCapture = false; MenuNote("Frame trace written to the log."); }
             ImGui::SameLine();
             if (ImGui::Button("Capture one frame (images)")) { g_traceArmed = true; g_wantCapture = true; MenuNote("Capturing: see Binaries\\APRenewal\\capture_*"); }
             ImGui::TextDisabled("Log: Binaries\\APRenewal\\APRenewal.log");
             ImGui::SeparatorText("Game shaders recognised (used)");
+            ImGui::Text("Character lighting: %d shaders (%s)", g_shCount[SK_CHARLIGHT], g_shUsed[SK_CHARLIGHT] ? "used" : "not seen yet");
             ImGui::Text("Final pass %d+%d (%d)  shadows %d (%d)  fog %d (%d)  motion blur %d (%d)  bloom %d (%d)",
                         g_shCount[SK_BLEND_BLOOM], g_shCount[SK_BLEND_DOF], g_shUsed[SK_BLEND_BLOOM] + g_shUsed[SK_BLEND_DOF],
                         g_shCount[SK_SHADOW], g_shUsed[SK_SHADOW], g_shCount[SK_FOG], g_shUsed[SK_FOG],
@@ -4354,7 +4562,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.12.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.13.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();
