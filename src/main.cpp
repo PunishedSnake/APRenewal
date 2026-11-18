@@ -983,6 +983,48 @@ static BOOL WINAPI hk_PeekMessageW(LPMSG msg, HWND wnd, UINT fmin, UINT fmax, UI
     return o_PeekMessageW(msg, wnd, fmin, fmax, remove);
 }
 
+// Crash reports: UE3 turns a crash into an error box (with its call stack) before it closes, so the
+// box text goes to our log; a vectored handler also logs the first fatal exceptions with the module
+// and offset they happened in (the game's own handler runs after it).
+typedef int (WINAPI *PFN_MessageBoxW)(HWND, LPCWSTR, LPCWSTR, UINT);
+typedef int (WINAPI *PFN_MessageBoxA)(HWND, LPCSTR, LPCSTR, UINT);
+static PFN_MessageBoxW o_MessageBoxW = nullptr;
+static PFN_MessageBoxA o_MessageBoxA = nullptr;
+static int WINAPI hk_MessageBoxW(HWND w, LPCWSTR text, LPCWSTR cap, UINT type)
+{
+    char t[4096] = "", c[256] = "";
+    if (text) WideCharToMultiByte(CP_UTF8, 0, text, -1, t, sizeof t, nullptr, nullptr);
+    if (cap) WideCharToMultiByte(CP_UTF8, 0, cap, -1, c, sizeof c, nullptr, nullptr);
+    Log("game: message box '%s': %s", c, t);
+    return o_MessageBoxW(w, text, cap, type);
+}
+static int WINAPI hk_MessageBoxA(HWND w, LPCSTR text, LPCSTR cap, UINT type)
+{
+    Log("game: message box '%s': %s", cap ? cap : "", text ? text : "");
+    return o_MessageBoxA(w, text, cap, type);
+}
+static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS e)
+{
+    static volatile LONG n = 0;
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&n) > 6) return EXCEPTION_CONTINUE_SEARCH;
+    void* at = e->ExceptionRecord->ExceptionAddress;
+    HMODULE m = nullptr; char mod[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)at, &m) && m) {
+        GetModuleFileNameA(m, mod, sizeof mod);
+        if (const char* sl = strrchr(mod, '\\')) memmove(mod, sl + 1, strlen(sl));
+    }
+    const CONTEXT* x = e->ContextRecord;
+    Log("crash?: exception %08lx at %p (%s+0x%lx) thread %lu, %s %p | eax %08lx ebx %08lx ecx %08lx edx %08lx esi %08lx edi %08lx esp %08lx",
+        code, at, mod, (unsigned long)((BYTE*)at - (BYTE*)m), GetCurrentThreadId(),
+        e->ExceptionRecord->NumberParameters >= 2 ? (e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading") : "",
+        e->ExceptionRecord->NumberParameters >= 2 ? (void*)e->ExceptionRecord->ExceptionInformation[1] : nullptr,
+        x->Eax, x->Ebx, x->Ecx, x->Edx, x->Esi, x->Edi, x->Esp);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static void InstallFocusHook()
 {
     static bool done = false;
@@ -990,6 +1032,11 @@ static void InstallFocusHook()
     done = true;
     if (void** s = FindIAT(GetModuleHandleA(nullptr), "user32.dll", "PeekMessageW"))
         o_PeekMessageW = (PFN_PeekMessageW)PatchIAT(s, (void*)hk_PeekMessageW);
+    if (void** s = FindIAT(GetModuleHandleA(nullptr), "user32.dll", "MessageBoxW"))
+        o_MessageBoxW = (PFN_MessageBoxW)PatchIAT(s, (void*)hk_MessageBoxW);
+    if (void** s = FindIAT(GetModuleHandleA(nullptr), "user32.dll", "MessageBoxA"))
+        o_MessageBoxA = (PFN_MessageBoxA)PatchIAT(s, (void*)hk_MessageBoxA);
+    AddVectoredExceptionHandler(1, CrashVeh);
     Log("focus hook: PeekMessageW=%p mainThread=%lu", o_PeekMessageW, g_mainThread);
 }
 
@@ -4896,7 +4943,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.16.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.16.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -5639,7 +5686,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.16.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.16.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

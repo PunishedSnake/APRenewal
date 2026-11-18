@@ -247,6 +247,9 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   - Draw distance: "set PlayerController LODDistanceFactor 100/pct" queued whenever a new player
     controller is seen (UE3 scales cull/LOD distance by the view's LODDistanceFactor). Unverified that
     SET works in this shipping build — the console logs the reply.
+- 0.16.1: user's 0.16.0 crashed in the main menu (native d3d9, no DXVK; log stopped ~3 s after the last
+  line, "window closing" but no "shutdown"). Cause unknown → MessageBoxW/A IAT hooks log UE3's error box
+  text (its call stack), vectored handler logs the first fatal exceptions with module+offset (`crash?:`).
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 

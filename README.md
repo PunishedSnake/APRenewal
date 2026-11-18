@@ -1,4 +1,4 @@
-# APRenewal 0.16.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.16.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,12 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.16.1
+- Crash reporting: when the game shows its error box (or something crashes), the text and the module
+  it happened in go to `APRenewal.log` (`game: message box` / `crash?:` lines). 0.16.0 crashed on one
+  PC in the main menu; this build is for finding out why. To narrow it down, turn things off one at a
+  time in `APRenewal.ini`: `[Materials] Enable=0`, `[Glass] ScreenReflections=0`, `[Game] DrawDistance=100`.
 
 ## New in 0.16.0
 - **Floor reflections actually run now.** 0.15.1 compiled the shader, but the camera matrix was never
