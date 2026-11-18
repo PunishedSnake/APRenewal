@@ -826,7 +826,9 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 // HDR test pattern, in the same gamma-encoded form as the game's frame (docs/hdr_testpattern.png is
 // the identical image for an SDR viewer): 75% colour bars, a grey ramp, 100% primaries, skin tones.
 static const char* kHdrPatternPS = R"HLSL(
+float4 hp : register(c1);   // x = 1: bottom row = highlight steps above paper white
 float Sel(float x, float lo, float hi) { return step(lo, x) * (1 - step(hi, x)); }
+float Enc(float k) { return 1.055 * pow(k, 1 / 2.4) - 0.055; }   // sRGB-encode k x paper white
 float4 main(float2 uv : TEXCOORD0) : COLOR0
 {
     float x = uv.x;
@@ -844,6 +846,10 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
     // row 4: skin tones
     float3 skin = float3(0.94,0.78,0.69) * Sel(x, 0, 0.25) + float3(0.78,0.57,0.44) * Sel(x, 0.25, 0.5)
                 + float3(0.55,0.38,0.26) * Sel(x, 0.5, 0.75) + float3(0.36,0.22,0.15) * Sel(x, 0.75, 2);
+    // highlight steps: 1, 1.25, 1.5, 2, 3, 4 x paper white (all equal = this path can't go above white)
+    float3 hi = Enc(1) * Sel(x, 0, 1.0/6) + Enc(1.25) * Sel(x, 1.0/6, 2.0/6) + Enc(1.5) * Sel(x, 2.0/6, 3.0/6)
+              + Enc(2) * Sel(x, 3.0/6, 4.0/6) + Enc(3) * Sel(x, 4.0/6, 5.0/6) + Enc(4) * Sel(x, 5.0/6, 2);
+    skin = lerp(skin, hi, hp.x);
     float y = uv.y;
     float3 c = bars * Sel(y, -1, 0.45) + ramp * Sel(y, 0.45, 0.65) + prim * Sel(y, 0.65, 0.85) + skin * Sel(y, 0.85, 2);
     return float4(c, 1);
@@ -1614,6 +1620,7 @@ static void BeforeHudOnSetRT(IDirect3DDevice9* dev, IDirect3DSurface9* next)
 static IDirect3DVertexShader9* g_xvs = nullptr;
 static IDirect3DPixelShader9 *g_psDown = nullptr, *g_psHdrFit = nullptr, *g_psHdrExpand = nullptr, *g_psHdrEncode = nullptr, *g_psHdrPattern = nullptr;
 static bool g_hdrPattern = false;   // menu: replace the frame with the HDR test pattern
+static bool g_hdrPatternHi = false; // menu: bottom row shows steps above paper white
 static bool g_xTried = false;
 static IDirect3DStateBlock9* g_xsb = nullptr;
 static IDirect3DTexture9 *g_xCopy = nullptr, *g_xScene = nullptr, *g_xFitRT = nullptr;
@@ -3002,7 +3009,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.9.6", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.9.7", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -3032,6 +3039,7 @@ static void DrawMenu()
             CheckboxInt("Reference: plain SDR exactly as Windows shows it (A/B)", &cfg.hdrReference);
             ImGui::Checkbox("Test pattern (compare with hdr_testpattern.png in an SDR viewer)", &g_hdrPattern);
             CheckboxInt("Compensate: output gets decoded as sRGB twice (fixes washed-to-neon look)", &cfg.hdrCompensate);
+            if (g_hdrPattern) ImGui::Checkbox("Highlight test: bottom row = 1x, 1.25x, 1.5x, 2x, 3x, 4x paper white", &g_hdrPatternHi);
             if (g_hdrPattern)
                 ImGui::TextWrapped("If the grey ramp turns flat white after about half way and the 75%% bars look like pure primaries, "
                                    "Windows is treating the game's HDR picture as SDR. On NVIDIA: Control Panel > Manage 3D settings > "
@@ -3354,7 +3362,8 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDirect3DDevice9* dev, const RECT* a
         IDirect3DSurface9* bb = nullptr;
         if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
             D3DSURFACE_DESC bd; bb->GetDesc(&bd);
-            XPass(dev, bb, bd.Width, bd.Height, nullptr, false, nullptr, false, g_psHdrPattern, nullptr, nullptr, false);
+            const float hp[4] = { g_hdrPatternHi ? 1.0f : 0.0f, 0, 0, 0 };
+            XPass(dev, bb, bd.Width, bd.Height, nullptr, false, nullptr, false, g_psHdrPattern, hp, nullptr, false);
             bb->Release();
         }
     }
@@ -3517,7 +3526,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.9.6 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.9.7 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         ApplySavedToggles();

@@ -91,6 +91,9 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   output came out as if decoded as SDR sRGB at SDR white and clipped at 1.0 — the HDR colour space
   gets lost after DXVK. NVIDIA "layered on DXGI" changed nothing. Measured shape = our linear output
   decoded as sRGB again at ~SDR white; 0.9.6 adds CompensateSRGB (pre-encode relative to paper white).
+  With Compensate the pattern matches the SDR reference but the game looks like plain SDR (user).
+  0.9.7 adds a "Highlight test" row (1x-4x paper white) to tell whether anything above paper white
+  survives this path; all patches equal = the path is SDR-limited, HDR has no gain → advise HDR off.
   Quit fix confirmed by the user (log ends with shutdown).
 - Focus pause must never park the thread while the window is closing/hidden (0.9.5: g_exiting) —
   that kept the process alive after quitting.

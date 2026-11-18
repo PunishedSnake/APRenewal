@@ -1,4 +1,4 @@
-# APRenewal 0.9.6 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.9.7 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -12,6 +12,13 @@ A research-and-fix base layer. It sits alongside the mods you already have:
 ## Install
 Copy `d3d9.dll` + `APRenewal.ini` into `Alpha Protocol\Binaries\`. Uninstall = delete both.
 The log goes to `Binaries\APRenewal\APRenewal.log`.
+
+## New in 0.9.7
+- HDR test pattern: "Highlight test" checkbox (shown while the pattern is on). The bottom row becomes
+  six patches at 1x, 1.25x, 1.5x, 2x, 3x and 4x paper white. Look at the monitor, not a screenshot
+  (captures clip at SDR white). If the patches get brighter left to right, real highlights reach
+  the display and Compensate + HDR is worth keeping. If they all look the same, this output path is
+  limited to SDR white and HDR gives nothing over the normal SDR mode: turn it off.
 
 ## New in 0.9.6
 - HDR: "Compensate" toggle (`[HDR] CompensateSRGB`). The 0.9.4/0.9.5 test pattern fits one model
