@@ -1,369 +1,165 @@
 # APRenewal — working notes
 
-A `d3d9.dll` proxy mod for **Alpha Protocol** (2010, Unreal Engine 3, D3D9 SM3, 32-bit `APGame.exe`).
-Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/`.
+`d3d9.dll` proxy mod for **Alpha Protocol** (2010, UE3, D3D9 SM3, 32-bit `APGame.exe`).
+Code: `src/main.cpp` (everything), `src/pad.h` (controllers), `src/smaa.h`, generated `src/matclass.h` /
+`src/specregs.h`, `src/xinput/` (xinput1_3.dll forwarder). Dear ImGui 1.91.9 vendored in `src/imgui/`.
+README = current feature list only (no changelog). These notes = current knowledge, not history.
 
-## Build and check
-- `./build.sh` → `out/d3d9.dll` (i686-w64-mingw32-g++, static, exports via `src/d3d9.def` + `--kill-at`).
-- Shaders are HLSL raw strings (`static const char* kXxxPS = R"HLSL(...)HLSL";`) compiled at runtime
-  with D3DXCompileShader. Offline check: `tools/shadercheck/shadercheck.py` (needs wine and the game's
-  `d3dx9_42.dll` copied next to it). Wine's compiler rejects dynamic loops/branches with "not
-  implemented" — that is a Wine limitation, not a shader bug. Prefer branch-free code where cheap.
-- `tools/proto/` has numpy replicas of the AO shader (`gtao.py`) run on captured fp16 DDS depth —
-  how the GTAO bugs were found. Validate shader math there before shipping.
-- No way to run the game here: the user tests. Every feature logs to `Binaries\APRenewal.log`
-  with a prefix (`postfx:`, `ssao:`, `depth:`, `hdr:`, `ssaa:`, `audio:`, `menu:`) — always add logs.
-- Releases: zip with `Binaries/` (d3d9.dll, APRenewal.ini, OpenAL32.dll), `source/`, README.
-  Bump the version string (`"APRenewal X.Y.Z"`, two places) and add a "New in" README section.
+## Build, test, release
+- `./build.sh` → `out/d3d9.dll` + `out/xinput1_3.dll` (i686-w64-mingw32, static, exports via `src/d3d9.def` + `--kill-at`).
+- No way to run the game here, and Wine in this sandbox crashes on any exe: the user tests. Every feature
+  logs to `Binaries\APRenewal\APRenewal.log` with a prefix (`postfx:`, `ssao:`, `ssr:`, `depth:`, `hdr:`,
+  `ssaa:`, `audio:`, `menu:`, `pad:`, `compat:`, `census:`, `crash?:`) — always add logs.
+- No offline HLSL compiler works here: shader compile errors only show in the user's log.
+- `tools/proto/` numpy replicas of the AO shader on captured fp16 depth — validate shader math there.
+- Release: bump `"APRenewal X.Y.Z"` (4× in main.cpp incl. the glass lock string, ini header), zip
+  `APRenewal-X.Y.Z/` with `Binaries/` (d3d9.dll, xinput1_3.dll, APRenewal.ini, OpenAL32.dll), `source/`
+  (git archive), README. Commit as PunishedSnake, push with `git -c push.negotiate=true push`.
+- Default branch `main`; work on a branch, merge by PR (REST API — gh GraphQL is blocked here).
 
-## The user's setup (stack order matters)
-- `winmm.dll` = **AlphaFixer** — replaced by our View module in 0.9; user is told to delete it.
-  It was an alphayellow1-style fix (spdlog/safetyhook, source not public). Reversed: three safetyhook
-  mid-hooks — FOV (`F3 0F 59 80 0C 01 00 00 09 98 10 01 00 00`, wrote a fixed HFOV =
-  2·atan(tan(37.5°)·FOVFactor·aspect/(16/9)) into every camera module's +0x10C), HUD canvas
-  (`89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50` at +9: ecx = width, esi = left), menu viewport
-  (`FF D2 85 C0 89 44 24 08 DB 44 24 08` at +2: eax = width; first of 3 matches). HUD width came from
-  AlphaFixer.ini or the desktop — that broke supersampling.
-- `dinput8.dll` / `xinput1_3.dll` = GOG "dixi" controller remapper (`dixi.ini`) — one DLL under both names (XInput
-  implemented itself via winmm + SetupAPI, no real xinput). Replaced by our controller layer in 0.20.0 (user told to delete it).
-  User's pads: DualSense (USB, sometimes BT), Xbox Series X; wants complete support, not tailored.
-- MulderConfig launcher edits `APEngine.ini` etc. (`MulderConfig.json`, save file must list every group).
-- `d3d9.dll` = APRenewal, chain-loads `RealD3D9=` (user runs DXVK as `d3d9_dxvk.dll`).
-- `OpenAL32.dll` = OpenAL Soft 1.25.2 we built (original Creative router kept as backup).
-- RTX 4080 SUPER + AMD iGPU, 2560x1440 desktop, 400-nit HDR display, headphones on a Burson DAC.
+## HLSL rules (both compilers)
+- `[Shaders] Compiler=auto`: System32 d3dcompiler_47 D3DCompile (flag 1<<12 backwards compat) unless Wine;
+  falls back to the game's d3dx9_42 (2009). One critical section around every compile.
+- No bitwise ops (ps_3_0). Never reuse a for-loop variable name later in a function (legacy scoping).
+  `near`/`far` are reserved. The 2009 compiler crashed on loops with `break` + early returns in helpers
+  (game-thread compiles): keep them branch-free/unrolled.
 
-## Hooks (where things are)
-- Code patches: `MidHook(site, len, expect, fn, repl)` — our own mid-function hook (pushfd/pushad/
-  XMM save, `fn(HookRegs*)` may edit registers, then original or replacement bytes, jmp back).
-  Sites must be whole instructions without relative operands; `expect` bytes are verified first.
-  View module (`InstallViewHooks`): the game's normal camera module FOV is 60 deg (measured);
-  `[View] FOV` is the target for that camera at 16:9 and all modules get the same tan ratio.
-  FOV blend function at 0xA8F020 in the Steam exe — per-module
-  FOV scaled via a replacement `mulss xmm0,[g_fovScratch]`, blended result read at its `fld [esp+8]`
-  (feeds AO's FOV); HUD and menu hooks only act when wider than 16:9.
-- Proxy exports Direct3DCreate9/Ex + D3DPERF_*. IAT hooks on APGame.exe: D3DXCompileShader, QPC,
-  GetTickCount, PeekMessageW (focus pause parks the main thread here — never freeze the clock
-  globally: UE3's frame limiter spins on it), DirectInput8Create, XInputGetState (ordinal 2),
-  GetProcAddress (OpenAL), GetCommandLineW / GetClientRect / ScreenToClient / ClientToScreen (SSAA),
-  plus msvcr80's GetCommandLineA/_acmdln (the game builds its command line from `_acmdln`).
-- Vtables: IDirect3D9 CreateDevice 16, GetAdapterModeCount 6 / EnumAdapterModes 7 (SSAA fake mode);
-  device Reset 16, Present 17, SetGammaRamp 21, CreateDepthStencilSurface 29, StretchRect 34,
-  SetRenderTarget 37, Clear 43, DP/DIP/DPUP/DIPUP 81-84, SetPixelShader 107.
+## Exe addresses (the user's GOG APGame.exe — verify bytes before every patch; Steam exe coming)
+- Mid-hooks: `MidHook(site, len, expect, fn, repl)` (pushfd/pushad/XMM save, fn may edit regs, original or
+  replacement bytes, jmp back). Sites = whole instructions without relative operands.
+- View (replaces AlphaFixer): FOV blend function 0xA8F020, per-module FOV via replacement
+  `mulss xmm0,[g_fovScratch]`, blended result read at its `fld [esp+8]` (feeds AO FOV). Normal camera
+  FOV = 60°. HUD canvas sig `89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50` (+9: ecx width, esi left),
+  menu viewport sig `FF D2 85 C0 89 44 24 08 DB 44 24 08` (+2: eax width, first of 3). HUD/menu only act
+  wider than 16:9.
+- Movies: player vtable slot 0x12173B0 = GameThreadPlayMovie 0x4E49F0 (thiscall mode, name, startFrame;
+  ret 0xC). Logos `slate_*.sfd` skipped by name prefix; loading movie `simple_loading_v02.sfd` (mode 129).
+- Console: player controller vtable +0x110 = ConsoleCommand(FString* ret, const FString&, UBOOL) thiscall.
+  PC pointer from MidHooks on AAPPlayerController-only exec thunks (ShouldAllowPauseMenu 0xA50230,
+  ShouldAllowPDAMenu 0xA50270, IsPlayerPastTitleScreen 0xA50490, UpdateAIData 0xA50970; not InPDAMenu).
+  Used only if seen in the last 3 s with the first-seen vtable; commands queued, run in hk_PeekMessageW
+  on the main thread; result FString freed with GMalloc (0x16E8030) vtable +0xC. Viewport Exec
+  (0x50E000–0x513800) has AP commands (HQDLE, USEMAGICRIM, TOGGLEUI, TOGGLEOCCLUSION 0x16F95C4, EDAA,
+  MINAMBIENT, LIGHTSCALE, SHADOWINTENSITY, SHARPNESS, …) → docs/script-commands.md.
+- Gamepad option: UAPProfileManager singleton [0x16F9A00] (cf. execGetProfileManager 0xAB3E40), bit 0 of
+  +0x13C = "Enable gamepad". Re-read every frame by 0xAC7B00 / 0xAC8DC0: pad connected (0xA274F0) && bit
+  → clear flag 0x800 at input object +0x1FC (gamepad), else set (KBM). Sites 0xAC7B48/51, 0xAC902F/38.
+- `docs/apgame-re.md`, `tools/re/apgame_natives.json` (2804 `Class::execFunc` → address),
+  `tools/re/apdis.py` (capstone disassembly with native names; `APGAME=path`).
+- Script packages: UE3 v539 / licensee 91, zlib-chunked: `tools/re/upk.py`, `execs.py`, `sigs.py`.
 
-## UE3 frame structure (learned from traces: Ctrl+F11 trace, Ctrl+Shift+F11 image capture)
-1. Occlusion queries on the backbuffer.
-2. Depth prepass into a full-res LDR A8R8G8B8 target, then HDR fp16 base pass (fmt 113).
-   HDR scene alpha = linear view depth (fp16 → too coarse for normals at grazing angles).
-3. Lights, shadow map (2048 R32F), translucency; the game clears depth+stencil before bloom.
-4. Bloom chain at ~1/4 res, finished world into the full-res LDR target, one draw copies it to
-   the backbuffer, then UI on top.
-- Variants: frames with no bloom (straight to backbuffer); scene-capture frames (a full scene,
-  then 1024² targets, then the main scene); UI-pass frames (armory: world → HDR → widgets → bb).
-- Before-HUD detection (`BeforeHudOnSetRT`) is order-aware: base pass before bloom, small RT ≤ bbW/3
-  is bloom, world RT = first full-res backbuffer-format target after bloom; new-scene reset on a
-  ≥80-draw full-res LDR prepass. Detection compares against the game's *logical* backbuffer format
-  (HDR swaps the real one to fp16).
+## Hooks
+- Proxy exports Direct3DCreate9/Ex, D3DPERF_*, APR_XInput*. Chain-loads `[Chain] RealD3D9` (user: DXVK as
+  `d3d9_dxvk.dll`); under Wine empty = Proton's DXVK (`LoadReal` refuses our own module).
+- IAT (APGame.exe): D3DXCompileShader, QPC, GetTickCount, PeekMessageW (focus pause parks the main thread
+  here — never freeze the clock globally, UE3's limiter spins on it; never park while closing: g_exiting),
+  DirectInput8Create, xinput1_3 ordinals 2/3, GetProcAddress (OpenAL), GetCommandLineW + msvcr80
+  GetCommandLineA/_acmdln, GetClientRect / ScreenToClient / ClientToScreen (SSAA), GetCursorPos /
+  SetCursorPos (frozen while the menu is open), MessageBoxW/A (logs UE3 error boxes).
+- D3D vtables: IDirect3D9 CreateDevice 16, GetAdapterModeCount 6 / EnumAdapterModes 7. Device: Reset 16,
+  Present 17, SetGammaRamp 21, CreateTexture 23, CreateDepthStencilSurface 29, StretchRect 34, SetRT 37,
+  Clear 43, SetViewport 47/48, SetTexture 65, SetSamplerState 69, SetScissorRect 75/76, DP/DIP/DPUP/DIPUP
+  81-84, CreateVertexShader 91, SetVS 92, SetVSConstantF 94, CreatePixelShader 106, SetPS 107,
+  SetPSConstantF 109, CreateQuery 118 (→ query GetData 7).
+- Menu input blocking: WndProc subclass, DI mouse/keyboard GetDeviceState/GetDeviceData blanked (mouse
+  buffer drained), XInput zeroed. Menu close logs what the game read while open (`MenuInputReport`).
 
-## Features and their gotchas
-- **AO (GTAO, XeGTAO-style)**: 3 slices × 6 steps, depth-aware blur, highlight protection.
-  Precise depth: the game's D24S8 is recreated as an INTZ texture, snapshotted to R32F right after the
-  base pass (`ZSnapshot`), calibrated against HDR-alpha depth by least squares 1/d = A + B·z
-  (fit: d = 10/(1−z), near plane 10, infinite far). Normal orientation must use dot(n, p), not n.z.
-- **Colour grade**: linear light, S-curve contrast pivoting on mid grey (keeps 0 and 1), vibrance.
-  Defaults are deliberately mild — this game is dark; stronger contrast crushes night scenes.
-- **SSAA** (`RenderScale`): game renders at scale × desktop via `-ResX/-ResY`, window stays at monitor
-  size (WM_WINDOWPOSCHANGING clamp, WM_SIZE + mouse lParam rewrite), Mitchell downscale at Present
-  into the backbuffer corner, presented with a source rect (swap effect COPY).
-  (AlphaFixer forced HUD/menu width to the desktop res — gone with the View module.)
-- **HDR**: DXVK only. `ID3D9VkExtInterface::UnlockAdditionalFormats` → fp16 backbuffer;
-  `ID3D9VkExtSwapchain::SetColorSpace(scRGB)`. Highlight expansion runs right after the game's
-  world→backbuffer copy (before UI), from the HDR scene buffer with an auto-fitted exposure; encode
-  at Present. DXVK **v3.1.1 never enables VK_EXT_swapchain_colorspace** (it sat in the device
-  extension list; fixed upstream in 3c40ca1, 2026-09-28) and then silently clips HDR to an SDR
-  swapchain → neon oversaturation. We check the loader ourselves (`CheckVulkanHdr`). Use a DXVK built
-  with 3c40ca1 cherry-picked onto v3.1.1 until 3.2 ships (master's new present-timing code is the
-  suspect for a broken Steam overlay). scRGB only: HDR10 colour space with the fp16 backbuffer froze
-  presentation (game stuck after a few frames). Encode has a soft shoulder to the peak and a
-  saturation trim; paper white near the peak = blown-out look. Since 0.9.2: paper white defaults to
-  Windows' SDR white level (DisplayConfig SDR_WHITE_LEVEL), sRGB piecewise curve like Windows, expansion
-  knee on luminance (max-channel knee boosted graded blue lights), and an A/B "Reference" toggle.
-  User confirmed DXVK 3.1.1 + 3c40ca1 keeps the Steam overlay working; FOV 60 base confirmed. DXVK ignores gamma ramps in windowed
-  mode; we still keep the game's ramp out of the HDR path.
-  0.9.4 test pattern on the user's PC (monitor on the RTX, Windows HDR on, scRGB swapchain per DXVK log):
-  output came out as if decoded as SDR sRGB at SDR white and clipped at 1.0 — the HDR colour space
-  gets lost after DXVK. NVIDIA "layered on DXGI" changed nothing. Measured shape = our linear output
-  decoded as sRGB again at ~SDR white; 0.9.6 adds CompensateSRGB (pre-encode relative to paper white).
-  With Compensate the pattern matches the SDR reference but the game looks like plain SDR (user).
-  0.9.7 adds a "Highlight test" row (1x-4x paper white) to tell whether anything above paper white
-  survives this path; all patches equal = the path is SDR-limited, HDR has no gain → advise HDR off.
-  RESULT (user, 0.9.7): all six patches identical with and without Compensate → native HDR via
-  DXVK's Vulkan swapchain is SDR-limited on this PC. HDR stays default off; user pointed to NVIDIA
-  RTX HDR instead. Only remaining native route: our own DXGI/D3D11 fp16 swapchain via interop
-  (Special K-style) — big job, not started.
-  0.9.8: HDR gated by HdrAllowed() = Wine || [HDR] AllowWindows. Under Proton/gamescope the scRGB
-  path should be composited properly (needs DXVK_HDR=1) — untested.
-  Quit fix confirmed by the user (log ends with shutdown).
-- Focus pause must never park the thread while the window is closing/hidden (0.9.5: g_exiting) —
-  that kept the process alive after quitting.
-- **Audio**: game loads OpenAL at runtime (`DeviceName=Generic Software` in APEngine.ini). With OpenAL
-  Soft we map legacy names to the default device and request `ALC_HRTF_SOFT` +
-  `ALC_OUTPUT_MODE_SOFT=ALC_STEREO_HRTF_SOFT`; `alcResetDeviceSOFT` toggles it live.
+## UE3 frame structure
+1. Occlusion queries; 2. depth prepass (full-res LDR), HDR fp16 base pass (alpha = linear view depth);
+3. lights, shadow map (2048 R32F), translucency; depth+stencil cleared before bloom; 4. bloom at ~1/4
+res, world into full-res LDR target, one draw to the backbuffer, then UI.
+- Variants: no-bloom frames, scene-capture frames (1024² targets first), UI-pass frames (armory).
+- `BeforeHudOnSetRT` is order-aware (base pass before bloom; small RT ≤ bbW/3 = bloom; world RT = first
+  full-res backbuffer-format target after bloom; new scene on a ≥80-draw full-res LDR prepass), compared
+  against the game's logical backbuffer format.
 
-## Proton / Steam Deck (0.9.8, untested)
-- `DetectCompat()`: ntdll `wine_get_version` → `g_wineVer`, env `SteamDeck=1` → `g_steamDeck`; logs `compat:`.
-- Launch options `WINEDLLOVERRIDES="d3d9,openal32=n,b" %command%`, `RealD3D9` empty → system d3d9 = Proton's
-  DXVK. `LoadReal` refuses if the system path resolves to our own module.
-- Windows-only bits (DisplayConfig SDR white, DXGI output diag) fail soft under Wine (paper white falls back to 200).
+## Shader patching
+- CreatePixelShader → `ParseCtab` (ps 0xFFFF and vs 0xFFFE tokens) → classify by CTAB names or FNV-1a
+  bytecode hash. SetPS swaps in replacements; constants mirrored into `g_psc`/`g_vsc`; `PreDraw` feeds ours
+  (`PdSet` = write + restore after the draw), `PostDrawRestore` puts the game's back.
+- Generated replacements: header with every CTAB constant at its original register + our body; rejected
+  unless our CTAB ⊆ the game's. Our constants (`apTM`…`apTM4`, `apX[12]`) go above the game's
+  (c ≥ paramReg, s ≥ 8). Originals AddRef'd. g_inPostFX work is ignored by all hooks.
+- UE3 packs matrices ROW-MAJOR: register i = row i, mul(v,M) = Σ v_i·row_i.
+- Final blend (AP_BloomBlend / DOFAndBloomBlend): scene + bloom(RGBE ×4) → apApplySaturation (its
+  (c − SceneShadowsAndDesaturation) clips HDR < ~0.006 to 0) → (overlay + c)·scale → saturate → lerp(x,
+  √x, GammaInverseOn) → brightness, contrast, colour filter. Ours adds roll-off, gamma choice, shadow toe,
+  bloom/DOF tent smoothing, wide bloom (s10), bokeh.
+- Shadow projection: kShadowBodyHLSL (Vogel disc, HW compare via tex2Dproj when the texture is a depth
+  format, CONTACT variant with Inverse4(ScreenToShadowMatrix)). Shadow map scale fixed at device creation
+  (g_shScaleRun); viewport/scissor/clear scaled while RT0 is the big map.
+- Glass (hashes cb2f41c2, 23836016, door glass cc79d4cd; refraction 3e0261ff / 98160836 / 855d48c7):
+  COLOR0 TangentX, COLOR1 TangentZ, TEXCOORD6 camera vector (tangent space); Texture2D_0 normal,
+  _1 mask (.x reflection, .w opacity), _2 diffuse, cube env. Writes COLOR1 = 1 into a glass mask (AO
+  behind glass), glass SSR variant (`#if GLASSSSR`, unrolled, built after the plain one, skipped if
+  `APRenewal_glass_compile.lock` survives a crash).
+- Fog OneLayerMain rebuilt to write transmittance to RT1 (AO fades with fog).
+- Material mask: `BuildTaggedShader` patches base-pass bytecode (`def cK`, `mov oC1, cK`) for skin / metal /
+  rough hashes (src/matclass.h from tools/re/matclass.py over RefShaderCache); RT1 = g_matMask (r skin,
+  g metal, b rough) when RT0 is the full-res HDR scene.
+- Gloss: src/specregs.h (tools/re/specregs.py) = per skin/metal light shader the registers of the specular
+  pow exponent (base from max(), not Fresnel's 1−x); scaled per draw. Skin light 54793f09: spec exp c40
+  (=7), Fresnel pow 12. Weapon light 2198188e: exponent lerp(US42, US41) 3–10, ramp map, Fresnel US0/US1/US2.
+- Character lighting: SH coefficients (c_SHCoefficients_*) and sky colours scaled per draw.
+- RefShaderCache-PC-D3D-SM3.upk layout and tools: `tools/re/shadercache.py` (material → shader hashes).
+- Census (Diagnostics): next frame's PS list with hashes, draws, CTAB names and UniformScalar/Vector values.
 
-## Game module (0.10.0, Steam exe addresses, all verified by bytes before patching)
-- Intro skip: movie player vtable slot 0x12173B0 = GameThreadPlayMovie 0x4E49F0 (thiscall, mode,
-  name, startFrame; ret 0xC). Refused (return 0) until `g_worldEverSeen` (first HDR base pass in
-  BeforeHudOnSetRT) — not enough: the logos `slate_sega/obsidian/ap.sfd` (mode 0) start just after the
-  menu's first 3D frame, so 0.10.1 also skips by name prefix ([Game] SkipMovies=slate_). Loading movie =
-  `simple_loading_v02.sfd` (mode 129). User confirmed console + 4x shadows work (0.10.0). `-nomovie` would install the null player and kill in-game .sfd movies too.
-- Shadows: the shadow map is a square R32F RT texture (2048) + square depth buffer. With
-  [Shadows] Scale they're created k× larger (CreateTexture 23 / CreateDS 29); while RT0 is the big
-  shadow map, SetViewport 47 / GetViewport 48 / SetScissorRect 75 / GetScissorRect 76 / Clear rects
-  are scaled. Shadow UVs are normalised. Unknown: whether the PCF shader uses a texel-size constant
-  (filter would then stay 2048-sized — still fine). User's MaxShadowResolution=4096 had no effect.
-- Console: vtable +0x110 on the player controller = ConsoleCommand(FString* ret, const FString& cmd,
-  UBOOL log) (thiscall). PC pointer captured by MidHooks on AAPPlayerController-only exec thunks
-  (ShouldAllowPauseMenu 0xA50230, ShouldAllowPDAMenu 0xA50270, IsPlayerPastTitleScreen 0xA50490,
-  UpdateAIData 0xA50970; InPDAMenu is shared with AAPAIController — don't use). Pointer used only if
-  seen in the last 3 s with the first-seen vtable. Commands run in hk_PeekMessageW on the main
-  thread. Result FString freed with GMalloc (0x16E8030) vtable +0xC.
-- dis.py must run with `python3 -P` (its name shadows the stdlib `dis` module).
+## PostFX chain (`PostFXRun`)
+AO → SSS (2 passes) → SSR → light shafts → grade → SMAA/FXAA → TAA → sharpen. **Every pass that calls
+`nextOut` must be counted in `remaining`** (missing ones silently drop later passes).
+- Depth: game D24S8 recreated as INTZ, snapshotted to R32F after the base pass (`ZSnapshot`), calibrated
+  against HDR-alpha depth (1/d = A + B·z; d = 10/(1−z)). Normals: orient with dot(n, p).
+- World position from depth (SSR, TAA, shafts): wp = ((sx·w, sy·w, w) − t)·inv(M3), M3 rows (r_i.x, r_i.y,
+  r_i.w), t = (r3.x, r3.y, r3.w), VP captured from the vertex shaders while the RT is the HDR scene.
+- SSS: separable 13-tap, radius 0.2 × width × focal / depth (cap 12 px), 65 % luminance restored (the user
+  rejected blurry faces). TAA history reduced on skin.
+- SSR: neighbour-picked normals, tMin = 2 + 1 % depth, hits within 3 px rejected, disc blur by roughness.
+- Light shafts: bright pass (excludes skin) → per-cell max with uv + depth → read back a frame late →
+  sources unprojected and tracked in world space, re-projected every frame → per light: 64-tap radial blur
+  + 8-tap fill across one tap spacing, added up → screen-blend composite.
+- Grade: linear light; contrast S-curve around mid grey; black level = soft toe c²/(c+b)·(1+b), never a
+  clip (`[Grade] BlackLevel2`, 1/10000). The game is dark — keep defaults mild.
+- SSAA: game renders at scale × desktop via `-ResX/-ResY` (through `_acmdln`), window kept at monitor size,
+  Mitchell downscale at Present (swap effect COPY).
 
-## Shader patching (0.11.0)
-- CreatePixelShader 106 → `ParseCtab` (constant names/registers) → classify. SetPixelShader 107 swaps
-  in our replacement; SetPixelShaderConstantF 109 is mirrored into `g_psc`; `PreDraw` (all 4 draw
-  hooks) feeds our values, `PostDrawRestore` (AfterDraw) puts the game's back.
-- Replacements are generated: a header with every CTAB constant at its original register, then our
-  body; compiled with D3DXCompileShader at runtime and rejected unless our CTAB is a subset of the
-  game's (same set/register). Our own extra constant `apTM` goes to max used c-register + 1.
-  Original shaders are AddRef'd so their pointers are never reused.
-- Final blend (HSBContrast + GammaColorScaleAndInverse + LensFilterImage + FilterColor): plain
-  (AP_BloomBlendPixelShader) and DOF (DOFAndBloomBlendPixelShader Main: NewDOF maps, PackedParameters,
-  vignette, c_finalColorScaleLow). The Epic variant without LensFilterImage is not touched.
-  Original order: scene + bloom(RGBE, ×4) → apApplySaturation → (overlay + c)·scale → saturate →
-  lerp(x, sqrt x, GammaInverseOn) → brightness, PS contrast, x² contrast, colour filter.
-- Shadow projection (ScreenToShadowMatrix + ShadowDepthTexture): SampleOffsets / RefiningSampleOffsets /
-  EdgeSampleOffsets × f, ShadowBufferSize × Scale; f = 1/Scale … 1 by [Shadows] Softness.
-- No offline HLSL compiler works here (Wine segfaults, apt's vkd3d 1.2 has no HLSL): replacement
-  compile errors only show in the user's log (`postfx: final blend compile failed`).
-- 0.12.0 effects: final pass params apTM (roll-off), apTM2 (sRGB / 2.2 weights, bloom intensity, DOF
-  strength), apTM3 (quarter-res texel size = 1/(pp/4+2), bloom / DOF tent smoothing) at paramReg..+2.
-  Constant overrides in PreDraw (PdSet = write + restore after draw): fog FogDistanceScale × density;
-  motion blur (AP MainPixelShader_DirectionalEDAA: VelocityBuffer + PrevViewProjMatrix) Static/Dynamic
-  VelocityParameters.xy × strength, apOffsetAndWeightTable[0].w = edge-AA weight, apUnsharpMaskAmount;
-  bloom gather (BloomThreshold + SceneColorTexture only) threshold += offset, .y = 1/(4−t).
-  The AP "motion blur" pass is also the game's EDAA (directional edge blur) + unsharp mask.
-- Menu: Video (sub-tabs Image/Colour/Effects/Shadows & AO/View/HDR), Audio, Game, Diagnostics, Miscellaneous.
-- User (0.11.0 log): both final blends + shadows recognised and used; logged shadow offsets ×1.000
-  (Softness at 100) → "difference not noticeable".
-- 0.13.0: soft shadows = generated replacement of the shadow projection (kShadowBodyHLSL: depth from
-  scene alpha, ScreenToShadowMatrix as float4[4] column-major → dot per register, Vogel disc NTAPS
-  rotated by IGN(VPOS), HW = tex2Dproj compare, else tex2Dlod compare; MODSHADOW/ATTEN/SPOT/CUBE/
-  CLAMPUV from the CTAB). Built lazily in PreDraw per [hw][quality]; HW decided by the bound texture's
-  format; re-bound with o_SetPS before every draw. Beast area / non-mod branching keep the game's.
-  Character lighting: material shaders with c_SHCoefficients_A*/B*/Cc (AP irradiance volumes, D3DX SH
-  layout, base pass) and Upper/LowerSkyColor — constants scaled per draw (even = directional ×(1−e),
-  fill = constant ×(1+f)). 2687 SH + 8786 sky shaders in RefShaderCache.
-  Census: Diagnostics button → next frame's PS list (ptr, FNV hash of bytecode, draws, CTAB names).
-  Glass: material CTABs only have generic names (UniformVector_N, Texture2D_N) — needs census + hash.
-- 0.14.0: UE3 compiles shaders with ROW-MAJOR matrix packing (disassembly: mad chain x·c18 + y·c19 +
-  z·c20 + c21) — register i = row i, mul(v,M) = Σ v_i·row_i. 0.13.0's dot() version put shadows in
-  the wrong place (user: "filters make it disappear"). Shadow scale used at runtime = g_shScaleRun
-  (fixed at device creation); 0.13.0 used live cfg → 1x/4x in the menu broke the viewport scaling.
-  CtabConst.type from the CTAB type info (14 = samplerCUBE) for generated headers.
-  Glass: census → hashes (FNV-1a of the bytecode, ShaderHash) cb2f41c2 (glass) / 23836016 (glass with
-  Fresnel) in RefShaderCache, unique shapes = the game's glass materials. Disassembled with
-  /tmp/apwork/dis9.py-style decoder: COLOR0 = TangentX (packed, w = sign), COLOR1 = TangentZ,
-  TEXCOORD0 uv, TEXCOORD4 fog (rgb add, w mul), TEXCOORD6 camera vector (tangent space); Texture2D_0
-  normal (xy × UniformScalar_1), Texture2D_1 mask (.x reflection, .w opacity), Texture2D_2 diffuse,
-  TextureCube_0 env; refl = env·lum(env) (crushes dim reflections). Distortion accumulate shaders
-  3e0261ff / 98160836: refraction scale UniformScalar_1 (c0).
-  User: character lighting sliders work but can't fix the probe direction — accepted, not pursued.
-  User (0.14.0): glass tweaks great; soft shadows work perfectly (also very soft).
-- 0.14.1 AO behind glass: glass replacement writes COLOR1 = 1; PreDraw binds g_glassMaskSurf (same
-  size/format as RT0, cleared once per frame via ColorFill, g_frameNo from TraceFrameBoundary) as RT1
-  with o_SetRT, PostDrawRestore unbinds it. AO composite samples it at s2: ao = lerp(ao, 1, mask·c4.z).
-  0.14.2: mask keyed by frame×64 + g_scenesThisFrame (scene-capture glass leaked into the main view as
-  a light trapezoid without AO), only bound when RT0 = g_ppW×g_ppH, mask alpha = saturate(alpha·4).
-- 0.15.0:
-  - Fog: one-layer height fog (HeightFogPixelShader OneLayerMain) rebuilt (kFogBodyHLSL) to write its
-    transmittance to RT1 (g_fogMask, cleared to 1 per scene; blend ONE/SRCALPHA → mask written as
-    (0,0,0,sc), otherwise (sc,sc,sc,1)). AO composite s3: ao = lerp(1, ao, lerp(1, fogT, c4.w)).
-  - Door glass cc79d4cd: two normal maps (Texture2D_0 × US1 + Texture2D_1 × US3, z summed), mask
-    Texture2D_2, diffuse Texture2D_3, cube s4 (DUALNORMAL in kGlassBodyHLSL); refraction 855d48c7 →
-    UniformScalar_5 is its overall scale.
-  - Pop-in: occlusion queries' GetData (IDirect3DQuery9 vtable 7, patched on the first occlusion query
-    from CreateQuery 118) reports ≥64 pixels. The game's own TOGGLEOCCLUSION flips 0x16F95C4.
-  - Vertex shaders: CreateVertexShader 91 (CTAB ViewProjectionMatrix reg), SetVertexShader 92,
-    SetVertexShaderConstantF 94 mirrored (g_vsc). PreDraw copies the VP (row-major, world→clip) while
-    the RT is the HDR scene → g_vp/g_vpKey. SSR (kSSRPS): wp = ((sx·w, sy·w, w) − t)·inv(M3) with M3
-    rows (r_i.x, r_i.y, r_i.w), t = (r3.x, r3.y, r3.w); normals from depth, world Z up.
-  - Wide bloom: BuildModernBloom in the final blend's PreDraw (XPass chain, 6 levels, fp16), bound at
-    s10 (apBloomTex), apTM4.x intensity. Our "ap*" constants/samplers may sit above the game's (c ≥
-    paramReg, s ≥ 8). hk_SetPS / PreDraw / PostDrawRestore / constant mirrors ignore g_inPostFX work.
-  - FXAA 3.11 quality (kFxaaQPS, [PostFX] FXAAQuality).
-  - Console: commands queue (g_conQueue). The game's viewport Exec (0x50E000–0x513800) has AP
-    commands: HQDLE (0x137A6BC, default 1), USEMAGICRIM (0x137A6A8, 1), TOGGLEUI (0x137ABD8),
-    TOGGLEOCCLUSION, DOORLIGHTINGFIX, TOGGLEDOFFIX, EDAA/DEDAA/EDAAOFF, value commands MINAMBIENT,
-    IRRADIANCESCALE/CONTRAST, LIGHTSCALE, STATICLIGHTSCALE, SHADOWINTENSITY(MIN), SHARPNESS,
-    DESATURATE, VIGNETTEFADE*, MOTIONBLURAMOUNT/STRETCH, MAGICRIMSCALE/Z/ROTATION, SHADOWFALLOFFRANGE.
-- 0.15.1: SSR failed to compile in 0.15.0 ("redefinition of 'k'": the legacy D3DX compiler scopes
-  for-loop variables to the function — never reuse a loop variable's name later). `ssr:` log lines
-  now report the VP capture and why SSR is off. SSR can't reach glass (translucent, no depth, drawn
-  before our pass); glass reflections stay cubemap-only.
-  Script packages: UE3 v539/licensee 91, zlib-chunked. `tools/re/upk.py` (tables + decompression),
-  `execs.py` (FUNC_Exec 0x200; flags = u32 at end−12, or end−14 with FUNC_Net), `sigs.py` (params:
-  CPF_Parm 0x80 in the u64 at +24 of a property export, children listed in reverse). Function
-  export: bytecode size at +40, code at +44. Commands → docs/script-commands.md. Pawn/HUD/
-  CheatManager execs are in the console's exec chain; CheatManager needs EnableCheats.
-  User's Materials folder (MasterMATS, Material_Skin, Material_Cloth, Material_VehicleAndWeapon,
-  PhysicalMATS, GenericMATS = Glass_0001/0002) has the material graphs (expressions) — the source
-  for mapping Texture2D_N / UniformScalar_N of material shaders.
-- 0.16.0:
-  - VS CTABs were never parsed (ParseCtab demanded a ps version token 0xFFFF....; vs is 0xFFFE....),
-    so ViewProjectionMatrix was never found and SSR never ran. Accept both.
-  - RefShaderCache-PC-D3D-SM3.upk (uncompressed): shader records = [type FName 8][Id GUID 16][skip 4]
-    [u8 platform][u8 freq][u32 size][bytecode]; shader maps end with [FName][MaterialId GUID][FString
-    friendly name] and reference shaders as [type FName][GUID][type FName]. tools/re/shadercache.py:
-    material_maps() → (material name, [(shader type, FNV hash)]) for 1972 maps / 1510 materials.
-    tools/re/matclass.py → src/matclass.h (TBasePassPixelShader* hashes owned only by skin / metal
-    materials; ~420 skin, ~480 metal). Census hash 9e6fdc78 = Mike's skin (Standard_Skin_MST_THOR).
-  - Material mask: BuildTaggedShader patches the game's bytecode (def cK = tag after the header,
-    mov oC1, cK before the end; K above CTAB + defs; skipped if the shader writes oC1 or uses relative
-    constant addressing). hk_SetPS binds the tagged copy; PreDraw binds g_matMask (fp16, r skin, g metal)
-    as RT1 when RT0 is the full-res HDR scene. Skin materials are MLM_Custom with their own layered
-    scattering in the light passes - the mask comes from the base pass only.
-  - Skin SSS (kSSSPS): separable 13-tap blur, per-channel sigma (1, .45, .25), radius = width x focal /
-    depth (focal from |VP column y| x H/2), depth + mask continuity, approx linear (x²). After AO.
-  - SSR (kSSRPS): c17 = (metal strength, mask valid), s2 = material mask; metal pixels reflect at any
-    angle, tinted by their colour. Runs when floors or metal need it.
-  - Glass SSR: BuildReplacement header adds apX[12] at paramReg+4 (if ≤ c223). PostFXRun copies the
-    finished HDR scene to g_prevHdr (half res) + g_vpPrev; the glass PreDraw binds s12 = zcopy (24-bit z,
-    1/d = A + B·z), s13 = g_prevHdr. Glass world position = camera − (TEXCOORD6 through the tangent basis
-    and LocalToWorld): the VS writes camera−position projected on the (unnormalised) tangent basis.
-  - Draw distance: "set PlayerController LODDistanceFactor 100/pct" queued whenever a new player
-    controller is seen (UE3 scales cull/LOD distance by the view's LODDistanceFactor). Unverified that
-    SET works in this shipping build — the console logs the reply.
-- 0.16.1: user's 0.16.0 crashed in the main menu (native d3d9, no DXVK; log stopped ~3 s after the last
-  line, "window closing" but no "shutdown"). Cause unknown → MessageBoxW/A IAT hooks log UE3's error box
-  text (its call stack), vectored handler logs the first fatal exceptions with module+offset (`crash?:`).
-- 0.16.2: the 0.16.1 logs showed the crash: AV in d3dcompiler_42.dll+0xf21a8 (reading 0x5b) on a
-  worker thread while a save loads = compiling our glass replacement (first glass shader of the level).
-  The game's D3DX (d3dx9_42 → d3dcompiler_42, Aug 2009) crashed on the SSR helper (function with
-  [loop] + break + early returns + VPOS). Glass SSR is now `#if GLASSSSR`, branch-free (12 unrolled
-  steps, masks), built as a second variant (gs.replSsr) after the plain one, between a marker file
-  (APRenewal_glass_compile.lock containing the version): marker present at startup → variant skipped.
-  Keep new HLSL for game-thread compiles simple: no loops with break in helper functions.
-  A real d3dcompiler_43 is in the Microsoft.DXSDK.D3DX NuGet package, but running it under Wine was
-  refused by the permission classifier — ask the user before trying that again.
-- 0.17.0 (user on 0.16.2: no crash, SSR works; snow reflected, metal mirror-like with black bands,
-  glass black rings, wood too reflective, no roughness/blur):
-  - CompileBlob: [Shaders] Compiler=auto|47|game. auto = System32 d3dcompiler_47 D3DCompile (flag
-    ENABLE_BACKWARDS_COMPATIBILITY 1<<12) unless Wine; on failure retries the game's D3DXCompileShader.
-    One critical section around every compile (game worker threads + render thread).
-  - matclass: third class 'rough' (snow|dirt|grass|terrain|carpet|concrete|stone|...; 1443 hashes) →
-    mask .b; SSR floors × (1 − rough). Tag order skin > metal > rough.
-  - kSSRPS: normals pick the neighbour with the smaller depth step per axis; tMin = 2 + 1 % of depth;
-    hits within 3 px of the start rejected; 7-tap rotated disc blur, radius = rough × hit distance /
-    hit depth (c18 = floor, metal roughness × 0.25); floor weight × lerp(0.08, 1, F5), metal × lerp(0.4, 1, F5).
-  - Glass SSR: 16 steps, branch-free 4-step refinement (lastMiss → hit), jitter = IGN of the glass
-    pixel's screen position (apX[10].zw = screen size), SSR mix × lerp(0.4, 1, 4F).
-- 0.17.1: user's 0.17.0 log: d3dcompiler_47 works (no rejects), no crash. Captures show the game's
-  final blend maps HDR < ~0.006 to exactly 0 (same in 0.16 — not a compiler change): apApplySat's
-  (c − SceneShadowsAndDesaturation.rgb) clip. apTM4.y = [Colour] ShadowDetail blends a toe c²/4s below 2s.
-  Glass SSR: tMin = 8 + 2 % of the glass distance, 16 steps, thickness + 1.5 × step length, hits within
-  4 px of the glass pixel ignored, conf × saturate(|N·V|·6), gain × apTM.y. HLSL: `near`/`far` are
-  reserved words.
-- 0.18.0 (user: "do everything except the long shot" - part 1):
-  - AF: SetTexture 65 / SetSamplerState 69 hooks; stage "plain" = texture/cube with >1 level, not RT/DS/INTZ;
-    game's MINFILTER/MAXANISOTROPY/MIPMAPLODBIAS remembered per stage and re-applied (aniso only where the
-    game asked for linear). Reset clears the tracking. Our own passes (g_inPostFX) untouched.
-  - SMAA: src/smaa.h embeds SMAA.hlsl (ASCII-cleaned, raw-string chunks) + AreaTexDX9 (A8L8 160x560) and
-    SearchTex (L8 64x16) pixels. Wrappers call the SMAA *VS functions inside the PS (one fullscreen VS);
-    SMAA_RT_METRICS = c0 (= rcpFrame). Edges/weights ColorFill-cleared each frame.
-  - BUG FIXED: `remaining` (nextOut pass count) didn't include SSS's two passes → FXAA + sharpen were
-    dropped whenever skin was on screen (0.16.0–0.17.1). Every nextOut pass must be counted.
-  - Chain: AO → SSS(2) → SSR → shafts → grade → SMAA/FXAA → TAA → sharpen.
-  - TAA (kTaaPS): no jitter. World pos from depth (c8-11 like SSR), previous VP g_taaVp at c12-15,
-    YCoCg variance clip (1.25σ), weight × saturate(1 − motion px / 40); history = StretchRect of the output.
-  - Light shafts: bright pass from g_prevHdr (now also copied when shafts > 0) → quarter-res shA;
-    max per 32x18 cell (shTiny[2], ping-pong) → GetRenderTargetData of LAST frame's → up to 4 peaks,
-    tracked/faded (g_shaft); radial blur 32 taps per light → shB; screen-blend composite.
-  - Contact shadows: soft-shadow variant CONTACT (needs paramReg+16 ≤ 224): apX[0..3] = Inverse4 of
-    ScreenToShadowMatrix (from g_psc), march h0 − (0,0,dz·k,0) (same shadow texel, closer to the light),
-    map back to (sxW, syW, W), compare with scene-alpha depth; dz scaled so 8 steps ≈ 30 world units.
-  - Bokeh: DOF blend, background only, 24-tap golden-angle gather of SceneColorTexture, tap accepted
-    if its own CoC × radius reaches it, highlight weight 1 + 4·lum². apTM4.z radius px, .w boost.
-  - Motion blur: StaticVelocityParameters = camera ([Effects] MotionBlur), Dynamic = objects (MotionBlurObjects).
-  - Census logs UniformScalar_N / UniformVector_N values at each shader's first draw (`census:     values`).
-  - 0.18.1 (user: faces "way too smooth and blurry"): SSS radius was width x focal / depth with width
-    1 unit → ~40 px at close-up (capped 48) and blurred albedo too. Now 0.2 x width x focal / depth, cap
-    12 px, and 65 % of the per-pixel luminance restored after the blend (keeps texture, keeps the red
-    terminator bleed). TAA history × (1 − 0.75·skin) via mask on s3, default 75. Shaft bright pass
-    excludes skin (mask s1), threshold 2.5.
-  - 0.19.0: user's 0.18.0 log: kShaftBrightPS failed on both compilers ("Bitwise operations not supported
-    on ps_3_0" - `i & 1`): shafts never ran. Fixed (4 explicit taps). Census with values (armory, two
-    weapons + Mike): weapon light pass 2198188e decoded - spec = pow(max(R·V,.01), lerp(US42, US41, tex.z))
-    → SpecularRampMap lookup × spec map × US43 × US44; Fresnel pow(1−N·V, US0) lerp(US2, US1); diffuse
-    lerp(V8 low, V9 high, N·L). Skin light pass 54793f09: spec pow(max(R·V,0), c40 = US77 = 7), Fresnel
-    pow(·, US74 = 12) lerp(US73, US72), layered SSS terms. tools/re/specregs.py finds, per skin/metal
-    TLightPixelShader in the cache, the constants of the pow whose base comes from max() (= specular;
-    Fresnel bases come from add 1−x), following log → cmp → mul → exp → src/specregs.h (305 shaders).
-    PreDraw scales them (PdSet) by [Materials] SkinGloss / MetalGloss.
-  - Still to do (part 2): weapon master + skin sheen rebuild (needs a values census near a weapon /
-    face), dixi absorption (user's dixi.ini: Sony pads via DirectInput, button/axis remaps; dixi exposes
-    them as XInput), HUD/subtitle scale (Scaleform canvas RE), 120 fps physics check.
-- 0.20.0:
-  - Light shafts were re-picked from screen-space peaks every frame → jumped with the camera. Now the max map
-    outputs (peak lum, its uv, its depth from g_fx.depth/zcopy), peaks are unprojected with the VP the tiny map
-    was drawn with (g_shaftVp[], = g_vpPrev at copy time), tracked in world space (tolerance 40 + 12 % of
-    depth, 8 missed frames before fading, slow EMA), re-projected with g_vp each frame, faded at screen edges.
-  - Grade black level: old c − b clip (b = 1/1000) crushed everything under ~4 % sRGB. Now soft toe
-    c²/(c+b)·(1+b), negative = lift; ini key BlackLevel2 (1/10000), default 0.
-  - Controller layer src/pad.h (`pad:` log): game imports xinput1_3 ordinals 2 (GetState) and 3 (SetState)
-    + dinput8 DirectInput8Create (mouse). out/xinput1_3.dll (src/xinput/) = forwarders to d3d9.APR_XInput*
-    exports (d3d9.def). If the exe's import still points elsewhere (system/Wine xinput) the IAT is redirected
-    to APR_*; if dixi is present (dinput8 exports XInputGetState) we stay out of the way. Merged virtual pad
-    on slot 0: system XInput (xinput1_4 → 9_1_0 → 1_3 by System32 path, GetStateEx ordinal 100), Sony HID
-    thread per device (DS4 05C4/09CC/0BA0, DualSense 0CE6/0DF2; BT = InputReportByteLength != 64; feature
-    0x02/0x05 read switches BT to full reports 0x11/0x31; output 0x05/0x11 (DS4), 0x02/0x31 (DS5), BT CRC32
-    seeded 0xA2 at [74]), DirectInput pads polled every 4 ms in the pad thread with maps (kDiKnown, generic
-    D-mode if Rz exists else Xbox-style, ini Map_VVVVPPPP). XInput-capable DI devices ("IG_") and Sony (not
-    DS3) are skipped in DI. Untested on hardware (Wine is broken in this sandbox).
-- 0.20.1:
-  - Auto gamepad/KBM switch (pad.h PadAutoSwitchTick, from hk_PeekMessageW on the main thread): the game's
-    "Enable gamepad" option = bit 0 of [0x16F9A00 (UAPProfileManager singleton, cf. execGetProfileManager
-    0xAB3E40)] + 0x13C. Tick functions 0xAC7B00 / 0xAC8DC0 re-read it every frame: input object +0x2AC,
-    +0xF0 == 2 && pad connected (0xA274F0) && bit → clear flag 0x800 at +0x1FC (gamepad), else set it (KBM);
-    a change notifies the UI. Bytes verified at 0xAC7B48/51 and 0xAC902F/38. Pad activity = button,
-    trigger > 40, stick > 8000 (g_padTick in APR_XInputGetState, also polled by us when the game stops);
-    KBM = WM_KEYDOWN (no repeat) / mouse buttons / wheel, DI mouse motion > 6, or cursor motion when the
-    game hasn't read the DI mouse for 250 ms.
-  - Shafts: user saw stripes next to lamps (radial blur comb). kShaftFillPS: 8 taps across one coarse tap
-    spacing along each light's ray, lights weighted by z / dist². Dither in the radial pass only without it.
-- 0.20.2 (user on 0.20.1: auto switch works; bands on distant lights; mouse moves the camera with the menu open):
-  - Shafts: fill along a share-weighted mix left one light's comb unfilled near another light. Now per light:
-    radial (only L0 set) → shB, fill → shC with ONE/ONE blending (cleared first), composite from shC.
-  - Menu: exe IAT GetCursorPos / SetCursorPos hooked - frozen while the menu is open (UE3 can recentre and
-    read deltas). Cause not confirmed: MenuInputReport logs on close how often the game read the DI mouse
-    (state / buffer), other DI devices (with input), GetCursorPos / SetCursorPos while open.
-  - pad.h: DI devices refused (IG_ / data format) remembered by instance GUID (were re-created every scan).
-- Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
-  height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
+## HDR (DXVK)
+- `UnlockAdditionalFormats` → fp16 backbuffer, `SetColorSpace(scRGB)`; highlights rebuilt from the HDR
+  scene buffer before the UI; encode at Present. HDR10 + fp16 froze presentation.
+- On the user's Windows PC the DXVK path is SDR-limited (highlight test patches all equal) → HDR off by
+  default, gated by HdrAllowed() = Wine || `[HDR] AllowWindows`. DXVK v3.1.1 needs commit 3c40ca1
+  (swapchain colorspace). Only remaining native route: own DXGI/D3D11 swapchain via interop (not started).
 
-## Reverse engineering
-- `docs/apgame-re.md` has the exe findings; `tools/re/apgame_natives.json` maps 2804 UE3 natives
-  (`Class::execFunc` → address, Steam exe); `tools/re/dis.py` disassembles with names. Start there.
+## Controllers (src/pad.h, `pad:`)
+- Game imports xinput1_3 ordinals 2 (GetState) and 3 (SetState) and dinput8 (mouse only). Our
+  xinput1_3.dll forwards to d3d9.APR_XInput*; otherwise the IAT is redirected. GOG dixi (dinput8.dll
+  exporting XInputGetState) present → we stay out of the way.
+- One merged pad on slot 0: system XInput (xinput1_4 → 9_1_0 → 1_3 by System32 path, ordinal 100 for
+  Guide), Sony HID thread per device (DS4 05C4/09CC/0BA0, DualSense 0CE6/0DF2; BT = input report length
+  ≠ 64; feature 0x02/0x05 enables full BT reports 0x11/0x31; output 0x05/0x11 DS4, 0x02/0x31 DS5, BT CRC32
+  seeded 0xA2), DirectInput pads polled every 4 ms with maps (kDiKnown, generic D-mode vs Xbox-style,
+  ini `Map_VVVVPPPP`); XInput (`IG_`) and Sony devices skipped in DI. Buttons OR, triggers max, sticks
+  by magnitude.
+- Auto switch (`PadAutoSwitchTick`, main thread): pad = button / trigger > 40 / stick > 8000; KBM = key
+  down (no repeat), mouse buttons/wheel, DI mouse motion, or cursor motion when DI is idle. Confirmed working.
 
-## Known not-our-bugs
-- MulderConfig "Allow higher-res world/weapon textures" breaks textures (see-through gun cabinet,
-  blocky pants). Parked.
+## Audio
+- OpenAL loaded at runtime (`DeviceName=Generic Software`); with OpenAL Soft 1.25.2 legacy names map to the
+  default device, `ALC_HRTF_SOFT` + stereo HRTF output, `alcResetDeviceSOFT` toggles live.
 
-## Ideas queued
-- Maybe absorb dixi (controller remapping) too.
-- Shader bytecode replacement, better window glass, physics check at 120 fps.
+## Proton / Steam Deck (untested)
+- `DetectCompat()`: `wine_get_version`, `SteamDeck=1`. Launch `WINEDLLOVERRIDES="d3d9,openal32=n,b" %command%`.
+  Windows-only bits (DisplayConfig SDR white, DXGI diag) fail soft.
+
+## The user's setup
+- RTX 4080 SUPER + AMD iGPU, 2560×1440, 400-nit HDR monitor, headphones on a Burson DAC.
+- DXVK as RealD3D9, OpenAL Soft (Creative router kept as backup), MulderConfig launcher (edits APEngine.ini;
+  its "higher-res textures" option breaks textures — not our bug).
+- Pads: DualSense (USB, sometimes BT) and Xbox Series X; wants generic support, not tailored.
+- AlphaFixer (winmm.dll) and dixi are replaced; user told to delete them.
+
+## Open items
+- Steam APGame.exe: user will supply it → make exe patches version-agnostic (signature scans instead of
+  fixed addresses).
+- HUD/subtitle scale (Scaleform canvas RE), 120 fps physics check.
+- Menu + mouse: game camera moved with the menu open in KBM mode; cursor freeze added, cause unconfirmed
+  (see the `menu closed (...)` log line).

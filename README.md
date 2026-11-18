@@ -1,528 +1,95 @@
-# APRenewal 0.20.2 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal
 
-A research-and-fix base layer. It sits alongside the mods you already have:
+A `d3d9.dll` mod for **Alpha Protocol** (2010, Unreal Engine 3): modern rendering, widescreen,
+controller support, HRTF audio and quality-of-life fixes, all switchable live from an in-game menu.
 
-| Slot | Who owns it |
-|---|---|
-| `winmm.dll` (AlphaFixer, not needed from 0.9) | AlphaProtocolFixer (FOV / HUD / widescreen) |
-| `xinput1_3.dll` | **APRenewal** controller layer (replaces GOG's "dixi" `dinput8.dll` + `xinput1_3.dll` from 0.20) |
-| `d3d9.dll` | **APRenewal** |
-| `OpenAL32.dll` | **OpenAL Soft 1.25.2** (optional, replaces Creative's router; for HRTF) |
+> Patches inside the game's code (FOV/HUD, intro skip, console, gamepad/keyboard switching) currently target
+> the **GOG** `APGame.exe`. Every patch checks the exe's bytes first and switches itself off (with a
+> log line) on any other build. Steam support is in progress.
 
 ## Install
-Copy `d3d9.dll`, `xinput1_3.dll` and `APRenewal.ini` into `Alpha Protocol\Binaries\`.
-From 0.20 APRenewal does the controller support itself: **delete (or move out) GOG's dixi** -
-`Binaries\dinput8.dll` and `Binaries\xinput1_3.dll` - and use APRenewal's `xinput1_3.dll` instead.
-Uninstall = delete APRenewal's files (and put dixi back if you want it).
-The log goes to `Binaries\APRenewal\APRenewal.log`.
+1. Copy into `Alpha Protocol\Binaries\`:
+   - `d3d9.dll` and `APRenewal.ini`
+   - `xinput1_3.dll` (controller support)
+   - `OpenAL32.dll` (optional, for HRTF audio; back up the original first)
+2. Remove what APRenewal replaces:
+   - AlphaFixer: `winmm.dll` and `AlphaFixer.ini`
+   - GOG's "dixi" controller wrapper: `dinput8.dll` and dixi's `xinput1_3.dll`
+3. Start the game and press **Insert** to open the menu.
 
-## Steam Deck / Linux (Proton) — untested yet, please send logs
-1. Copy `d3d9.dll`, `APRenewal.ini` and `OpenAL32.dll` into `Alpha Protocol/Binaries/`.
-   Leave `RealD3D9` **empty**: Proton's own DXVK is used. Don't copy `winmm.dll`, `dinput8.dll` or
-   `xinput1_3.dll` (Steam Input handles the controller; APRenewal still routes it through Wine's XInput).
-2. Steam > Alpha Protocol > Properties > Launch options:
-   `WINEDLLOVERRIDES="d3d9,openal32=n,b" %command%`
-3. Check `APRenewal.log`: it should say `compat: running under Wine ...` and `system d3d9 ... -> <address>`.
-- Performance on the Deck: keep `RenderScale=100`; if the frame rate drops, turn AO off first.
-- HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
-  add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
-  path can actually show highlights. Check with the test pattern + "Highlight test".
+Settings live in `APRenewal.ini` (the menu saves there). The log goes to `Binaries\APRenewal\APRenewal.log`.
 
-## New in 0.20.2
-- **Light shafts: no more bands where rays cross other lights.** 0.20.1 smoothed all shafts together,
-  along a blend of the lights' directions - so one light's rays stayed striped wherever they passed
-  near another light (the distant ones). Each light is now blurred and smoothed on its own and the
-  results are added up.
-- **Menu vs. camera**: with the APRenewal menu open the game now also sees a frozen mouse cursor (it
-  can recentre the cursor and read the camera from it, which got past the DirectInput blocking).
-  When the menu closes, the log lists what the game tried to read while it was open - if the camera
-  still moves, send that line.
-- The controller scan no longer re-creates (and logs) DirectInput copies of Xbox pads every 2 s.
+**DXVK (optional):** rename DXVK's 32-bit `d3d9.dll` to `d3d9_dxvk.dll`, put it in `Binaries\` and set
+`[Chain] RealD3D9=d3d9_dxvk.dll`.
 
-## New in 0.20.1
-- **Gamepad and keyboard + mouse switch automatically.** The game's own "Enable gamepad" option turns
-  keyboard and mouse off completely. APRenewal now flips that option to whatever you touched last -
-  press a pad button or push a stick and the game is in gamepad mode, press a key, click or move the
-  mouse and it's back to keyboard + mouse. Controller tab / `[Controller] AutoSwitch`.
-- **Light shafts without stripes.** The shaft blur takes 64 samples toward the light, so it drew a
-  faint copy of the lamp every sample - the regular gaps and bands next to some lights. A second pass
-  now smooths each shaft across one sample spacing, which turns the copies into a continuous streak.
+**Steam Deck / Linux (Proton, untested):** copy `d3d9.dll`, `APRenewal.ini` and `OpenAL32.dll`, leave
+`RealD3D9` empty, and set the launch options to `WINEDLLOVERRIDES="d3d9,openal32=n,b" %command%`.
+Steam Input handles the controller.
 
-## New in 0.20.0
-- **Controller support built in - dixi is retired.** One merged pad for player 1, from whatever is
-  plugged in: Xbox 360 / One / Series pads (XInput, any connection), **DualSense, DualSense Edge and
-  DualShock 4 read directly over USB or Bluetooth** (with rumble, and an optional light bar colour),
-  and other DirectInput pads (Switch Pro, DualShock 3, Logitech in D mode, PS2 adapters, generic USB
-  pads) with built-in button maps. Mix and match - use the DualSense one evening and the Xbox pad the
-  next, no settings to change. New **Controller** tab: rumble strength, extra dead zone, touchpad =
-  Back, Swap A/B, free button remap, light bar colour, and a list of what's connected. The game no
-  longer needs the DirectX runtime's xinput1_3: APRenewal ships its own `xinput1_3.dll`.
-  Unknown DirectInput pad with odd buttons? Add `Map_VVVVPPPP=` under `[Controller]` (see the ini).
-  If Steam Input or DS4Windows is running too, the pad shows up twice - harmless, buttons are merged,
-  but turn those off if anything acts strange.
-- **Light shafts stay put.** They used to re-pick "the brightest spots on screen" every frame, so they
-  jumped around whenever the camera moved. Now each source is located in the world (from the depth
-  buffer), tracked there and re-projected every frame, fades in over half a second, survives a few
-  frames of being hidden, and fades out as it leaves the screen.
-- **Black level is a soft toe now** (`[Grade] BlackLevel2`, default 0). The old one subtracted a value
-  and clipped - even 1 turned everything under ~4 % brightness pitch black. Now positive values deepen
-  shadows gradually without losing their gradation, negative values lift them; 0 leaves them alone.
+## Features
 
-## New in 0.19.0
-- **Skin and weapon gloss** (`[Materials] SkinGloss / MetalGloss`, Lighting & shadows tab). From your
-  armory census and the shader cache: the game's skin lighting uses a specular exponent of ~7 and
-  weapons 3-10, which gives broad, plastic-looking highlights. APRenewal now finds that exponent in
-  each skin / weapon lighting shader (175 skin and 130 metal shaders, by hash) and scales it:
-  2.5x for skin, 3.5x for weapons by default - tighter highlights, so skin reads as moist instead of
-  waxy and guns as metal instead of plastic.
-- **Light shafts actually work now**: their bright-pass shader used a bitwise operation, which SM3
-  shaders can't do, so it never compiled in 0.18.x.
+### Image
+- **Anti-aliasing:** SMAA, FXAA 3.11 or fast FXAA, plus a temporal stabiliser (reprojected,
+  variance-clamped history) and contrast-adaptive sharpening. All of it runs before the HUD, so text
+  stays crisp.
+- **Supersampling:** renders at up to 2× your desktop resolution and downscales with a Mitchell filter
+  (`[Display] RenderScale`).
+- **Anisotropic filtering** forced on the game's textures, with mip bias.
+- **Borderless window**, precise frame cap, VSync override.
 
-## New in 0.18.1
-- **Faces are sharp again.** The skin scattering blur was far too wide up close (up to 48 px on a
-  close-up face) and it blurred the finished image, skin texture included. It's now a few millimetres
-  (max 12 px), and most of each pixel's original brightness is put back, so pores, stubble and
-  eyebrows stay crisp - what's left is the red glow at shadow edges. Default strength 40 %.
-- Temporal stabiliser: less history on skin (talking and blinking faces move on their own, which
-  camera reprojection can't follow) and a lower default (75 %).
-- Light shafts: brightly lit faces no longer count as light sources (that made the soft glow around
-  faces in cutscenes); default threshold 2.5.
+### Lighting and materials
+- **Ambient occlusion:** GTAO (horizon-based) from the game's 24-bit depth buffer. It is removed behind
+  window glass and fades with fog.
+- **Soft shadows:** shadow maps up to 4× resolution, a rotated-disc soft filter and contact shadows.
+- **Screen-space reflections** on floors and metal, with roughness blur. Rough materials (snow, dirt,
+  carpet, concrete…) never reflect.
+- **Skin:** subsurface scattering and tighter, glossier highlights.
+- **Weapons and metal:** glossier highlights and metal reflections.
+- **Window glass:** clearer, angle-dependent (Fresnel) reflections, screen-space reflections from the
+  previous frame, refraction control.
+- **Character lighting:** fill and evenness controls for the game's light probes.
 
-## New in 0.18.0
-- **Anisotropic filtering** (`[Textures]`, Image tab): 16x on the game's material textures, plus an
-  optional mip bias for sharper distant textures. Render targets and shadow maps are left alone.
-- **SMAA** (`[PostFX] AAMode=2`, the new default): sharper anti-aliased edges than FXAA (SMAA 1.0 by
-  Jorge Jimenez et al., MIT licence - see `docs/SMAA-LICENSE.txt`).
-- **Temporal stabiliser** (`[PostFX] TemporalAA`): the previous frame, reprojected through the camera
-  motion and clamped to the current neighbourhood, is blended in. It calms shimmer and the noise of
-  the AO / reflections. It doesn't jitter the game's camera, so it isn't full super-sampled TAA.
-- **Contact shadows** (`[Shadows] ContactShadows`, with the soft shadow filter): short rays toward
-  the light catch the small gaps the shadow map is too coarse for (feet, hands, furniture legs).
-- **Light shafts** (`[Effects] LightShafts`): rays streaming from up to four bright lamps or windows
-  on screen. The lights are found automatically each frame and fade in and out smoothly.
-- **Round bokeh** (`[Effects] Bokeh`): the background blur of the game's depth of field becomes
-  disc-shaped, with bright spots turning into bokeh circles.
-- **Motion blur split**: separate sliders for camera and object motion blur.
-- **Fixed**: whenever skin was on screen, FXAA and sharpening were silently skipped (the skin pass
-  wasn't counted in the post-processing chain since 0.16.0).
-- Shader census now also logs each material's parameter values (groundwork for the weapon and skin
-  material rework).
+### Post-processing
+- **Tonemapping:** a smooth highlight roll-off instead of the game's hard clip, hue preservation,
+  selectable gamma, and a soft toe instead of its black clip (`[Colour] ShadowDetail`).
+- **Colour grading:** exposure, S-curve contrast, vibrance, saturation, a soft black level and
+  temperature, all in linear light.
+- **Bloom:** the game's bloom tent-filtered, plus a wide HDR bloom.
+- **Light shafts** from lamps and windows, anchored to their sources in the world.
+- **Depth of field** with round bokeh, plus the game's motion blur, fog and edge AA, each with its own
+  strength.
+- **HDR output** (scRGB through DXVK). Works under Proton with gamescope HDR; off by default on Windows.
 
-## New in 0.17.1
-- **Shadow detail** (`[Colour] ShadowDetail`, Colour tab): the game's own colour grading subtracts a
-  shadow level and clips everything below it to pure black (measured from your captures: the darkest
-  ~0.5 % of scene brightness all becomes 0). APRenewal's final pass now uses a soft toe there instead,
-  so dark areas keep their detail. 0 = the game's clipped look.
-- **Glass reflections**: thickness grows with each ray step (thin things like Mike were stepped over,
-  leaving banded silhouettes), rays start a little off the pane (the window frame no longer reflects
-  itself as white bands at steep angles), and reflections fade out at grazing angles. They now also
-  follow the *Glass reflections* slider like the cubemap does.
+### View and game
+- **Field of view:** Hor+ widescreen with a configurable FOV that applies to every camera. On wider
+  screens the HUD and menus stay centred at 16:9. Replaces AlphaFixer.
+- **Skips the intro logo movies.**
+- **No pop-in:** occlusion culling turned off, longer draw and detail distances.
+- **Developer console** in the menu, including Alpha Protocol's own rendering commands.
+- **Pause on focus loss:** game and dialogue timers stop while you alt-tab. Also keeps the cursor
+  inside the window.
 
-## New in 0.17.0
-- **Newer shader compiler** (`[Shaders] Compiler`, Diagnostics tab): APRenewal's own shaders are now
-  compiled with Windows' `d3dcompiler_47` (in System32 on Windows 10/11) instead of the game's 2009
-  compiler, which crashed on the glass shader. If it rejects a shader, the old one is tried; under
-  Wine/Proton the old one is used. `compiler:` lines in the log say which.
-- **Reflections, take two**:
-  - Blur that grows with distance (`[Reflections] Roughness`, `[Materials] MetalRoughness`), so
-    floors and metal look glossy instead of mirror-like.
-  - Floors reflect mostly at grazing angles (Fresnel), much less when you look down at them.
-  - Materials named like snow, dirt, grass, carpet, concrete, stone... (1,400+ shaders) are marked
-    rough and don't reflect at all.
-  - Metal: weaker by default (25 %), no more self-reflection bands (the ray starts off the surface,
-    better normals at edges and on small curved objects).
-  - Glass: more steps, refined hits and per-pixel jitter instead of the rings; the reflection is
-    blended in more gently head-on.
+### Controllers
+- One merged player-1 pad built from everything plugged in:
+  - **Xbox** pads (any connection)
+  - **DualSense, DualSense Edge and DualShock 4** over USB or Bluetooth, with rumble and light bar colour
+  - Other **DirectInput** pads: Switch Pro, DualShock 3, Logitech, PS2 adapters, generic, with your own
+    maps in the ini
+- **Switches automatically** between gamepad and keyboard + mouse, depending on what you touched last.
+- Rumble strength, extra dead zone, Swap A/B and free button remapping.
 
-## New in 0.16.2
-- **Fixed the crash when loading a save.** The new glass-reflection shader crashed the game's own
-  shader compiler (`d3dcompiler_42.dll`) when the level's glass loaded. It's rewritten without
-  loops and branches, built separately from the normal glass, and guarded: if the compiler ever
-  crashes on it again, the next launch notices and keeps glass on the old cubemap reflections
-  (`glass:` line in the log; delete `APRenewal_glass_compile.lock` to retry).
+### Audio
+- **HRTF 3D audio** for headphones through OpenAL Soft. The included `OpenAL32.dll` is OpenAL Soft
+  1.25.2. It can be switched live.
 
-## New in 0.16.1
-- Crash reporting: when the game shows its error box (or something crashes), the text and the module
-  it happened in go to `APRenewal.log` (`game: message box` / `crash?:` lines). 0.16.0 crashed on one
-  PC in the main menu; this build is for finding out why. To narrow it down, turn things off one at a
-  time in `APRenewal.ini`: `[Materials] Enable=0`, `[Glass] ScreenReflections=0`, `[Game] DrawDistance=100`.
-
-## New in 0.16.0
-- **Floor reflections actually run now.** 0.15.1 compiled the shader, but the camera matrix was never
-  found: the shader reader only accepted pixel shaders, so the game's vertex shaders (where the
-  matrix lives) were skipped. Look for `ssr: view-projection found` in the log.
-- **Glass reflects the room** (`[Glass] ScreenReflections`): window glass traces its reflection
-  through this frame's depth and takes the colour from the previous frame, reprojected. Where the
-  ray leaves the screen, the old cubemap is used.
-- **Skin and metal**: APRenewal now knows which shaders belong to skin and metal materials. The
-  game's shader cache lists every material's shaders by name; the skin materials (Mike's
-  `Standard_Skin_MST_THOR`, the NPC skins...) and the metal ones (weapons, `Metal*`, pipes, chains)
-  are marked while the scene is drawn.
-  - **Skin subsurface scattering** (`[Materials] SkinScatter`): light bleeds softly through skin,
-    with red travelling furthest - faces lose the plastic look.
-  - **Metal reflections** (`[Materials] MetalReflections`): weapons and metal props reflect the
-    scene on screen, tinted by their own colour.
-- **Draw distance** (`[Game] DrawDistance`, Game tab): objects stay visible and keep their detailed
-  models further away (150 % by default). Set through the game's own LODDistanceFactor at every
-  level load.
-
-## New in 0.15.1
-- **Screen-space reflections fixed**: the reflection shader failed to compile in 0.15.0 (a variable
-  name clash only the real compiler catches), so nothing was reflected. The log now also says why
-  reflections aren't running if something else is missing (`ssr:` lines).
-- **More console shortcuts** (Game tab, now grouped): camera bob, copyright overlay, free camera,
-  freeze world, aim depth of field, subtitles, aim assist, recoil, infinite ammo, cheats (God,
-  Ghost). The full list of the game's script commands is in `source/docs/script-commands.md`.
-
-## New in 0.15.0
-- **AO fades with fog** (`[AO] FadeWithFog`). The game's height fog is rebuilt so it also writes
-  how much fog each pixel has; the AO pass fades out by that amount, so fogged distance no longer
-  has dark AO outlines.
-- **Door glass**: the third glass material (two normal maps, doors with small panes) and its
-  refraction shader are improved like the windows.
-- **Distant objects popping in** (`[Game] NoOcclusionCulling`): the trees behind the wall were hidden
-  by the game's occlusion culling. Occlusion queries now always report "visible".
-- **Screen-space reflections** (`[Reflections]`, Lighting & shadows tab): floors and other
-  upward-facing surfaces reflect what's on screen. World positions come from the game's own
-  view-projection matrix (read from its vertex shaders) and the 24-bit depth.
-- **Wide HDR bloom** (`[Effects] ModernBloom`): a soft, wide modern glow built from the HDR scene
-  (6-level downsample/upsample chain) and added in the final pass, next to the game's bloom.
-- **Better AA**: FXAA 3.11 quality (edge search along the whole edge) next to the fast version.
-- **Console shortcuts** (Game tab): buttons for commands found in the game's own exec handler —
-  HUD toggle, screenshots, hi-res screenshots, FPS / timing, slow motion, occlusion, Obsidian's
-  high-quality character lighting and rim light, door lighting fix, view modes, show flags — plus a
-  list of the value commands (MINAMBIENT, IRRADIANCESCALE, SHARPNESS, DESATURATE...).
-
-## New in 0.14.2
-- Fixed the light trapezoid without AO at some angles: some frames first render a second view
-  (scene capture) that also contains glass, and its glass coverage was left in the mask for the main
-  view. The mask is now per scene, only for full-resolution views, and weighted by how opaque the
-  glass is (near-invisible glass keeps the AO behind it).
-
-## New in 0.14.1
-- **No more AO through windows** (`[AO] BehindGlass`, Video → Lighting & shadows). Our glass shader
-  now also writes a coverage mask (second render target); the AO pass skips pixels seen through
-  glass, so contact shadows don't show up on the window. Needs the improved glass on.
-- User confirmed: soft shadows work, including very soft settings.
-
-## New in 0.14.0
-- **Window glass** (Video → Effects, `[Glass]`). From the shader census: the game's two glass
-  materials were rebuilt from their bytecode. They squared the reflection's brightness (dim
-  reflections went black) and had no angle dependence, at fixed opacity. Now: clearer glass,
-  stronger reflections, Fresnel-style reflections (weak head-on, strong at grazing angles), bright
-  reflections add opacity like real glass, plus bumpiness and refraction sliders. "Game's glass"
-  button restores the original look.
-- **Shadow fixes**: soft shadows used the wrong matrix layout (UE3 packs matrices row-major), so the
-  shadow landed in the wrong place → disappeared. Fixed. Changing the shadow resolution in the menu
-  no longer breaks shadows until restart (the running scale stays fixed until the next launch).
-
-## New in 0.13.0
-- **Soft shadows** (Video → Lighting & shadows, `[Shadows] Filter/Radius`). The game's shadow
-  projection is rebuilt with a rotated 16/32/48-sample disc filter (hardware PCF per sample when the
-  shadow map is a depth texture), so shadow edges are smooth instead of grainy. Radius slider sets
-  how soft. Built on first use per light type; failures fall back to the game's filter (log: `shaders:`).
-- **Character lighting** (`[Lighting]`). Characters and moving objects are lit from Obsidian's baked
-  light probes (spherical harmonics) plus a sky term. When a probe misses a lamp, Mike's front goes
-  dark. *Even out lighting* removes part of the directional term (dark side lifted), *Fill light*
-  adds ambient. Off by default.
-- **Shader census** (Diagnostics): logs every pixel shader one frame uses, with draw counts, a hash
-  and its constant names — the tool for finding specific materials (glass) to patch next.
-
-## New in 0.12.0
-**New menu layout:** Video (Image, Colour, Effects, Shadows & AO, View, HDR), Audio, Game,
-Diagnostics, Miscellaneous.
-
-**The game's own effects, tuned in its shaders** (Video → Effects, `[Effects]`; 100 % = the game):
-- **Bloom**: intensity, threshold, and *smooth bloom* — the quarter-res glow is now tent-filtered
-  instead of a single bilinear tap, so no blocky, shimmering halos.
-- **Depth of field**: strength (0 = off) and the same smoothing for its quarter-res blur.
-- **Fog**: density (0 = off).
-- **Motion blur**: strength (0 = off). The same pass holds the game's own edge anti-aliasing
-  (a blur along edges) and its unsharp-mask sharpening — both now have sliders.
-- **Gamma** (Video → Colour, `[Tonemap] Gamma`): the game encodes with a plain square root;
-  sRGB or 2.2 can be chosen. Default stays the game's.
-Bloom/DOF/gamma live in APRenewal's version of the final pass (`ReplaceFinalPass=1`).
-Diagnostics lists every recognised game shader and whether it's in use.
-
-## New in 0.11.0 — game shader patching
-APRenewal now recognises the game's own shaders as they load (by the constant names compiled into
-them) and fixes them. Log prefix `shaders:`.
-- **Highlight roll-off** (Colour tab, `[Tonemap]`). The game's final HDR→LDR pass hard-clips
-  everything brighter than white (`saturate`) before its gamma, so lamps, windows and sky turn into
-  flat white blobs. Our version of that pass is the same maths with a smooth shoulder instead of
-  the clip: below the knee nothing changes, above it highlights keep their detail and colour. Both
-  variants are covered (plain bloom, and DOF + bloom + vignette). Toggle it to compare live.
-- **Shadow filter fix** (Game tab, `[Shadows] Softness`). The shadow shaders' sample offsets and
-  buffer size were sized for the 2048 map; with the bigger map they skipped texels (grainy edges).
-  They're now rescaled per draw: 0 = filter matched to the new map (sharp), 100 = the game's soft
-  width.
-
-## New in 0.10.1
-- Intro skip fixed: the logo movies (`slate_sega`, `slate_obsidian`, `slate_ap`) start *after* the
-  main menu's 3D scene, so 0.10.0 let them through. They are now skipped by name
-  (`[Game] SkipMovies=slate_`); loading-screen and story movies still play.
-
-## New in 0.10.0
-New **Game** tab in the menu (Insert):
-- **Skip intro logos** (`[Game] SkipIntros=1`, on by default). Movies that start before the first
-  3D scene are refused, so the game goes straight to the main menu. In-game movies (news reports)
-  still play. Each movie shows in the log as `movie: '<name>' skipped/playing`.
-- **Shadow resolution** (`[Shadows] Scale=2`, applies at next launch). The game's shadow map is 2048²
-  no matter what MaxShadowResolution says. APRenewal creates it 2x (4096²) or 4x (8192²) larger and
-  scales every draw into it, so shadow edges get sharper. Log: `shadow:`. If shadows break
-  (missing, shifted, striped), set Scale=1 and send the log.
-- **Developer console** (`[Game] Console=1`). Type Unreal Engine 3 commands into the Game tab once a
-  save is loaded (`slomo 0.5`, `stat fps`, `show fog`…). The release build stripped some commands; the
-  reply (or "(done)") shows under the input. Log: `console:`.
-
-## New in 0.9.8
-- HDR is off on native Windows. The 0.9.7 highlight test showed the output never gets brighter than
-  SDR white there (all patches equal, with or without Compensate), so it only cost performance. Use
-  NVIDIA RTX HDR (NVIDIA app) instead. `[HDR] AllowWindows=1` brings it back for experiments.
-  DXVK stays an optional presenter on Windows (`RealD3D9`).
-- Proton / Steam Deck support: Wine is detected (`compat:` in the log), HDR stays available there
-  (gamescope), and chain-loading guards against Wine handing back our own d3d9. See the Steam Deck section.
-
-## New in 0.9.7
-- HDR test pattern: "Highlight test" checkbox (shown while the pattern is on). The bottom row becomes
-  six patches at 1x, 1.25x, 1.5x, 2x, 3x and 4x paper white. Look at the monitor, not a screenshot
-  (captures clip at SDR white). If the patches get brighter left to right, real highlights reach
-  the display and Compensate + HDR is worth keeping. If they all look the same, this output path is
-  limited to SDR white and HDR gives nothing over the normal SDR mode: turn it off.
-
-## New in 0.9.6
-- HDR: "Compensate" toggle (`[HDR] CompensateSRGB`). The 0.9.4/0.9.5 test pattern fits one model
-  exactly: our linear scRGB output is decoded as sRGB a second time somewhere after DXVK and shown
-  at SDR white. Compensate pre-encodes the output with the sRGB curve relative to paper white, so
-  that second decode cancels out. Test it with the test pattern: all 32 grey steps visible and the
-  bars matching hdr_testpattern.png = fixed. (NVIDIA "layered on DXGI" made no difference.)
-
-## New in 0.9.5
-- Fixed: the game could stay in memory after quitting. While closing, its window loses focus,
-  and the focus pause parked the game thread waiting for focus that never came back. The pause
-  now stands down once the window is closing or hidden.
-- HDR: the user's test pattern showed the output being decoded as SDR sRGB at SDR white and
-  clipped at 1.0 (grey ramp flat above ~57%, 75% bars → full primaries), so the HDR colour space
-  is lost after DXVK. The HDR tab now explains the NVIDIA "Vulkan/OpenGL present method → Prefer
-  layered on DXGI Swapchain" setting, which routes Vulkan windows through DXGI (HDR-aware).
-
-## New in 0.9.4
-- HDR diagnostics: the log and HDR tab now say which GPU the game's monitor is plugged into and
-  whether Windows HDR is really on for it (DXGI output colour space). A monitor on the iGPU while
-  the RTX renders, or HDR off, both turn HDR output into clipped, neon SDR.
-
-## New in 0.9.3
-- HDR test pattern (HDR tab): replaces the frame with colour bars, a grey ramp, primaries and skin
-  tones, sent through the same HDR path as plain SDR. `docs/hdr_testpattern.png` is the identical
-  image: open it in the Windows Photos app (an SDR app) with HDR on and compare side by side.
-  Same look = APRenewal's HDR path is correct and the punchiness is the game's own colours;
-  different = something between APRenewal and the screen (DXVK, driver, display mode).
-
-## New in 0.9.2
-- HDR, still too punchy in 0.9.1:
-  - Paper white now defaults to Windows' own "SDR content brightness" (`PaperWhite=0`), so the
-    game's whites match the desktop's.
-  - SDR → light conversion uses the sRGB curve Windows uses for SDR apps (`Curve=0`). The old
-    gamma 2.2 (`Curve=1`) crushes shadows and adds contrast, which reads as "overblown".
-  - Highlight expansion only touches pixels that are bright in *luminance*. 0.9.1 judged by the
-    brightest channel, so strongly graded blue lights counted as highlights and got boosted.
-  - A/B switch in the HDR tab: "Reference" shows the plain SDR image the way Windows would show
-    it in HDR mode. If that already looks oversaturated, the cause is outside APRenewal.
-
-## New in 0.9.1
-- FOV is now set in degrees (`[View] FOV`, default 85). The game's camera is 60 degrees and
-  AlphaFixer simply forced it to ~85 (with FOVFactor 1.20); 0.9 multiplied the game's 60 by 1.2,
-  which gave a cramped ~69. Every camera mode is scaled by the same ratio, so aim/zoom still work.
-  The log lists each camera FOV the game uses and what it became.
-- HDR: removed the HDR10 option (froze the game with DXVK); scRGB only. Highlights now roll off
-  softly below the display peak instead of clipping, there is a saturation trim (`[HDR] Saturation`),
-  and the menu warns when paper white is too close to the display peak (blown-out whites).
-- Recommended DXVK: 3.1.1 + the upstream HDR fix only (`d3d9_dxvk.dll` in the dxvk zip). The
-  master build added newer present-timing code; it is the first suspect for the Steam overlay.
-
-## New in 0.9
-- **AlphaFixer is no longer needed.** Delete `winmm.dll` and `AlphaFixer.ini` from Binaries;
-  APRenewal does its job (menu: View tab, ini: `[View]`), and does it differently:
-  - FOV is scaled per camera module, live, from the size the game is actually rendering at.
-    AlphaFixer overwrote every module with one fixed number worked out at startup, which flattened
-    aim/zoom FOV changes. The FOV factor (default 120%, AlphaFixer's 1.20) now changes live.
-  - HUD and menu width follow the real render size, so supersampling no longer squeezes them.
-    On 16:9 they are left alone; wider screens get a centred 16:9 HUD and menus.
-  - AO now uses the game's live camera FOV instead of a fixed 85 degrees (`[AO] FOVAuto`).
-  - If winmm.dll is still there, APRenewal leaves FOV/HUD alone and says so in the log.
-
-## New in 0.8.3
-- HDR: found the oversaturation. DXVK's log shows Vulkan never offered HDR colour spaces
-  (VK_EXT_swapchain_colorspace missing), so DXVK quietly presented an SDR swapchain and
-  clipped APRenewal's HDR values to SDR white channel by channel - neon colours, HUD included.
-  APRenewal now asks the Vulkan loader itself and stays SDR when HDR can't actually reach the
-  display (the log and the HDR tab say why, including which vulkan-1.dll is loaded).
-  Root cause: DXVK v3.1.1 never enables that extension (fixed upstream after the release, commit
-  3c40ca1). Use a DXVK d3d9.dll built from master (renamed `d3d9_dxvk.dll`) until 3.2 is out.
-- Supersampling: the window is kept at monitor size even when the game tries to resize it to
-  the render size (which stretched the picture and threw off the mouse).
-
-## New in 0.8.2
-- HDR: back to scRGB by default - the HDR10 path in 0.8.1 gave a black screen (likely the DXVK
-  version pairing an fp16 backbuffer with the HDR10 colour space). HDR10 stays as `Encoding=0`.
-- HDR: the game's gamma ramp (its brightness slider) is kept out of DXVK while HDR is on and
-  applied as an exponent in our own encode instead. Some DXVK versions run ramps through an SDR
-  lookup table, which clips every bright colour channel separately.
-
-## New in 0.8.1
-- HDR: fixed the oversaturated image (HUD included). APRenewal now outputs HDR10 itself - PQ curve,
-  Rec.2020 primaries - instead of handing linear scRGB to DXVK and trusting the conversion
-  further down. The old path is still there as `[HDR] Encoding=1`. The peak clamp now keeps
-  hue (scales the whole colour instead of clipping channels).
-- Supersampling: 0.8 asked for the bigger resolution through the wrong door (the game reads its
-  command line through msvcr80's `_acmdln`, not GetCommandLineW), so it kept rendering at native.
-  Now the arguments go in there, and the render size is also listed as an adapter display mode,
-  in case the game only accepts resolutions it finds in that list.
-- Supersampling + HDR: the downscale now runs before the HDR encode.
-
-## New in 0.8
-Four new features, each with its own switch. Test them one at a time.
-
-- **Colour grading** (menu: Colour tab, `[Grade]`). On by default, mildly: +0.1 EV, gentle S-curve
-  contrast, +45% vibrance, slightly deeper blacks. Runs on the 3D image only, before the HUD.
-  "Neutral" in the menu turns it into a no-op so you can compare.
-- **Supersampling** (`[Display] RenderScale`, Display tab). Set e.g. 150 and restart: APRenewal
-  hands the game `-ResX/-ResY` at 1.5x your desktop, keeps the window at desktop size, tells the
-  game its window is the bigger size (window size and mouse coordinates are remapped), and
-  downscales each frame with a Mitchell filter in linear light. Needs Borderless=1.
-- **HDR output** (`[HDR]`, HDR tab). Experimental, needs DXVK as RealD3D9 and Windows HDR on.
-  The backbuffer becomes fp16 scRGB through DXVK's D3D9 extension. The game's image is placed at
-  paper white; near-white pixels of the 3D view are then pushed towards their real brightness,
-  taken from the game's own HDR scene buffer (exposure fitted automatically), with a roll-off
-  below the display peak. The HUD is drawn after that step, so it stays at paper white.
-  Menus with a 3D background (armory) stay SDR-in-HDR.
-- **HRTF 3D audio** (`[Audio] HRTF`, Audio tab). The game uses OpenAL through Creative's router.
-  Back up `Binaries\OpenAL32.dll`, then copy the one from this package (OpenAL Soft 1.25.2,
-  32-bit, built from source, built-in HRTF data). APRenewal maps the game's legacy device name
-  ("Generic Software") to the default device and asks for stereo HRTF output; the menu can
-  switch it live. Note: OpenAL Soft also runs the game's EFX reverb, which the Creative software
-  path never did, so rooms may sound more reverberant than you remember. To undo, put the
-  original OpenAL32.dll back.
-
-## New in 0.7.1
-- Fixed: AO turning floors, ceilings and stair faces pitch black at some camera pitches. The rebuilt
-  surface normal was oriented by its z sign only, which flips on near-level floors; it is now turned
-  to face the viewer.
-- Fixed: the 24-bit depth calibration never completed (the game clears the depth buffer before the
-  frame ends), so AO silently stayed on 16-bit depth. The depth is now snapshotted right after the
-  base pass and both calibration and AO read the snapshot. Calibration problems are logged.
-
-## New in 0.7
-- **GTAO**: horizon-based ambient occlusion (after Jimenez et al. 2016 / XeGTAO), validated offline on real
-  captured depth before shipping: contact shading on characters, no halos, grounded objects.
-- **Precise depth** (`[AO] PreciseDepth=1`): the game's full-screen depth buffer is created as an INTZ
-  texture (same trick ReShade uses in D3D9), giving 24-bit depth instead of UE3's 16-bit HDR alpha. That
-  precision is what grazing walls need. It is calibrated against the HDR-alpha depth every 30 frames
-  (least-squares fit of 1/d = A + B*z, checked before use) and falls back to 16-bit depth if anything fails.
-- If the GTAO shader fails to compile on a driver, the previous AO shader is used instead (logged).
-
-## New in 0.6.5
-- SSAO: the sphere shrinks with the capped on-screen footprint, so objects close to the camera (Mike) get
-  AO again; samples landing on something far in front of the sphere are ignored (fading weight), which
-  removes the dark halo behind characters and the lost AO on objects next to their outline.
-
-## New in 0.6.4
-- Saving from the menu now covers everything: the post-processing master switch (`[PostFX] Enabled`) and
-  the AO mode (`[AO] Mode`) were missing and always came back on at launch.
-- Every saved value is read back from the file; failures, mismatches and a read-only ini are logged and
-  shown in the menu. The menu shows which ini file it writes to.
-- MulderConfig no longer manages `FPSLimit` (it rewrote it on every launch); set the frame cap in game.
-
-## New in 0.6.3
-- SSAO is now volumetric obscurance: it measures how much of a small sphere around each pixel lies behind
-  the visible surface. No normals are rebuilt from depth any more, so there is no faceting on low-poly
-  characters and no ring banding from fp16 depth steps on walls seen at grazing angles.
-- Route counters: frames with effects switched off (F11) are counted as "off", not "skipped".
-
-## New in 0.6.2
-- Frames that render the world twice (a scene capture for reflections / screens first, then the real view)
-  no longer lose SSAO/FXAA: a depth pre-pass starts a new scene and resets detection, so depth and the
-  world image come from the last scene. Only quarter-res targets count as the bloom chain (1024x1024
-  capture textures used to be mistaken for it, and the effects landed on the pre-pass buffer).
-
-## New in 0.6.1
-- Menu cursor: the DirectInput mouse buffer is drained completely while the menu is open (fixes the slow,
-  jittery, ~1 s delayed cursor with high-polling-rate mice).
-- Diagnostics: every frame is counted by the route that applied the effects (switch / at Present /
-  no-bloom / SKIPPED / no 3D), in the log and in the menu's Diagnostics tab.
-
-## New in 0.6
-- **In-game menu** (Insert): every APRenewal option live (post-processing, FXAA, sharpening, SSAO and all its
-  sliders incl. debug view, frame cap, focus pause, cursor lock, menu cursor speed), Save / Reload ini,
-  diagnostics (effect stats, input status, one-click frame trace and capture). Built with Dear ImGui
-  (MIT, see `src/imgui/LICENSE.txt`). While open, the game receives no keyboard, mouse or gamepad input:
-  APRenewal captures the DirectInput mouse (via the game's dinput8 import = GOG dixi), window messages
-  and XInput. Escape or Insert closes it.
-- Frames without a bloom chain (final pass straight to the screen) now get SSAO/FXAA too.
-
-## New in 0.5
-- **SSAO** (`[AO]`): ambient occlusion on the 3D world, applied before the UI together with FXAA.
-  Depth comes from UE3's HDR scene buffer, whose alpha channel holds scene distance (confirmed from an
-  fp16 capture). APRenewal copies that buffer right after the base pass; AO = 12-tap normal-oriented
-  samples, depth-aware blur, multiplied into the image (bright lights are protected).
-  F10 cycles ON / OFF / DEBUG VIEW.
-- 0.5.3: frames where UE3 writes its final post pass straight to the backbuffer (some post steps skipped,
-  camera-angle dependent) are now processed too. When a 3D frame is still skipped, the log prints its
-  render-target sequence once per 10 s. SSAO ignores very close samples (no faceting on low-poly
-  characters, no rings on distant walls).
-- 0.5.2: frame detection is order-aware (base pass must come before the bloom chain). Scenes that draw small
-  render targets early no longer make PostFX/SSAO skip frames (= flicker). Logs `postfx stats` every 10 s
-  if some frames were skipped.
-- 0.5.1: off-screen samples are ignored (no more dark smears at screen edges), 16 samples with a tighter
-  radius cap (no blotches up close), near-camera fade, softer/configurable highlight protection and a higher
-  bias (no flicker on bright/shiny surfaces at grazing angles).
-
-## New in 0.4
-- **Before-HUD PostFX** (`[PostFX] BeforeHUD=1`): FXAA + sharpening now run on the finished 3D image,
-  before Alpha Protocol draws its UI, so HUD and menu text stay crisp. Found via frame captures: the world
-  ends in a full-res LDR target right after the quarter-res bloom chain; APRenewal processes that target
-  in place when the game switches away from it. The log says `before-HUD target found` once it locks on.
-
-## New in 0.3
-- **Cursor confinement** (`[Focus] ConfineCursor=1`): the cursor stays inside the game window while it has
-  focus, so it can't wander onto other monitors (hacking minigames!). Released on alt-tab/pause and on exit.
-- **Render trace**: Ctrl+F11 logs one frame's render-target switches, clears, copies and draw counts.
-- **Frame capture** (0.3.1): Ctrl+Shift+F11 also saves each render target of that frame as an image
-  (`APRenewal\capture_HHMMSS\segNN_WxH_fmtF.png`, float targets fall back to .dds).
-
-## New in 0.2
-- **Pause on focus loss** (`[Focus] PauseOnFocusLoss=1`): when another window is in front, the game's main
-  thread is parked inside its own message pump (APRenewal keeps the window responsive), and the game's clock
-  is frozen for exactly that time, so gameplay *and* dialogue timers resume where they stopped.
-  Audio already playing (e.g. a voice line) finishes.
-  (0.2.1: fixes 0.2 hanging on refocus - it froze the clock while the engine kept running, and UE3's frame
-  limiter spin-waits on the clock.)
-- **PostFX** on the final frame: FXAA + contrast-adaptive sharpening (`[PostFX]`), toggle with **F11**.
-  It's applied after the HUD is drawn, so HUD text gets a touch softer with FXAA on.
-- If a shader fails to compile, the log says why and PostFX just switches itself off.
-
-## What 0.1 does
-- **Chain loading**: uses system d3d9, or DXVK (`RealD3D9=d3d9_dxvk.dll`) for Vulkan-backed frame pacing.
-- **Shader hook**: hooks `D3DXCompileShader` in APGame.exe's import table. Logs every runtime compile,
-  can dump the HLSL (`DumpSource=1`), and swaps in `APRenewal\override\<hash>.hlsl` if one exists
-  (if it fails to compile, the error goes to the log and the original is used).
-- **Frame limiter**: high-resolution waitable timer + short spin, runs after Present.
-- **Borderless / VSync override** (experimental).
-- **Diagnostics**: logs the game's present parameters before/after changes, and every Reset.
-
-## First test run (please send back the log)
-1. Install with the default ini, launch, load a save, walk around for a minute, quit.
-2. In the log, check:
-   - `Direct3DCreate9` appears → the game is on the D3D9 path (if it's missing, it went D3D10).
-   - The `compile #` lines and the `total D3DXCompileShader calls` at shutdown:
-     **0** → everything comes from the precompiled shader cache; overrides need a cache rebuild.
-     **>0** → runtime shader replacement works right away.
-3. Optional: `DumpSource=1` and send a few files from `APRenewal\dump`.
-
-## Notes
-- AlphaFixer already does FOV/HUD; APRenewal doesn't touch them.
-- Above 60 fps: test physics, animations, cutscenes and minigames (hacking/lockpicking timers!) before keeping a higher cap.
-- MSAA isn't forced: UE3's post chain would break it. Post-process AA comes in a later version.
+### Tools
+- In-game menu (Insert) with every option live, plus Save / Reload.
+- F11 toggles all post-processing; F10 cycles AO between on, off and a debug view.
+- Ctrl+F11 logs a one-frame render trace. Ctrl+Shift+F11 also saves every render target of that frame.
+- A shader census: each pixel shader of a frame, with its hash and constants.
+- Shader dump and override (`[Shaders]`).
 
 ## Build
-`sh build.sh` (needs `g++-mingw-w64-i686`). Output: `out/d3d9.dll`.
+`sh build.sh` (needs `g++-mingw-w64-i686`) → `out/d3d9.dll` and `out/xinput1_3.dll`.
+
+Third-party code: Dear ImGui (MIT, `src/imgui/`) and SMAA (MIT, `docs/SMAA-LICENSE.txt`).

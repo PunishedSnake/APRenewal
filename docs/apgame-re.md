@@ -1,6 +1,6 @@
 # APGame.exe — reverse-engineering notes
 
-Steam build, 32-bit, unpacked (no SteamStub). Sections: `.text` 0x401000–0xE0BA0E (~10 MB code),
+GOG build (imports Galaxy.dll; PE timestamp 0x6502278D), 32-bit, unpacked. All addresses below are for this build. Sections: `.text` 0x401000–0xE0BA0E (~10 MB code),
 `.rdata`, `.data`. MSVC 2005 runtime (msvcr80). Most *gameplay* logic is UnrealScript inside the
 cooked `.u`/`.upk` packages (CookedPC), not in the exe — the exe holds the engine plus the
 game's native C++ classes (`AAP*`, `UAP*`).
@@ -9,7 +9,7 @@ game's native C++ classes (`AAP*`, `UAP*`).
 - `natives.py APGame.exe` → `apgame_natives.json`: **2804 native functions mapped by name**
   (`Class::execFunction` → address). UE3 registers every native with a UTF-16 name
   `int<Class>exec<Func>` next to its function pointer; the script pairs them up.
-- `dis.py 0xADDR[:len] …` (env `APGAME=path`) — disassembles with native names annotated on calls.
+- `apdis.py 0xADDR[:len] …` (env `APGAME=path`) — disassembles with native names annotated on calls.
 - `exec` thunks read their parameters from the script stack and then call the real C++ method,
   usually a virtual call — follow that call to get the actual implementation.
 
