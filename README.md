@@ -1,4 +1,4 @@
-# APRenewal 0.9.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.9.2 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -12,6 +12,17 @@ A research-and-fix base layer. It sits alongside the mods you already have:
 ## Install
 Copy `d3d9.dll` + `APRenewal.ini` into `Alpha Protocol\Binaries\`. Uninstall = delete both.
 The log goes to `Binaries\APRenewal\APRenewal.log`.
+
+## New in 0.9.2
+- HDR, still too punchy in 0.9.1:
+  - Paper white now defaults to Windows' own "SDR content brightness" (`PaperWhite=0`), so the
+    game's whites match the desktop's.
+  - SDR → light conversion uses the sRGB curve Windows uses for SDR apps (`Curve=0`). The old
+    gamma 2.2 (`Curve=1`) crushes shadows and adds contrast, which reads as "overblown".
+  - Highlight expansion only touches pixels that are bright in *luminance*. 0.9.1 judged by the
+    brightest channel, so strongly graded blue lights counted as highlights and got boosted.
+  - A/B switch in the HDR tab: "Reference" shows the plain SDR image the way Windows would show
+    it in HDR mode. If that already looks oversaturated, the cause is outside APRenewal.
 
 ## New in 0.9.1
 - FOV is now set in degrees (`[View] FOV`, default 85). The game's camera is 60 degrees and

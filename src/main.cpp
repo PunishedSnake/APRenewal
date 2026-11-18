@@ -112,6 +112,8 @@ struct Config {
     int  hdrHighlights = 100;   // percent highlight expansion
     int  hdrEncoding   = 1;     // scRGB only (HDR10 + fp16 backbuffer froze the game with DXVK)
     int  hdrSaturation = 100;   // percent, HDR only
+    int  hdrCurve      = 0;     // 0 = sRGB like Windows shows SDR, 1 = gamma 2.2
+    int  hdrReference  = 0;     // A/B: plain SDR-in-HDR exactly as Windows would show it
     // audio
     int  hrtf          = 1;     // 0 off, 1 on (headphones), 2 leave to OpenAL
     // view (replaces AlphaFixer)
@@ -181,12 +183,13 @@ static void LoadConfig()
     if (cfg.renderScale < 100) cfg.renderScale = 100;
     if (cfg.renderScale > 200) cfg.renderScale = 200;
     cfg.hdrEnable     = GetPrivateProfileIntA("HDR", "Enable", 0, g_ini);
-    cfg.hdrPaper      = GetPrivateProfileIntA("HDR", "PaperWhite", 200, g_ini);
+    cfg.hdrPaper      = GetPrivateProfileIntA("HDR", "PaperWhite", 0, g_ini);   // 0 = Windows' SDR content brightness
+    cfg.hdrCurve      = GetPrivateProfileIntA("HDR", "Curve", 0, g_ini) ? 1 : 0;
     cfg.hdrPeak       = GetPrivateProfileIntA("HDR", "PeakNits", 0, g_ini);
     cfg.hdrHighlights = GetPrivateProfileIntA("HDR", "Highlights", 100, g_ini);
     cfg.hdrEncoding   = 1;
     cfg.hdrSaturation = GetPrivateProfileIntA("HDR", "Saturation", 100, g_ini);
-    if (cfg.hdrPaper < 80) cfg.hdrPaper = 80;
+    if (cfg.hdrPaper != 0 && cfg.hdrPaper < 80) cfg.hdrPaper = 80;
     cfg.hrtf          = GetPrivateProfileIntA("Audio", "HRTF", 1, g_ini);
     {
         // first run after AlphaFixer: AlphaFixer set every camera to 2*atan(tan(37.5 deg) * FOVFactor)
@@ -805,12 +808,12 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
     float3 c = pow(max(s.rgb, 0), 2.2);
     float Y = max(dot(c, L), 1e-4);
     float Yh = dot(max(tex2Dlod(sHdr, float4(uv, 0, 0)).rgb, 0), L) * h.x;
-    float mx = max(c.r, max(c.g, c.b));
-    float t = saturate((mx - h.w) / (1 - h.w));
+    // only pixels that are bright in luminance (a saturated blue at full channel is not a highlight)
+    float t = saturate((Y - h.w) / (1 - h.w));
     t = t * t * (3 - 2 * t);
-    float room = max(h.y - Y, 1e-3);
+    float room = max(h.y - 1, 1e-3);
     float Yt = Y + room * (1 - exp(-max(Yh - Y, 0) / room));
-    float b = lerp(1, Yt / Y, t * h.z);
+    float b = min(lerp(1, Yt / Y, t * h.z), h.y);
     return float4(pow(c * b, 1 / 2.2), s.a);
 }
 )HLSL";
@@ -818,7 +821,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 // HDR: gamma-encoded frame -> HDR10 (Rec.2020 primaries, PQ) or scRGB (linear Rec.709, 1.0 = 80 nits)
 static const char* kHdrEncodePS = R"HLSL(
 sampler2D sSrc : register(s0);
-float4 e : register(c1);    // x paper white nits, y peak nits, z 1 = PQ / 0 = scRGB
+float4 e : register(c1);    // x paper white nits, y peak nits, z 1 = PQ / 0 = scRGB, w 1 = sRGB curve / 0 = gamma 2.2
 float4 e2 : register(c2);   // xy uv scale (only part of the source holds the image), z game gamma ramp exponent, w saturation
 float3 PQ(float3 nits)
 {
@@ -827,7 +830,9 @@ float3 PQ(float3 nits)
 }
 float4 main(float2 uv : TEXCOORD0) : COLOR0
 {
-    float3 c = pow(max(tex2Dlod(sSrc, float4(uv * e2.xy, 0, 0)).rgb, 0), 2.2 * e2.z) * e.x;   // nits, Rec.709
+    float3 v = pow(max(tex2Dlod(sSrc, float4(uv * e2.xy, 0, 0)).rgb, 0), e2.z);      // game brightness ramp
+    float3 srgb = lerp(v / 12.92, pow((v + 0.055) / 1.055, 2.4), saturate((v - 0.04045) * 1e6));
+    float3 c = lerp(pow(v, 2.2), srgb, e.w) * e.x;                                      // nits, Rec.709
     float Y = dot(c, float3(0.2126, 0.7152, 0.0722));
     c = max(lerp(Y, c, e2.w), 0);                                                        // saturation trim
     float m = max(c.r, max(c.g, c.b));
@@ -1679,10 +1684,48 @@ static void XPass(IDirect3DDevice9* dev, IDirect3DSurface9* dst, UINT vw, UINT v
     g_inPostFX = was;
 }
 
+// Windows' "SDR content brightness" for the monitor the game is on (what the desktop uses as white)
+static float g_winSdrWhite = 0;
+static void QueryWindowsSdrWhite()
+{
+    if (!g_hwnd) return;
+    MONITORINFOEXW mi = {}; mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) return;
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np) return;
+    DISPLAYCONFIG_PATH_INFO* paths = (DISPLAYCONFIG_PATH_INFO*)calloc(np, sizeof *paths);
+    DISPLAYCONFIG_MODE_INFO* modes = (DISPLAYCONFIG_MODE_INFO*)calloc(nm, sizeof *modes);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, nullptr) == ERROR_SUCCESS) {
+        for (UINT32 i = 0; i < np; i++) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME src = {};
+            src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = sizeof src;
+            src.header.adapterId = paths[i].sourceInfo.adapterId;
+            src.header.id = paths[i].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS || wcscmp(src.viewGdiDeviceName, mi.szDevice)) continue;
+            struct { DISPLAYCONFIG_DEVICE_INFO_HEADER header; ULONG SDRWhiteLevel; } wl = {};
+            wl.header.type = (DISPLAYCONFIG_DEVICE_INFO_TYPE)11;      // DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL
+            wl.header.size = sizeof wl;
+            wl.header.adapterId = paths[i].targetInfo.adapterId;
+            wl.header.id = paths[i].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&wl.header) == ERROR_SUCCESS && wl.SDRWhiteLevel)
+                g_winSdrWhite = wl.SDRWhiteLevel * 80.0f / 1000.0f;
+            break;
+        }
+    }
+    free(paths); free(modes);
+    Log("hdr: Windows SDR content brightness %.0f nits%s", g_winSdrWhite, g_winSdrWhite ? "" : " (unknown - using 200)");
+}
+static float HdrPaperNits()
+{
+    if (cfg.hdrReference || cfg.hdrPaper == 0) return g_winSdrWhite > 0 ? g_winSdrWhite : 200.0f;
+    return (float)cfg.hdrPaper;
+}
+
 static float HdrPeakNits()
 {
     float p = cfg.hdrPeak > 0 ? (float)cfg.hdrPeak : (g_hdrMaxNits > 100 ? g_hdrMaxNits : 1000.0f);
-    return p < (float)cfg.hdrPaper ? (float)cfg.hdrPaper : p;
+    return p < HdrPaperNits() ? HdrPaperNits() : p;
 }
 
 // Exposure fit: median of display/scene luminance over mid-tones (below the game's tonemap shoulder)
@@ -1726,7 +1769,8 @@ static void HdrExpand(IDirect3DDevice9* dev)
     if (!CopyToTex(dev, g_bbPtr, &g_xCopy) || !CopyToTex(dev, g_hdrSceneSurf, &g_xScene)) return;
     if (g_hdrK <= 0 || (g_hdrFrames++ % 10) == 0) HdrFit(dev);
     if (g_hdrK <= 0) return;
-    const float c1[4] = { g_hdrK, HdrPeakNits() / cfg.hdrPaper, cfg.hdrHighlights / 100.0f, 0.55f };
+    if (cfg.hdrReference) return;
+    const float c1[4] = { g_hdrK, HdrPeakNits() / HdrPaperNits(), cfg.hdrHighlights / 100.0f, 0.55f };
     XPass(dev, g_bbPtr, bd.Width, bd.Height, g_xCopy, false, g_xScene, false, g_psHdrExpand, c1, nullptr, true);
 }
 
@@ -1752,8 +1796,10 @@ static const RECT* PresentExtras(IDirect3DDevice9* dev)
         iw = g_outW; ih = g_outH;
     }
     if (g_hdrActive && g_psHdrEncode && CopyToTex(dev, bb, &g_xCopy)) {
-        const float e[4] = { (float)cfg.hdrPaper, HdrPeakNits(), g_hdrPQ ? 1.0f : 0.0f, 0 };
-        const float e2[4] = { (float)iw / bd.Width, (float)ih / bd.Height, g_gammaExp, cfg.hdrSaturation / 100.0f };
+        const float e[4] = { HdrPaperNits(), HdrPeakNits(), g_hdrPQ ? 1.0f : 0.0f,
+                             (cfg.hdrReference || cfg.hdrCurve == 0) ? 1.0f : 0.0f };
+        const float e2[4] = { (float)iw / bd.Width, (float)ih / bd.Height, g_gammaExp,
+                              cfg.hdrReference ? 1.0f : cfg.hdrSaturation / 100.0f };
         XPass(dev, bb, iw, ih, g_xCopy, false, nullptr, false, g_psHdrEncode, e, e2, false);
     }
     bb->Release();
@@ -1833,6 +1879,7 @@ static void HdrSetupSwapchain(IDirect3DDevice9* dev)
             if (!ext->CheckColorSpaceSupport(cs) || FAILED(ext->SetColorSpace(cs))) continue;
             g_hdrActive = true;
             g_hdrPQ = cs == VK_COLOR_SPACE_HDR10_ST2084_EXT_;
+            QueryWindowsSdrWhite();
             break;
         }
         if (g_hdrActive) {
@@ -2779,6 +2826,7 @@ static bool SaveConfig()
     WriteIniInt("Display", "RenderScale", cfg.renderScale);
     WriteIniInt("HDR", "Enable", cfg.hdrEnable);
     WriteIniInt("HDR", "PaperWhite", cfg.hdrPaper);
+    WriteIniInt("HDR", "Curve", cfg.hdrCurve);
     WriteIniInt("HDR", "PeakNits", cfg.hdrPeak);
     WriteIniInt("HDR", "Highlights", cfg.hdrHighlights);
     WriteIniInt("HDR", "Saturation", cfg.hdrSaturation);
@@ -2867,7 +2915,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.9.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.9.2", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -2894,16 +2942,20 @@ static void DrawMenu()
         }
         if (ImGui::BeginTabItem("HDR")) {
             CheckboxInt("HDR output (applies at next launch)", &cfg.hdrEnable);
-            ImGui::SliderInt("Paper white", &cfg.hdrPaper, 80, 400, "%d nits");
+            CheckboxInt("Reference: plain SDR exactly as Windows shows it (A/B)", &cfg.hdrReference);
+            ImGui::SliderInt("Paper white", &cfg.hdrPaper, 0, 400, cfg.hdrPaper ? "%d nits" : "Windows setting");
+            static const char* curves[] = { "sRGB (like Windows)", "Gamma 2.2 (deeper shadows)" };
+            ImGui::Combo("SDR curve", &cfg.hdrCurve, curves, 2);
             ImGui::SliderInt("Peak brightness", &cfg.hdrPeak, 0, 4000, cfg.hdrPeak ? "%d nits" : "display's own");
             ImGui::SliderInt("Saturation", &cfg.hdrSaturation, 50, 130, "%d %%");
-            if (g_hdrActive && cfg.hdrPaper > HdrPeakNits() * 0.75f)
+            if (g_hdrActive && HdrPaperNits() > HdrPeakNits() * 0.75f)
                 ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Paper white is close to the display peak: whites will look blown out.");
             ImGui::SliderInt("Highlights", &cfg.hdrHighlights, 0, 150, cfg.hdrHighlights ? "%d %%" : "off (SDR in HDR)");
             if (g_hdrActive)
                 ImGui::TextDisabled("Active: %s", g_hdrPQ ? "HDR10 (PQ)" : "scRGB");
             if (g_hdrActive)
-                ImGui::TextDisabled("Peak %.0f nits (display reports %.0f), exposure fit %.3g", HdrPeakNits(), g_hdrMaxNits, g_hdrK);
+                ImGui::TextDisabled("Paper white %.0f nits (Windows: %.0f), peak %.0f (display reports %.0f), exposure fit %.3g",
+                                    HdrPaperNits(), g_winSdrWhite, HdrPeakNits(), g_hdrMaxNits, g_hdrK);
             else if (cfg.hdrEnable && g_vkHdrExt == 0)
                 ImGui::TextWrapped("Not active: Vulkan offers no HDR colour spaces here (%s). An old vulkan-1.dll in the game folder can cause this.", g_vkPath);
             else if (cfg.hdrEnable && !g_hdrUnlocked)
@@ -3364,7 +3416,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.9.1 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.9.2 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         ApplySavedToggles();

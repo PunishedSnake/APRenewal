@@ -82,7 +82,10 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   with 3c40ca1 cherry-picked onto v3.1.1 until 3.2 ships (master's new present-timing code is the
   suspect for a broken Steam overlay). scRGB only: HDR10 colour space with the fp16 backbuffer froze
   presentation (game stuck after a few frames). Encode has a soft shoulder to the peak and a
-  saturation trim; paper white near the peak = blown-out look. DXVK ignores gamma ramps in windowed
+  saturation trim; paper white near the peak = blown-out look. Since 0.9.2: paper white defaults to
+  Windows' SDR white level (DisplayConfig SDR_WHITE_LEVEL), sRGB piecewise curve like Windows, expansion
+  knee on luminance (max-channel knee boosted graded blue lights), and an A/B "Reference" toggle.
+  User confirmed DXVK 3.1.1 + 3c40ca1 keeps the Steam overlay working; FOV 60 base confirmed. DXVK ignores gamma ramps in windowed
   mode; we still keep the game's ramp out of the HDR path.
 - **Audio**: game loads OpenAL at runtime (`DeviceName=Generic Software` in APEngine.ini). With OpenAL
   Soft we map legacy names to the default device and request `ALC_HRTF_SOFT` +
