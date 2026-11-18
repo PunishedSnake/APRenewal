@@ -1,4 +1,4 @@
-# APRenewal 0.18.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.19.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,16 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.19.0
+- **Skin and weapon gloss** (`[Materials] SkinGloss / MetalGloss`, Lighting & shadows tab). From your
+  armory census and the shader cache: the game's skin lighting uses a specular exponent of ~7 and
+  weapons 3-10, which gives broad, plastic-looking highlights. APRenewal now finds that exponent in
+  each skin / weapon lighting shader (175 skin and 130 metal shaders, by hash) and scales it:
+  2.5x for skin, 3.5x for weapons by default - tighter highlights, so skin reads as moist instead of
+  waxy and guns as metal instead of plastic.
+- **Light shafts actually work now**: their bright-pass shader used a bitwise operation, which SM3
+  shaders can't do, so it never compiled in 0.18.x.
 
 ## New in 0.18.1
 - **Faces are sharp again.** The skin scattering blur was far too wide up close (up to 48 px on a

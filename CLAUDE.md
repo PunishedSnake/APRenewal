@@ -304,6 +304,15 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
     12 px, and 65 % of the per-pixel luminance restored after the blend (keeps texture, keeps the red
     terminator bleed). TAA history × (1 − 0.75·skin) via mask on s3, default 75. Shaft bright pass
     excludes skin (mask s1), threshold 2.5.
+  - 0.19.0: user's 0.18.0 log: kShaftBrightPS failed on both compilers ("Bitwise operations not supported
+    on ps_3_0" - `i & 1`): shafts never ran. Fixed (4 explicit taps). Census with values (armory, two
+    weapons + Mike): weapon light pass 2198188e decoded - spec = pow(max(R·V,.01), lerp(US42, US41, tex.z))
+    → SpecularRampMap lookup × spec map × US43 × US44; Fresnel pow(1−N·V, US0) lerp(US2, US1); diffuse
+    lerp(V8 low, V9 high, N·L). Skin light pass 54793f09: spec pow(max(R·V,0), c40 = US77 = 7), Fresnel
+    pow(·, US74 = 12) lerp(US73, US72), layered SSS terms. tools/re/specregs.py finds, per skin/metal
+    TLightPixelShader in the cache, the constants of the pow whose base comes from max() (= specular;
+    Fresnel bases come from add 1−x), following log → cmp → mul → exp → src/specregs.h (305 shaders).
+    PreDraw scales them (PdSet) by [Materials] SkinGloss / MetalGloss.
   - Still to do (part 2): weapon master + skin sheen rebuild (needs a values census near a weapon /
     face), dixi absorption (user's dixi.ini: Sony pads via DirectInput, button/axis remaps; dixi exposes
     them as XInput), HUD/subtitle scale (Scaleform canvas RE), 120 fps physics check.

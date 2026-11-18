@@ -31,6 +31,7 @@
 #include "imgui/imgui.h"
 #include "matclass.h"
 #include "smaa.h"
+#include "specregs.h"
 #include "imgui/imgui_impl_dx9.h"
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
@@ -154,6 +155,8 @@ struct Config {
     int  metalRefl   = 25;    // % screen-space reflections on metal (weapons, metal props)
     int  ssrRough    = 40;    // % blur of floor reflections (roughness)
     int  metalRough  = 50;    // % blur of metal reflections
+    int  skinGloss   = 250;   // % of the skin materials' specular exponent (tighter highlights)
+    int  metalGloss  = 350;   // % of the weapon / metal materials' specular exponent
     int  glassSsr    = 100;   // % screen-space reflections on glass (from the previous frame)
     int  bloomModern = 35;    // % of APRenewal's wide HDR bloom added in the final pass
     int  shadowDetail = 70;   // % soft toe instead of the game's hard black clip in the final pass
@@ -302,6 +305,8 @@ static void LoadConfig()
     cfg.sssWidth    = GetPrivateProfileIntA("Materials", "SkinScatterWidth", 100, g_ini);
     cfg.metalRefl   = GetPrivateProfileIntA("Materials", "MetalReflections", 25, g_ini);
     cfg.metalRough  = GetPrivateProfileIntA("Materials", "MetalRoughness", 50, g_ini);
+    cfg.skinGloss   = GetPrivateProfileIntA("Materials", "SkinGloss", 250, g_ini);
+    cfg.metalGloss  = GetPrivateProfileIntA("Materials", "MetalGloss", 350, g_ini);
     cfg.ssrRough    = GetPrivateProfileIntA("Reflections", "Roughness", 40, g_ini);
     cfg.glassSsr    = GetPrivateProfileIntA("Glass", "ScreenReflections", 100, g_ini);
     cfg.bloomModern = GetPrivateProfileIntA("Effects", "ModernBloom", 35, g_ini);
@@ -1660,10 +1665,10 @@ float4 sp : register(c1);   // x threshold, yz source texel, w material mask val
 float4 main(float2 uv : TEXCOORD0) : COLOR0
 {
     float3 c = 0;
-    [unroll] for (int i = 0; i < 4; i++) {
-        float2 o = float2((i & 1) ? 0.5 : -0.5, (i & 2) ? 0.5 : -0.5) * sp.yz;
-        c += tex2Dlod(sHdr, float4(uv + o, 0, 0)).rgb;
-    }
+    c += tex2Dlod(sHdr, float4(uv + float2(-0.5, -0.5) * sp.yz, 0, 0)).rgb;   // no bitwise ops in ps_3_0
+    c += tex2Dlod(sHdr, float4(uv + float2( 0.5, -0.5) * sp.yz, 0, 0)).rgb;
+    c += tex2Dlod(sHdr, float4(uv + float2(-0.5,  0.5) * sp.yz, 0, 0)).rgb;
+    c += tex2Dlod(sHdr, float4(uv + float2( 0.5,  0.5) * sp.yz, 0, 0)).rgb;
     c *= 0.25;
     float l = dot(c, float3(0.2126, 0.7152, 0.0722));
     float skin = sp.w > 0.5 ? tex2Dlod(sMat, float4(uv, 0, 0)).r : 0;
@@ -3716,6 +3721,7 @@ struct GameShader {
     int distReg = -1;                        // glass refraction: UniformScalar_1 (normal offset scale)
     int sceneTexReg = -1;                    // final blend: SceneColorTexture sampler (source of our bloom)
     int matTag = 0;                          // 1 skin, 2 metal (base pass, by bytecode hash)
+    int specKind = 0, specN = 0, specReg[3] = {};   // light pass: specular exponent registers (skin 1 / metal 2)
     IDirect3DPixelShader9* replSsr = nullptr; // glass: the replacement with screen-space reflections
     IDirect3DPixelShader9* tagged = nullptr; // the game's bytecode + 'mov oC1, tag' (material mask)
     int uses = 0;
@@ -4207,7 +4213,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.18.1") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.19.0") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4216,7 +4222,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.18.1", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.19.0", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -4355,6 +4361,12 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
     GameShader gs;
     const uint32_t hash = ShaderHash(fn);
     const int tag = MaterialTag(hash);
+    const SpecRegs* spec = nullptr;
+    {
+        const SpecRegs* e = kSpecRegs + sizeof kSpecRegs / sizeof kSpecRegs[0];
+        const SpecRegs* it = std::lower_bound(kSpecRegs, e, hash, [](const SpecRegs& a, uint32_t h) { return a.hash < h; });
+        if (it != e && it->hash == hash) spec = it;
+    }
     if (hash == 0xcb2f41c2u || hash == 0x23836016u || hash == 0xcc79d4cdu) {
         const bool fres = hash == 0x23836016u, dual = hash == 0xcc79d4cdu;
         gs.kind = SK_GLASS;
@@ -4430,7 +4442,8 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
         if (const CtabConst* k = CtabFind(ct, "ShadowBufferSize")) if (k->set == 2) gs.sizeReg = k->reg;
         if (const CtabConst* k = CtabFind(ct, "ScreenToShadowMatrix")) if (k->set == 2 && k->count == 4) gs.stsmReg = k->reg;
         if (gs.offReg[0] < 0 && gs.offReg[1] < 0 && gs.offReg[2] < 0) return hr;
-    } else if (!tag) return hr;
+    } else if (!tag && !spec) return hr;
+    if (spec) { gs.specKind = spec->kind; gs.specN = spec->n; for (int i = 0; i < spec->n; i++) gs.specReg[i] = spec->r[i]; }
     if (tag) {
         gs.matTag = tag;
         gs.tagged = BuildTaggedShader(d, fn, ct, tag);
@@ -4627,7 +4640,24 @@ static void PreDraw(IDirect3DDevice9* d)
     GameShader* gs = g_curGS;
     if (!gs || g_inPostFX || !o_SetPSConstF) return;
     g_preDrawDev = d;
-    if (!gs->uses++) {
+    // material gloss: scale the specular exponent of skin / weapon light passes (sharper, tighter highlights)
+    if (gs->specN && cfg.matEnable) {
+        const int pct = gs->specKind == 1 ? cfg.skinGloss : cfg.metalGloss;
+        if (pct != 100) {
+            const float f = std::max(pct, 10) / 100.0f;
+            for (int i = 0; i < gs->specN; i++) {
+                const int r = gs->specReg[i];
+                if (r < 0 || r >= 224) continue;
+                const float v[4] = { g_psc[r][0] * f, g_psc[r][1] * f, g_psc[r][2] * f, g_psc[r][3] * f };
+                PdSet(r, v);
+            }
+            static bool logged[3] = {};
+            if (!logged[gs->specKind]) { logged[gs->specKind] = true;
+                Log("materials: %s gloss x%.2f on its light passes (exponent c%d = %g -> %g)", gs->specKind == 1 ? "skin" : "metal", f,
+                    gs->specReg[0], g_psc[gs->specReg[0]][0], g_psc[gs->specReg[0]][0] * f); }
+        }
+    }
+    if (!gs->uses++ && gs->kind) {
         static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather", "character lighting", "window glass", "glass refraction" };
         if (gs->kind != SK_CHARLIGHT || !g_shUsed[SK_CHARLIGHT]) Log("shaders: %s %p in use", kn[gs->kind], (void*)gs);
         g_shUsed[gs->kind]++;
@@ -5580,6 +5610,8 @@ static bool SaveConfig()
     WriteIniInt("Materials", "SkinScatterWidth", cfg.sssWidth);
     WriteIniInt("Materials", "MetalReflections", cfg.metalRefl);
     WriteIniInt("Materials", "MetalRoughness", cfg.metalRough);
+    WriteIniInt("Materials", "SkinGloss", cfg.skinGloss);
+    WriteIniInt("Materials", "MetalGloss", cfg.metalGloss);
     WriteIniInt("Reflections", "Roughness", cfg.ssrRough);
     WriteIniInt("Glass", "ScreenReflections", cfg.glassSsr);
     WriteIniInt("Effects", "ModernBloom", cfg.bloomModern);
@@ -5687,7 +5719,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.18.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.19.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -5835,6 +5867,10 @@ static void DrawMenu()
                 ImGui::SliderInt("Scattering width", &cfg.sssWidth, 25, 300, "%d %%");
                 ImGui::SliderInt("Metal reflections", &cfg.metalRefl, 0, 100, cfg.metalRefl ? "%d %%" : "off");
                 ImGui::SliderInt("Metal roughness", &cfg.metalRough, 0, 100, cfg.metalRough ? "%d %%" : "mirror");
+                ImGui::SliderInt("Skin gloss", &cfg.skinGloss, 50, 500, cfg.skinGloss == 100 ? "game's" : "%d %%");
+                ImGui::SliderInt("Weapon / metal gloss", &cfg.metalGloss, 50, 800, cfg.metalGloss == 100 ? "game's" : "%d %%");
+                ImGui::TextDisabled("Gloss tightens the specular highlights of the game's own skin and weapon lighting");
+                ImGui::TextDisabled("(their exponents are 3-10: broad, plastic-looking). 100 %% = the game.");
                 ImGui::TextDisabled("Light bleeds softly through skin; weapons and metal props reflect the scene (needs");
                 ImGui::TextDisabled("screen-space reflections on). %d skin / %d metal shaders tagged, %s.", g_matTagCount[1], g_matTagCount[2],
                                     MatMaskValid() ? "mask drawn this frame" : "none on screen");
@@ -6457,7 +6493,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.18.1 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.19.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();
