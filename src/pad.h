@@ -726,23 +726,22 @@ static void PadDescribe()
 
 // ---------------------------------------------------------------- automatic gamepad <-> keyboard/mouse
 // The game's "Enable gamepad" option (APProfileManager.ProfileSettings.bUsingXboxController, bit 0 at
-// +0x13C of the profile manager, global pointer 0x16F9A00 in the Steam/GOG exe) turns keyboard and mouse
-// off. The game re-reads it every tick (0xAC7B48 / 0xAC9038: "using gamepad" = pad connected && bit),
-// so flipping the bit to whatever was touched last switches modes on the fly, prompts included.
+// +0x13C of the profile manager) turns keyboard and mouse off. The game re-reads it every tick in two
+// places ("using gamepad" = pad connected && bit), so flipping the bit to whatever was touched last
+// switches modes on the fly, prompts included. Both sites are found by signature (GOG and Steam), and
+// the profile manager's global pointer is read from their `mov eax,[global]`.
 static int g_autoSwOk = -1;           // -1 unchecked, 0 exe doesn't match, 1 ok
+static BYTE** g_profileMgr = nullptr;
 static void PadAutoSwitchTick()
 {
     if (!g_padCfg.autoSwitch || g_menuOpen || !g_padStarted) return;
     if (g_autoSwOk < 0) {
-        static const BYTE a[] = { 0xA1, 0x00, 0x9A, 0x6F, 0x01 };                 // mov eax, [0x16F9A00]
-        static const BYTE b[] = { 0xF6, 0x80, 0x3C, 0x01, 0x00, 0x00, 0x01 };     // test byte [eax+0x13C], 1
-        MEMORY_BASIC_INFORMATION mbi = {};
-        const bool mapped = VirtualQuery((const void*)0xAC7B48, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
-                            (BYTE*)mbi.AllocationBase == (BYTE*)GetModuleHandleA(nullptr);
-        g_autoSwOk = mapped && !memcmp((const void*)0xAC7B48, a, 5) && !memcmp((const void*)0xAC7B51, b, 7) &&
-                     !memcmp((const void*)0xAC902F, a, 5) && !memcmp((const void*)0xAC9038, b, 7);
-        Log(g_autoSwOk ? "pad: automatic gamepad / keyboard switching ready" :
-                         "pad: unknown APGame.exe - automatic gamepad / keyboard switching off");
+        BYTE* a = FindUnique("A1 ? ? ? ? 85 C0 74 ? F6 80 3C 01 00 00 01 74 ? 81 A7 FC 01 00 00 FF F7 FF FF");
+        BYTE* b = FindUnique("A1 ? ? ? ? 85 C0 74 ? F6 80 3C 01 00 00 01 74 ? 81 A6 FC 01 00 00 FF F7 FF FF");
+        g_autoSwOk = a && b && *(DWORD*)(a + 1) == *(DWORD*)(b + 1);
+        if (g_autoSwOk) g_profileMgr = *(BYTE***)(a + 1);
+        if (g_autoSwOk) Log("pad: automatic gamepad / keyboard switching ready (profile manager at %p)", (void*)g_profileMgr);
+        else Log("pad: unknown APGame.exe - automatic gamepad / keyboard switching off");
     }
     if (!g_autoSwOk) return;
     // in keyboard mode the game may stop polling the pad: look ourselves so a button press switches back
@@ -760,7 +759,7 @@ static void PadAutoSwitchTick()
     const DWORD pad = g_padTick, kbm = g_kbmTick;
     if (!pad && !kbm) return;
     const bool wantPad = (LONG)(pad - kbm) > 0;
-    BYTE* pm = *(BYTE**)0x16F9A00;
+    BYTE* pm = *g_profileMgr;
     if (!pm) return;
     BYTE& bits = pm[0x13C];
     const bool isPad = bits & 1;

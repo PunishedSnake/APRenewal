@@ -3,9 +3,9 @@
 A `d3d9.dll` mod for **Alpha Protocol** (2010, Unreal Engine 3): modern rendering, widescreen,
 controller support, HRTF audio and quality-of-life fixes, all switchable live from an in-game menu.
 
-> Patches inside the game's code (FOV/HUD, intro skip, console, gamepad/keyboard switching) currently target
-> the **GOG** `APGame.exe`. Every patch checks the exe's bytes first and switches itself off (with a
-> log line) on any other build. Steam support is in progress.
+Works with both the **GOG** and the **Steam** release. Patches inside the game's code (FOV/HUD, intro
+skip, console, gamepad/keyboard switching) find their spots by name or byte pattern and check them
+before writing; on an unknown build a feature switches itself off with a log line instead.
 
 ## Install
 1. Copy into `Alpha Protocol\Binaries\`:
@@ -46,7 +46,8 @@ Steam Input handles the controller.
 - **Skin:** subsurface scattering and tighter, glossier highlights.
 - **Weapons and metal:** glossier highlights and metal reflections.
 - **Window glass:** clearer, angle-dependent (Fresnel) reflections, screen-space reflections of the
-  current frame's scene (falling back to cubemaps where the screen has nothing to show), refraction control.
+  surrounding environment from the current frame (characters are left out; cubemaps fill in where the
+  screen has nothing to show), refraction control.
 - **Character lighting:** fill and evenness controls for the game's light probes.
 
 ### Post-processing

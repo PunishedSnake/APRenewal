@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <initializer_list>
 #include <vector>
+#include <unordered_set>
 #include <string>
 #include <unordered_map>
 #ifndef DI_OK
@@ -475,7 +476,7 @@ static void* PatchIAT(void** slot, void* hook)
 struct HookRegs { DWORD edi, esi, ebp, esp, ebx, edx, ecx, eax; };   // pushad layout
 typedef void (__cdecl *HookFn)(HookRegs*);
 
-static BYTE* FindPattern(const char* pat)
+static BYTE* FindPattern(const char* pat, BYTE* from = nullptr)
 {
     HMODULE exe = GetModuleHandleA(nullptr);
     auto nt = (IMAGE_NT_HEADERS*)((BYTE*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
@@ -484,19 +485,75 @@ static BYTE* FindPattern(const char* pat)
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
         if (!memcmp(sec[i].Name, ".text", 5)) { start = (BYTE*)exe + sec[i].VirtualAddress; size = sec[i].Misc.VirtualSize; }
     if (!start) return nullptr;
-    int bytes[64], n = 0;
-    for (const char* p = pat; *p && n < 64; ) {
+    int bytes[192], n = 0;
+    for (const char* p = pat; *p && n < 192; ) {
         while (*p == ' ') p++;
         if (!*p) break;
         if (*p == '?') { bytes[n++] = -1; while (*p == '?') p++; }
         else { bytes[n++] = (int)strtoul(p, (char**)&p, 16); }
     }
-    for (size_t i = 0; i + n <= size; i++) {
+    const size_t i0 = from && from >= start && from < start + size ? (size_t)(from - start) : 0;
+    for (size_t i = i0; i + n <= size; i++) {
         int k = 0;
         while (k < n && (bytes[k] < 0 || start[i + k] == bytes[k])) k++;
         if (k == n) return start + i;
     }
     return nullptr;
+}
+// Exactly one match, or nullptr (a pattern that matches twice is not trusted)
+static BYTE* FindUnique(const char* pat)
+{
+    BYTE* a = FindPattern(pat);
+    if (!a) return nullptr;
+    return FindPattern(pat, a + 1) ? nullptr : a;
+}
+
+// Exe sections, for the lookups below (works for any build: GOG and Steam differ in addresses only)
+static bool ExeSection(const char* name, BYTE** start, size_t* size)
+{
+    HMODULE exe = GetModuleHandleA(nullptr);
+    auto nt = (IMAGE_NT_HEADERS*)((BYTE*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if (!strncmp((const char*)sec[i].Name, name, 8)) { *start = (BYTE*)exe + sec[i].VirtualAddress; *size = sec[i].Misc.VirtualSize; return true; }
+    return false;
+}
+// A UE3 native function by name. Every native is registered as { L"int<Class>exec<Func>", function }
+// in the exe's data, so this finds the same function in any build without fixed addresses.
+static BYTE* FindNative(const wchar_t* cls, const wchar_t* func)
+{
+    wchar_t want[128];
+    swprintf(want, 128, L"int%lsexec%ls", cls, func);
+    const size_t wlen = (wcslen(want) + 1) * sizeof(wchar_t);     // including the terminator
+    BYTE *rd, *dt, *tx; size_t rds, dts, txs;
+    if (!ExeSection(".rdata", &rd, &rds) || !ExeSection(".data", &dt, &dts) || !ExeSection(".text", &tx, &txs)) return nullptr;
+    for (int pass = 0; pass < 2; pass++) {
+        BYTE* sb = pass ? dt : rd; const size_t ss = pass ? dts : rds;
+        for (size_t i = 0; i + wlen <= ss; i += 2) {
+            if (sb[i] != 'i' || memcmp(sb + i, want, wlen)) continue;
+            if (i >= 2 && sb[i - 2] != 0) continue;                  // must start a string
+            const DWORD nameAddr = (DWORD)(sb + i);
+            for (int tp = 0; tp < 2; tp++) {                         // the { name, function } table
+                BYTE* tb = tp ? rd : dt; const size_t ts = tp ? rds : dts;
+                for (size_t j = 0; j + 8 <= ts; j += 4)
+                    if (*(DWORD*)(tb + j) == nameAddr) {
+                        BYTE* f = *(BYTE**)(tb + j + 4);
+                        if (f >= tx && f < tx + txs) return f;
+                    }
+            }
+        }
+    }
+    return nullptr;
+}
+// The (single) vtable slot in .rdata that points at fn
+static void** FindVtableSlot(const void* fn)
+{
+    BYTE* rd; size_t rds;
+    if (!ExeSection(".rdata", &rd, &rds)) return nullptr;
+    void** hit = nullptr;
+    for (size_t j = 0; j + 4 <= rds; j += 4)
+        if (*(const void**)(rd + j) == fn) { if (hit) return nullptr; hit = (void**)(rd + j); }
+    return hit;
 }
 
 // Mid-function hook: `len` bytes at `site` (whole instructions, no relative operands) are replaced
@@ -604,7 +661,7 @@ static void InstallViewHooks()
     }
     // FOV: per camera module, non-destructive
     static const BYTE fovOrig[8] = { 0xF3, 0x0F, 0x59, 0x80, 0x0C, 0x01, 0x00, 0x00 };   // mulss xmm0,[eax+10Ch]
-    BYTE* fov = FindPattern("F3 0F 59 80 0C 01 00 00 09 98 10 01 00 00");
+    BYTE* fov = FindUnique("F3 0F 59 80 0C 01 00 00 09 98 10 01 00 00");
     BYTE repl[8] = { 0xF3, 0x0F, 0x59, 0x05 };                                            // mulss xmm0,[g_fovScratch]
     *(float**)(repl + 4) = &g_fovScratch;
     if (MidHook(fov, 8, fovOrig, View_ModuleFov, repl, 8)) g_viewSites |= 1;
@@ -617,11 +674,13 @@ static void InstallViewHooks()
     }
     // HUD canvas
     static const BYTE hudOrig[6] = { 0x89, 0x4B, 0x64, 0x89, 0x43, 0x68 };
-    BYTE* hud = FindPattern("89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50");
+    BYTE* hud = FindUnique("89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50");
     if (MidHook(hud ? hud + 9 : nullptr, 6, hudOrig, View_Hud)) g_viewSites |= 4;
     // menu viewport
     static const BYTE menuOrig[6] = { 0x85, 0xC0, 0x89, 0x44, 0x24, 0x08 };
-    BYTE* menu = FindPattern("FF D2 85 C0 89 44 24 08 DB 44 24 08");
+    // (the pattern alone matches 3 functions; with its prologue it is unique in GOG and Steam builds)
+    BYTE* menu = FindUnique("51 56 8B F1 33 C0 39 46 44 57 74 ? 8B 4E 44 8B 01 8B 50 08 FF D2 85 C0 89 44 24 08 DB 44 24 08");
+    if (menu) menu += 20;
     if (MidHook(menu ? menu + 2 : nullptr, 6, menuOrig, View_Menu)) g_viewSites |= 8;
     g_viewHooks = g_viewSites != 0;
     Log("view: hooks - module FOV %s, FOV readback %s, HUD %s, menu %s (FOV %d deg at 16:9)",
@@ -630,7 +689,8 @@ static void InstallViewHooks()
 }
 
 // --------------------------------------------------------------------------
-// Game module: intro skip and developer console (GOG APGame.exe addresses, verified before use)
+// Game module: intro skip and developer console. Everything is located by UE3 native names or byte
+// signatures (GOG and Steam builds differ only in addresses) and verified before use.
 // --------------------------------------------------------------------------
 static bool Readable(const void* p, size_t n)
 {
@@ -666,12 +726,17 @@ static int __thiscall hk_PlayMovie(void* self, int mode, const wchar_t* name, in
 }
 static void InstallMovieHook()
 {
-    const DWORD slot = 0x12173B0, fn = 0x4E49F0;
-    if (!Readable((void*)slot, 4) || *(DWORD*)slot != fn ||
-        !CodeIs(fn, "\x55\x8B\xEC\x83\xE4\xF8\x6A\xFF", 8) || !CodeIs(0x4E4A68, "\x68\xE0\x9E\x1D\x01", 5)) {
-        Log("movie: movie player not found (different exe build) - intro skip unavailable");
+    // GameThreadPlayMovie (GOG 0x4E49F0 / Steam 0x4E4410), found by its first 100 bytes, and the one
+    // vtable slot that points at it
+    BYTE* fn = FindUnique("55 8B EC 83 E4 F8 6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 81 EC 00 02 00 00 A1 ? ? ? ? 33 C4 "
+                          "89 84 24 F8 01 00 00 53 56 57 A1 ? ? ? ? 33 C4 50 8D 84 24 10 02 00 00 64 A3 00 00 00 00 "
+                          "8B 7D 0C 8B D9 83 7B 24 00 89 7C 24 10 75 ? C7 43 24 01 00 00 00 8B 45 08 89 43 08 A1");
+    void** slot = fn ? FindVtableSlot(fn) : nullptr;
+    if (!slot) {
+        Log("movie: movie player not found (unknown exe build) - intro skip unavailable");
         return;
     }
+    Log("movie: player at %p, vtable slot %p", fn, slot);
     o_PlayMovie = (PFN_PlayMovie)fn;
     DWORD old;
     VirtualProtect((void*)slot, 4, PAGE_READWRITE, &old);
@@ -684,6 +749,7 @@ static void InstallMovieHook()
 // ConsoleCommand() calls. The player controller pointer comes from AAPPlayerController natives
 // the game calls on it; commands run on the main thread between frames (our PeekMessageW hook).
 struct FStr { wchar_t* data; int num; int max; };
+static void** g_gmallocPtr = nullptr;    // &GMalloc, read from execConsoleCommand
 typedef FStr* (__thiscall *PFN_ConsoleCmd)(void* self, FStr* ret, const FStr* cmd, int writeToLog);
 static void* volatile g_pc = nullptr;
 static void* g_pcVtbl = nullptr;
@@ -762,27 +828,29 @@ static void ConRunOne(const char* cmd)
         Log("console:   %s", r);
     } else ConAddLine("  (done)");
     // the returned string was allocated by the game's GMalloc - give it back
-    void* gm = *(void**)0x16E8030;
+    void* gm = g_gmallocPtr ? *g_gmallocPtr : nullptr;
     if (out.data && gm) ((void (__thiscall*)(void*, void*))((*(void***)gm)[3]))(gm, out.data);
 }
 static void InstallConsole()
 {
     InitializeCriticalSection(&g_conCs);
     if (!cfg.console) { Log("console: off (Console=0)"); return; }
-    // ConsoleCommand thunk: vtable +0x110 call, and GMalloc->Free at +0xC
-    if (!CodeIs(0x4DB7E7, "\x8B\x17\x8B\x92\x10\x01\x00\x00", 8) || !CodeIs(0x4DB821, "\x8B\x0D\x30\x80\x6E\x01", 6) ||
-        !CodeIs(0x4DB838, "\x8B\x01\x8B\x50\x0C", 5)) {
-        Log("console: ConsoleCommand not found (different exe build) - console unavailable");
+    // execConsoleCommand: vtable +0x110 call at +0xB7, `mov ecx,[GMalloc]` at +0xF1, GMalloc->Free (+0xC) at +0x108
+    BYTE* cc = FindNative(L"APlayerController", L"ConsoleCommand");
+    if (!cc || !CodeIs((DWORD)cc + 0xB7, "\x8B\x17\x8B\x92\x10\x01\x00\x00", 8) || !CodeIs((DWORD)cc + 0xF1, "\x8B\x0D", 2) ||
+        !CodeIs((DWORD)cc + 0x108, "\x8B\x01\x8B\x50\x0C", 5)) {
+        Log("console: ConsoleCommand not found (unknown exe build) - console unavailable");
         return;
     }
+    g_gmallocPtr = *(void***)(cc + 0xF3);
     static const BYTE thunk[8] = { 0x8B, 0x44, 0x24, 0x04, 0x83, 0x40, 0x0C, 0x01 };   // mov eax,[esp+4]; add [eax+0Ch],1
     static const BYTE ai[5] = { 0x51, 0x0F, 0x57, 0xC0, 0x56 };                        // push ecx; xorps xmm0,xmm0; push esi
     int n = 0;
     // AAPPlayerController-only thunks (InPDAMenu is shared with the AI controller - not usable):
     // ShouldAllowPauseMenu, ShouldAllowPDAMenu, IsPlayerPastTitleScreen, UpdateAIData
-    for (DWORD a : { 0xA50230u, 0xA50270u, 0xA50490u })
-        if (MidHook((BYTE*)a, 8, thunk, Con_CapturePC)) n++;
-    if (MidHook((BYTE*)0xA50970, 5, ai, Con_CapturePC)) n++;
+    for (const wchar_t* f : { L"ShouldAllowPauseMenu", L"ShouldAllowPDAMenu", L"IsPlayerPastTitleScreen" })
+        if (MidHook(FindNative(L"AAPPlayerController", f), 8, thunk, Con_CapturePC)) n++;
+    if (MidHook(FindNative(L"AAPPlayerController", L"UpdateAIData"), 5, ai, Con_CapturePC)) n++;
     g_conOk = n > 0;
     Log("console: %d/4 player-controller probes installed%s", n, g_conOk ? "" : " - console unavailable");
 }
@@ -4232,6 +4300,7 @@ static const char* kGlassBodyHLSL = R"HLSL(
 #if GLASSSSR
 sampler2D apZTex : register(s12);
 sampler2D apPrevTex : register(s13);
+sampler2D apMatTex : register(s14);     // material mask: alpha = character
 #endif
 void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 fog : TEXCOORD4, float3 camv : TEXCOORD6,
           out float4 OutColor : COLOR0, out float4 OutMask : COLOR1)
@@ -4355,6 +4424,8 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
             float frontHit = saturate(-dot(hn, Rw) * 5 + 0.1);
             conf *= lerp(1, frontHit, curSrc);
         }
+        // characters are left out (apX[11].y = mask valid): only the environment is reflected
+        conf *= 1 - step(0.5, apX[11].y) * step(0.5, tex2Dlod(apMatTex, float4(saturate(puv), 0, 0)).a);
         // and rays turning almost straight back toward the camera have nothing on screen to hit
         float facing = dot(Rw, -wcv / max(length(wcv), 1e-3));
         conf *= saturate(1.0 + 1.5 * facing);
@@ -4411,7 +4482,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.21.1") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.22.0") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4420,13 +4491,14 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.21.1", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.22.0", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
 // Material mask: the game's own bytecode with two extra instructions - "def cK, tag" after the
 // header and "mov oC1, cK" before the end token - so the base pass also writes which pixels are skin
 // or metal to a second render target. cK is above every constant the shader uses (CTAB and defs).
+// tag: 1 skin, 2 metal, 3 rough (rgb); + 8 = drawn with a skinned (character) vertex shader (alpha)
 static IDirect3DPixelShader9* BuildTaggedShader(IDirect3DDevice9* dev, const DWORD* fn, const std::vector<CtabConst>& ct, int tag)
 {
     if ((fn[0] & 0xFFFF0000) != 0xFFFF0000 || (fn[0] & 0xFFFF) < 0x0300) return nullptr;   // ps_3_0 only
@@ -4456,7 +4528,8 @@ static IDirect3DPixelShader9* BuildTaggedShader(IDirect3DDevice9* dev, const DWO
     const int K = maxC + 1;
     if (!first || !end || K > 223) return nullptr;
     std::vector<DWORD> v(fn, fn + first);
-    const float val[4] = { tag == 1 ? 1.0f : 0.0f, tag == 2 ? 1.0f : 0.0f, tag == 3 ? 1.0f : 0.0f, 1.0f };
+    const int mt = tag & 7;
+    const float val[4] = { mt == 1 ? 1.0f : 0.0f, mt == 2 ? 1.0f : 0.0f, mt == 3 ? 1.0f : 0.0f, (tag & 8) ? 1.0f : 0.0f };
     v.push_back(0x05000051); v.push_back(0xA00F0000u | (DWORD)K);
     for (int i = 0; i < 4; i++) { DWORD w; memcpy(&w, &val[i], 4); v.push_back(w); }
     v.insert(v.end(), fn + first, fn + end);
@@ -4674,14 +4747,22 @@ static PFN_CreateVS o_CreateVS = nullptr;
 static PFN_SetVS o_SetVS = nullptr;
 static PFN_SetVSConstF o_SetVSConstF = nullptr;
 static std::unordered_map<IDirect3DVertexShader9*, int> g_vsVP;
+// GPU-skinned vertex shaders (characters): their CTAB has BoneMatrices
+static std::unordered_set<IDirect3DVertexShader9*> g_vsSkinned;
+static bool g_curVSSkinned = false;
 static HRESULT STDMETHODCALLTYPE hk_CreateVS(IDirect3DDevice9* d, const DWORD* fn, IDirect3DVertexShader9** out)
 {
     HRESULT hr = o_CreateVS(d, fn, out);
     if (SUCCEEDED(hr) && out && *out && !g_inPostFX && !g_ownShaderCreate) {
         std::vector<CtabConst> ct;
-        if (ParseCtab(fn, ct))
+        if (ParseCtab(fn, ct)) {
             if (const CtabConst* k = CtabFind(ct, "ViewProjectionMatrix"))
                 if (k->set == 2 && k->count == 4) { (*out)->AddRef(); g_vsVP[*out] = k->reg; }
+            if (CtabFind(ct, "BoneMatrices")) {
+                (*out)->AddRef(); g_vsSkinned.insert(*out);
+                if (g_vsSkinned.size() == 1) Log("materials: skinned (character) vertex shaders recognised");
+            }
+        }
     }
     return hr;
 }
@@ -4690,6 +4771,7 @@ static HRESULT STDMETHODCALLTYPE hk_SetVS(IDirect3DDevice9* d, IDirect3DVertexSh
     if (!g_inPostFX) {
         auto it = vs ? g_vsVP.find(vs) : g_vsVP.end();
         g_curVSvp = it != g_vsVP.end() ? it->second : -1;
+        g_curVSSkinned = vs && g_vsSkinned.count(vs) != 0;
     }
     return o_SetVS(d, vs);
 }
@@ -4817,6 +4899,37 @@ static bool BindMaskRT(IDirect3DDevice9* d, IDirect3DTexture9** tex, IDirect3DSu
     o_SetRT(d, 1, *surf);
     return true;
 }
+// pixel shader -> its "character" copy (nullptr = can't be patched); built from GetFunction on first use
+static std::unordered_map<IDirect3DPixelShader9*, IDirect3DPixelShader9*> g_charPS;
+static bool g_charPSBound = false;
+static long g_charDraws = 0;
+static IDirect3DPixelShader9* CharVariant(IDirect3DDevice9* d, IDirect3DPixelShader9* ps)
+{
+    auto it = g_charPS.find(ps);
+    if (it != g_charPS.end()) return it->second;
+    IDirect3DPixelShader9* v = nullptr;
+    UINT n = 0;
+    if (SUCCEEDED(ps->GetFunction(nullptr, &n)) && n >= 8 && n < (1u << 20)) {
+        std::vector<DWORD> code((n + 3) / 4);
+        if (SUCCEEDED(ps->GetFunction(code.data(), &n))) {
+            std::vector<CtabConst> ct;
+            ParseCtab(code.data(), ct);
+            const int mt = MaterialTag(ShaderHash(code.data()));
+            v = BuildTaggedShader(d, code.data(), ct, mt | 8);
+        }
+    }
+    g_charPS[ps] = v;
+    static int fails = 0;
+    if (!v && fails++ < 3) Log("materials: a character shader could not be marked (%p)", (void*)ps);
+    return v;
+}
+// what hk_SetPS bound for the game's current shader
+static IDirect3DPixelShader9* GameBoundPS()
+{
+    if (g_curGS && ReplActive(g_curGS)) return g_curGS->replSsr && cfg.glassSsr > 0 ? g_curGS->replSsr : g_curGS->repl;
+    if (g_curGS && g_curGS->tagged && cfg.matEnable) return g_curGS->tagged;
+    return g_curGamePS;
+}
 static void PreDraw(IDirect3DDevice9* d)
 {
     if (g_inPostFX) return;                       // our own passes (they may run inside a game draw)
@@ -4834,6 +4947,20 @@ static void PreDraw(IDirect3DDevice9* d)
     if (g_curGS && g_curGS->tagged && cfg.matEnable && g_curRTIsHDR) {
         g_matMaskBound = BindMaskRT(d, &g_matMask, &g_matMaskSurf, &g_matMaskFrame, 0, "material");
         if (g_matMaskBound && !g_matTaggedDraws++) Log("materials: first skin/metal draw tagged");
+    }
+    // characters (skinned meshes) in the opaque base pass: the same pixel shader, patched to also write
+    // "character" into the material mask's alpha - window reflections leave characters out
+    if (g_curVSSkinned && cfg.matEnable && g_curRTIsHDR && g_curGamePS && !(g_curGS && ReplActive(g_curGS))) {
+        DWORD blend = TRUE;
+        d->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+        if (!blend) {
+            IDirect3DPixelShader9* v = CharVariant(d, g_curGamePS);
+            if (v && (g_matMaskBound || (g_matMaskBound = BindMaskRT(d, &g_matMask, &g_matMaskSurf, &g_matMaskFrame, 0, "material")))) {
+                o_SetPS(d, v);
+                g_charPSBound = true;
+                if (!g_charDraws++) Log("materials: first character draw marked");
+            }
+        }
     }
     GameShader* gs = g_curGS;
     if (!gs || g_inPostFX || !o_SetPSConstF) return;
@@ -5062,12 +5189,16 @@ static void PreDraw(IDirect3DDevice9* d)
                 x[10][0] = 30.0f; x[10][1] = (float)(jf++ % 64); x[10][2] = (float)(g_ppW ? g_ppW : g_bbW); x[10][3] = (float)(g_ppH ? g_ppH : g_bbH);
                 d->SetTexture(12, g_fx.zcopy);
                 d->SetTexture(13, cur ? g_glassSrc : g_prevHdr);
-                for (DWORD sm = 12; sm <= 13; sm++) {
+                // characters (material mask alpha) are left out of the reflections
+                const bool chars = cur && MatMaskValid() && g_charDraws > 0;
+                d->SetTexture(14, chars ? (IDirect3DBaseTexture9*)g_matMask : nullptr);
+                x[11][1] = chars ? 1.0f : 0.0f;
+                for (DWORD sm = 12; sm <= 14; sm++) {
                     d->SetSamplerState(sm, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
                     d->SetSamplerState(sm, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
                     d->SetSamplerState(sm, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-                    d->SetSamplerState(sm, D3DSAMP_MINFILTER, sm == 12 ? D3DTEXF_POINT : D3DTEXF_LINEAR);
-                    d->SetSamplerState(sm, D3DSAMP_MAGFILTER, sm == 12 ? D3DTEXF_POINT : D3DTEXF_LINEAR);
+                    d->SetSamplerState(sm, D3DSAMP_MINFILTER, sm == 13 ? D3DTEXF_LINEAR : D3DTEXF_POINT);
+                    d->SetSamplerState(sm, D3DSAMP_MAGFILTER, sm == 13 ? D3DTEXF_LINEAR : D3DTEXF_POINT);
                     d->SetSamplerState(sm, D3DSAMP_SRGBTEXTURE, FALSE);
                 }
                 g_glassSsrBound = true;
@@ -5104,7 +5235,8 @@ static void PostDrawRestore(IDirect3DDevice9* d)
     if (g_inPostFX) return;
     if (g_glassMaskBound) { o_SetRT(d, 1, nullptr); g_glassMaskBound = false; }
     if (g_matMaskBound) { o_SetRT(d, 1, nullptr); g_matMaskBound = false; }
-    if (g_glassSsrBound) { d->SetTexture(12, nullptr); d->SetTexture(13, nullptr); g_glassSsrBound = false; }
+    if (g_charPSBound) { o_SetPS(d, GameBoundPS()); g_charPSBound = false; }
+    if (g_glassSsrBound) { d->SetTexture(12, nullptr); d->SetTexture(13, nullptr); d->SetTexture(14, nullptr); g_glassSsrBound = false; }
     if (g_fogMaskBound) { o_SetRT(d, 1, nullptr); g_fogMaskBound = false; }
     if (g_bloomBound) { d->SetTexture(10, nullptr); g_bloomBound = false; }
     if (g_preDrawLo < 0) return;
@@ -6037,7 +6169,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.21.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.22.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -6149,7 +6281,7 @@ static void DrawMenu()
             ImGui::SliderInt("Glass bumpiness", &cfg.glassBump, 0, 300, "%d %%");
             ImGui::SliderInt("Glass refraction", &cfg.glassRefract, 0, 300, "%d %%");
             ImGui::SliderInt("Screen-space glass reflections", &cfg.glassSsr, 0, 200, cfg.glassSsr ? "%d %%" : "off (cubemap only)");
-            ImGui::TextDisabled("Windows reflect what is on screen this frame; the cubemap fills in where the screen has nothing (e.g. what is behind you).");
+            ImGui::TextDisabled("Windows reflect the surroundings on screen this frame (not characters); the cubemap fills in the rest.");
             if (ImGui::Button("Game's glass")) { cfg.glassClarity = 100; cfg.glassRefl = 100; cfg.glassFresnel = 0; cfg.glassReflContrast = 100; cfg.glassBump = 100; cfg.glassRefract = 100; }
             ImGui::SameLine();
             if (ImGui::Button("APRenewal defaults")) { cfg.glassClarity = 65; cfg.glassRefl = 160; cfg.glassFresnel = 70; cfg.glassReflContrast = 30; cfg.glassBump = 100; cfg.glassRefract = 100; }
@@ -6856,7 +6988,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.21.1 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.22.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

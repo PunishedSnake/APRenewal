@@ -24,28 +24,34 @@ README = current feature list only (no changelog). These notes = current knowled
   `near`/`far` are reserved. The 2009 compiler crashed on loops with `break` + early returns in helpers
   (game-thread compiles): keep them branch-free/unrolled.
 
-## Exe addresses (the user's GOG APGame.exe — verify bytes before every patch; Steam exe coming)
+## Exe patches (GOG and Steam builds — nothing hard-coded, everything looked up and verified)
+- GOG APGame.exe (imports Galaxy.dll, PE time 0x6502278D) and Steam APGame.exe (PE time 0x4C5DE174, no
+  ASLR, not packed; Steam ships SolidShield's Activator.exe) are the same code at different addresses.
+- Lookups at runtime: `FindUnique(sig)` (exactly one match in .text), `FindNative(L"Class", L"Func")`
+  (UE3 registers every native as { L"int<Class>exec<Func>", fn } in .rdata/.data), `FindVtableSlot(fn)`.
+  `/tmp/sig/verify.py`-style check against both exes before shipping any new sig (keep a copy of each exe).
 - Mid-hooks: `MidHook(site, len, expect, fn, repl)` (pushfd/pushad/XMM save, fn may edit regs, original or
   replacement bytes, jmp back). Sites = whole instructions without relative operands.
-- View (replaces AlphaFixer): FOV blend function 0xA8F020, per-module FOV via replacement
-  `mulss xmm0,[g_fovScratch]`, blended result read at its `fld [esp+8]` (feeds AO FOV). Normal camera
-  FOV = 60°. HUD canvas sig `89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50` (+9: ecx width, esi left),
-  menu viewport sig `FF D2 85 C0 89 44 24 08 DB 44 24 08` (+2: eax width, first of 3). HUD/menu only act
-  wider than 16:9.
-- Movies: player vtable slot 0x12173B0 = GameThreadPlayMovie 0x4E49F0 (thiscall mode, name, startFrame;
-  ret 0xC). Logos `slate_*.sfd` skipped by name prefix; loading movie `simple_loading_v02.sfd` (mode 129).
-- Console: player controller vtable +0x110 = ConsoleCommand(FString* ret, const FString&, UBOOL) thiscall.
-  PC pointer from MidHooks on AAPPlayerController-only exec thunks (ShouldAllowPauseMenu 0xA50230,
-  ShouldAllowPDAMenu 0xA50270, IsPlayerPastTitleScreen 0xA50490, UpdateAIData 0xA50970; not InPDAMenu).
-  Used only if seen in the last 3 s with the first-seen vtable; commands queued, run in hk_PeekMessageW
-  on the main thread; result FString freed with GMalloc (0x16E8030) vtable +0xC. Viewport Exec
-  (0x50E000–0x513800) has AP commands (HQDLE, USEMAGICRIM, TOGGLEUI, TOGGLEOCCLUSION 0x16F95C4, EDAA,
-  MINAMBIENT, LIGHTSCALE, SHADOWINTENSITY, SHARPNESS, …) → docs/script-commands.md.
-- Gamepad option: UAPProfileManager singleton [0x16F9A00] (cf. execGetProfileManager 0xAB3E40), bit 0 of
-  +0x13C = "Enable gamepad". Re-read every frame by 0xAC7B00 / 0xAC8DC0: pad connected (0xA274F0) && bit
-  → clear flag 0x800 at input object +0x1FC (gamepad), else set (KBM). Sites 0xAC7B48/51, 0xAC902F/38.
-- `docs/apgame-re.md`, `tools/re/apgame_natives.json` (2804 `Class::execFunc` → address),
-  `tools/re/apdis.py` (capstone disassembly with native names; `APGAME=path`).
+
+| What | How it's found | GOG | Steam |
+|---|---|---|---|
+| Module FOV `mulss xmm0,[eax+10Ch]` | sig `F3 0F 59 80 0C 01 00 00 09 98 10 01 00 00` | 0xA8F0B7 | 0xA8ED77 |
+| FOV blend result `fld [esp+8]; pop esi` | first `D9 44 24 08 5E` within 0x60 after it | | |
+| HUD canvas (ecx width, esi left) | sig `89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50` +9 | 0x50CA76 | 0x50C766 |
+| Menu viewport width (eax) | sig `51 56 8B F1 33 C0 39 46 44 57 74 ? 8B 4E 44 8B 01 8B 50 08 FF D2 85 C0 …` +22 | 0x617814 | 0x64ABF4 |
+| GameThreadPlayMovie (thiscall mode, name, frame; ret 0xC) | 100-byte prologue sig + its one .rdata vtable slot | 0x4E49F0 / slot 0x12173B0 | 0x4E4410 / 0x1216C38 |
+| ConsoleCommand: PC vtable +0x110 | FindNative APlayerController ConsoleCommand, bytes at +0xB7 | 0x4DB730 | 0x4DB620 |
+| GMalloc (Free = vtable +0xC) | dword at execConsoleCommand +0xF3 (`mov ecx,[GMalloc]`) | 0x16E8030 | 0x16DEE10 |
+| PC capture probes | FindNative AAPPlayerController ShouldAllowPauseMenu / ShouldAllowPDAMenu / IsPlayerPastTitleScreen (8-byte thunk), UpdateAIData (5 bytes) | 0xA50230… | 0xA4FB60… |
+| "Enable gamepad" bit 0 of [profile manager]+0x13C | two sigs `A1 ? ? ? ? 85 C0 74 ? F6 80 3C 01 00 00 01 74 ? 81 A7/A6 FC 01 00 00 FF F7 FF FF`, global = dword at +1 | 0x16F9A00 | 0x16F8804 |
+
+- Console commands queued, run in hk_PeekMessageW on the main thread; PC pointer used only if seen in
+  the last 3 s with the first-seen vtable. Viewport Exec has AP commands (HQDLE, USEMAGICRIM, TOGGLEUI,
+  EDAA, MINAMBIENT, LIGHTSCALE, SHADOWINTENSITY, SHARPNESS, …) → docs/script-commands.md.
+- The tick functions re-read the gamepad bit every frame: pad connected && bit → clear flag 0x800 at
+  input object +0x1FC (gamepad), else set it (KBM).
+- `docs/apgame-re.md` (GOG addresses), `tools/re/apgame_natives.json` (GOG; `natives.py <exe>` regenerates
+  for any build), `tools/re/apdis.py` (capstone with native names; `APGAME=path`).
 - Script packages: UE3 v539 / licensee 91, zlib-chunked: `tools/re/upk.py`, `execs.py`, `sigs.py`.
 
 ## Hooks
@@ -101,11 +107,14 @@ res, world into full-res LDR target, one draw to the backbuffer, then UI.
   With the same-frame source apX[11].x = 1 and apX[4..6] = inverse rows (A), apX[7] = camera: back-face
   test at the hit (normal from 3 depth taps, oriented to the camera; ray must hit the front: −n·R > 0) —
   rays from a window back toward Mike land on his back from behind (the "dark Mike ghost"). Rays almost
-  straight back to the camera faded too. Jitter IGN(pixel + frame) so TAA averages it; 5-tap cross on the hit.
+  straight back to the camera faded too. Characters are left out entirely (user's call): skinned vertex
+  shaders (CTAB BoneMatrices) in the opaque base pass get a patched copy of their PS (`CharVariant`, from
+  GetFunction, BuildTaggedShader tag | 8) that writes material mask alpha = 1; glass samples it at s14
+  (apX[11].y = valid) and drops those hits. Jitter IGN(pixel + frame) so TAA averages it; 5-tap cross on the hit.
 - Fog OneLayerMain rebuilt to write transmittance to RT1 (AO fades with fog).
 - Material mask: `BuildTaggedShader` patches base-pass bytecode (`def cK`, `mov oC1, cK`) for skin / metal /
   rough hashes (src/matclass.h from tools/re/matclass.py over RefShaderCache); RT1 = g_matMask (r skin,
-  g metal, b rough) when RT0 is the full-res HDR scene.
+  g metal, b rough, a character) when RT0 is the full-res HDR scene.
 - Gloss: src/specregs.h (tools/re/specregs.py) = per skin/metal light shader the registers of the specular
   pow exponent (base from max(), not Fresnel's 1−x); scaled per draw. Skin light 54793f09: spec exp c40
   (=7), Fresnel pow 12. Weapon light 2198188e: exponent lerp(US42, US41) 3–10, ramp map, Fresnel US0/US1/US2.
@@ -167,7 +176,5 @@ AO → SSS (2 passes) → SSR → light shafts → grade → SMAA/FXAA → TAA �
 - AlphaFixer (winmm.dll) and dixi are replaced; user told to delete them.
 
 ## Open items
-- Steam APGame.exe: user will supply it → make exe patches version-agnostic (signature scans instead of
-  fixed addresses).
 - HUD/subtitle scale (Scaleform canvas RE), 120 fps physics check.
 - Menu + mouse: fix for the stolen g_diMouse in 0.21.1 — confirm with the user.
