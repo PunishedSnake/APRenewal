@@ -2015,7 +2015,7 @@ struct PostFX {
     IDirect3DPixelShader9 *psSmaaE = nullptr, *psSmaaW = nullptr, *psSmaaN = nullptr, *psTaa = nullptr;
     IDirect3DPixelShader9 *psShB = nullptr, *psShM = nullptr, *psShR = nullptr, *psShC = nullptr, *psShF = nullptr;
     IDirect3DTexture9 *smaaEdge = nullptr, *smaaWeight = nullptr, *taaHist = nullptr;      // default pool
-    IDirect3DTexture9 *shA = nullptr, *shB = nullptr, *shTiny[2] = {};                     // default pool
+    IDirect3DTexture9 *shA = nullptr, *shB = nullptr, *shC = nullptr, *shTiny[2] = {};                     // default pool
     IDirect3DSurface9* shSys = nullptr;                                                     // system memory
     IDirect3DTexture9 *smaaArea = nullptr, *smaaSearch = nullptr;                          // managed
     IDirect3DPixelShader9* psSharp = nullptr;
@@ -2139,7 +2139,7 @@ static IDirect3DVertexShader9* CompileVS(IDirect3DDevice9* dev, const char* src,
 static void PostFXReleaseDefault()
 {
     IDirect3DTexture9** texs[] = { &g_fx.L0, &g_fx.L1, &g_fx.L2, &g_fx.aoA, &g_fx.aoB, &g_fx.depth, &g_fx.fitRT, &g_fx.zcopy,
-                                   &g_fx.smaaEdge, &g_fx.smaaWeight, &g_fx.taaHist, &g_fx.shA, &g_fx.shB, &g_fx.shTiny[0], &g_fx.shTiny[1] };
+                                   &g_fx.smaaEdge, &g_fx.smaaWeight, &g_fx.taaHist, &g_fx.shA, &g_fx.shB, &g_fx.shC, &g_fx.shTiny[0], &g_fx.shTiny[1] };
     if (g_fx.shSys) { g_fx.shSys->Release(); g_fx.shSys = nullptr; }
     if (g_fx.fitSys) { g_fx.fitSys->Release(); g_fx.fitSys = nullptr; }
     for (auto t : texs) if (*t) { (*t)->Release(); *t = nullptr; }
@@ -2712,13 +2712,37 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
                 // no dither when the fill pass runs (it closes the gaps without noise); dither as the fallback
                 static unsigned shFrame = 0;
                 const float r6[4] = { 0.85f, 0.9798f, g_fx.psShF ? 0.0f : (float)(shFrame++ % 63 + 1), 0 };   // 0.9798^64 = 0.96^32
-                dev->SetPixelShaderConstantF(2, &L[0][0], 4);
                 dev->SetPixelShaderConstantF(6, r6, 1);
                 dev->SetVertexShaderConstantF(0, hpq, 1);
                 SamplerSet(dev, 0, D3DTEXF_LINEAR);
-                DrawFullscreen(dev, g_fx.shA, sB, g_fx.psShR);                        // radial blur toward the lights
                 IDirect3DTexture9* shOut = g_fx.shB;
-                if (g_fx.psShF) { DrawFullscreen(dev, g_fx.shB, sA, g_fx.psShF); shOut = g_fx.shA; }   // close the gaps between taps
+                IDirect3DSurface9* sC = nullptr;
+                if (g_fx.psShF && !g_fx.shC) MkRT(dev, &g_fx.shC, qw, qh, D3DFMT_A16B16G16R16F);
+                if (g_fx.psShF && g_fx.shC && SUCCEEDED(g_fx.shC->GetSurfaceLevel(0, &sC))) {
+                    // one light at a time: radial blur, then the fill pass smears it along that light's own
+                    // rays only, added up in shC. (Filling the sum along a blend of directions left the
+                    // gaps in one light's rays wherever they crossed near another light.)
+                    dev->ColorFill(sC, nullptr, 0);
+                    const float zero[12] = {};
+                    dev->SetPixelShaderConstantF(3, zero, 3);
+                    for (int i = 0; i < 4; i++) {
+                        if (L[i][2] <= 0) continue;
+                        dev->SetPixelShaderConstantF(2, L[i], 1);
+                        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+                        DrawFullscreen(dev, g_fx.shA, sB, g_fx.psShR);
+                        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+                        dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+                        dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+                        dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+                        DrawFullscreen(dev, g_fx.shB, sC, g_fx.psShF);
+                    }
+                    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+                    shOut = g_fx.shC;
+                    sC->Release();
+                } else {
+                    dev->SetPixelShaderConstantF(2, &L[0][0], 4);
+                    DrawFullscreen(dev, g_fx.shA, sB, g_fx.psShR);                    // radial blur toward all lights
+                }
                 const float hp2[4] = { -1.0f / bd.Width, 1.0f / bd.Height, 0, 0 };
                 dev->SetVertexShaderConstantF(0, hp2, 1);
                 const float c1[4] = { std::max(cfg.shafts, 0) / 100.0f * 1.5f, 0, 0, 0 };
@@ -4336,7 +4360,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.20.1") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.20.2") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4345,7 +4369,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.20.1", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.20.2", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -5394,6 +5418,7 @@ static void CalibrateDepth(IDirect3DDevice9* dev)
 // thread just queues events.
 // ==========================================================================
 static volatile bool g_menuOpen = false;
+static void MenuInputReport();
 
 // ---- events from the main thread -> render thread
 struct MenuEv { int type, a, b; };              // 0 = key(vk, down), 1 = char, 2 = wheel(delta)
@@ -5509,6 +5534,33 @@ static void HookSlot(VtOrig* t, int n, void* self, int index, void* hook)
     }
 }
 
+// while the menu is open: who still feeds the game mouse movement? (logged when the menu closes)
+static volatile LONG g_mdStateMouse = 0, g_mdDataMouse = 0, g_mdOther = 0, g_mdOtherMove = 0, g_mdCursor = 0, g_mdSetCursor = 0;
+// the game also has GetCursorPos / SetCursorPos (UE3 recentres the cursor and can read deltas from it):
+// with the menu open it sees a frozen cursor and can't move the real one
+static POINT g_menuCursor = {};
+static bool g_menuCursorSet = false;
+typedef BOOL (WINAPI *PFN_GetCursorPos)(LPPOINT);
+typedef BOOL (WINAPI *PFN_SetCursorPos)(int, int);
+static PFN_GetCursorPos o_GetCursorPos = nullptr;
+static PFN_SetCursorPos o_SetCursorPos = nullptr;
+static BOOL WINAPI hk_GetCursorPos(LPPOINT p)
+{
+    if (g_menuOpen && p) {
+        InterlockedIncrement(&g_mdCursor);
+        if (!g_menuCursorSet) { o_GetCursorPos(&g_menuCursor); g_menuCursorSet = true; }
+        *p = g_menuCursor;
+        return TRUE;
+    }
+    g_menuCursorSet = false;
+    return o_GetCursorPos(p);
+}
+static BOOL WINAPI hk_SetCursorPos(int x, int y)
+{
+    if (g_menuOpen) { InterlockedIncrement(&g_mdSetCursor); g_menuCursor.x = x; g_menuCursor.y = y; g_menuCursorSet = true; return TRUE; }
+    return o_SetCursorPos(x, y);
+}
+
 static HRESULT STDMETHODCALLTYPE hk_DIGetState(void* self, DWORD cb, void* data)
 {
     auto orig = (PFN_DIGetState)FindOrig(g_vtState, 8, self);
@@ -5522,6 +5574,13 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetState(void* self, DWORD cb, void* data)
             g_diMouseTick = GetTickCount();
             InterlockedExchangeAdd(&g_miceZ, st[2]);
             g_haveDIMouse = true;
+        }
+        if (g_menuOpen) {
+            if (self == g_diMouse) InterlockedIncrement(&g_mdStateMouse);
+            else if (self != g_diKeyboard) {
+                InterlockedIncrement(&g_mdOther);
+                if (cb >= 8 && (((const LONG*)data)[0] || ((const LONG*)data)[1])) InterlockedIncrement(&g_mdOtherMove);
+            }
         }
         if (g_menuOpen && (self == g_diMouse || self == g_diKeyboard)) memset(data, 0, cb);
     }
@@ -5548,6 +5607,7 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetData(void* self, DWORD cbObj, void* rgd
     if (!orig) return E_FAIL;
     // Menu open: the game reads the mouse buffer in small chunks and stops when it gets nothing back,
     // so a fast mouse would pile up events (slow, laggy cursor). Drain the whole buffer here instead.
+    if (g_menuOpen && self == g_diMouse) InterlockedIncrement(&g_mdDataMouse);
     if (g_menuOpen && self == g_diMouse && inout && cbObj >= 8 && cbObj <= 64 && !(flags & 1 /*DIGDD_PEEK*/)) {
         BYTE buf[64 * 64];
         for (int guard = 0; guard < 64; guard++) {
@@ -5563,6 +5623,7 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetData(void* self, DWORD cbObj, void* rgd
     HRESULT hr = orig(self, cbObj, rgdod, inout, flags);
     if (SUCCEEDED(hr) && inout) {
         if (self == g_diMouse && rgdod && cbObj >= 8) AccumulateMouseData(rgdod, cbObj, *inout);
+        if (g_menuOpen && self != g_diMouse && self != g_diKeyboard && *inout) { InterlockedIncrement(&g_mdOther); InterlockedIncrement(&g_mdOtherMove); }
         if (g_menuOpen && (self == g_diMouse || self == g_diKeyboard)) *inout = 0;
     }
     return hr;
@@ -5574,7 +5635,7 @@ static HRESULT STDMETHODCALLTYPE hk_DICreateDevice(void* self, REFGUID guid, voi
     HRESULT hr = orig ? orig(self, guid, dev, outer) : E_FAIL;
     if (SUCCEEDED(hr) && dev && *dev) {
         const char* kind = "other";
-        if (IsEqualGUID(guid, kGUID_SysMouse))    { g_diMouse = *dev; kind = "mouse"; }
+        if (IsEqualGUID(guid, kGUID_SysMouse))    { if (g_diMouse && g_diMouse != *dev) Log("menu: the game made a new mouse device (old %p)", g_diMouse); g_diMouse = *dev; kind = "mouse"; }
         if (IsEqualGUID(guid, kGUID_SysKeyboard)) { g_diKeyboard = *dev; kind = "keyboard"; }
         HookSlot(g_vtState, 8, *dev, 9, (void*)hk_DIGetState);   // IDirectInputDevice8::GetDeviceState
         HookSlot(g_vtData, 8, *dev, 10, (void*)hk_DIGetData);    // IDirectInputDevice8::GetDeviceData
@@ -5639,6 +5700,10 @@ static void InstallInputHooks()
     if (!o_DI8Create)
         if (void** s = FindIAT(exe, "dinput8.dll", "DirectInput8Create"))
             o_DI8Create = (PFN_DI8Create)SafePatchIAT(s, (void*)hk_DI8Create);
+    if (!o_GetCursorPos)
+        if (void** s = FindIAT(exe, "user32.dll", "GetCursorPos")) o_GetCursorPos = (PFN_GetCursorPos)SafePatchIAT(s, (void*)hk_GetCursorPos);
+    if (!o_SetCursorPos)
+        if (void** s = FindIAT(exe, "user32.dll", "SetCursorPos")) o_SetCursorPos = (PFN_SetCursorPos)SafePatchIAT(s, (void*)hk_SetCursorPos);
     // dixi = one DLL installed as both dinput8.dll and xinput1_3.dll, with XInput exports in its dinput8
     HMODULE di8 = GetModuleHandleA("dinput8.dll");
     g_dixiPresent = di8 && GetProcAddress(di8, "XInputGetState");
@@ -5877,7 +5942,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.20.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.20.2", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -6309,7 +6374,15 @@ static void DrawMenu()
     if (g_menuNote[0] && GetTickCount() - g_menuNoteTime < 4000) { ImGui::SameLine(); ImGui::TextDisabled("%s", g_menuNote); }
     ImGui::End();
 
-    if (!open || ImGui::IsKeyPressed(ImGuiKey_Escape)) { g_menuOpen = false; Log("menu closed"); }
+    if (!open || ImGui::IsKeyPressed(ImGuiKey_Escape)) { g_menuOpen = false; MenuInputReport(); }
+}
+
+static void MenuInputReport()
+{
+    Log("menu closed (while open, the game read: mouse state %ld x, mouse buffer %ld x - both blanked; other devices %ld x, "
+        "%ld with input; cursor position %ld x, cursor moves %ld x - frozen)",
+        InterlockedExchange(&g_mdStateMouse, 0), InterlockedExchange(&g_mdDataMouse, 0), InterlockedExchange(&g_mdOther, 0),
+        InterlockedExchange(&g_mdOtherMove, 0), InterlockedExchange(&g_mdCursor, 0), InterlockedExchange(&g_mdSetCursor, 0));
 }
 
 static void MenuFrame(IDirect3DDevice9* dev)
@@ -6323,7 +6396,7 @@ static void MenuFrame(IDirect3DDevice9* dev)
             InterlockedExchange(&g_miceX, 0); InterlockedExchange(&g_miceY, 0); InterlockedExchange(&g_miceZ, 0);
             g_vcx = g_bbW * 0.5f; g_vcy = g_bbH * 0.5f;
         }
-        Log(g_menuOpen ? "menu opened" : "menu closed");
+        if (g_menuOpen) Log("menu opened"); else MenuInputReport();
     }
     keyWas = key;
     if (!g_menuOpen) {
@@ -6688,7 +6761,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.20.1 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.20.2 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

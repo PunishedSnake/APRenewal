@@ -416,6 +416,10 @@ static BOOL CALLBACK DiEnumDev(LPCDIDEVICEINSTANCEW di, LPVOID)
 {
     if (g_diN >= 4) return DIENUM_STOP;
     for (int i = 0; i < g_diN; i++) if (IsEqualGUID(g_diDev[i].inst, di->guidInstance)) return DIENUM_CONTINUE;
+    // devices already turned down (XInput pads seen through DirectInput): don't re-create them every scan
+    static GUID skipped[16]; static int nSkipped = 0;
+    for (int i = 0; i < nSkipped; i++) if (IsEqualGUID(skipped[i], di->guidInstance)) return DIENUM_CONTINUE;
+    auto skip = [&]() { if (nSkipped < 16) skipped[nSkipped++] = di->guidInstance; };
     const DWORD pidvid = di->guidProduct.Data1;            // PID << 16 | VID
     const DWORD vid = pidvid & 0xFFFF, pid = pidvid >> 16, vidpid = vid << 16 | pid;
     if (vid == 0x054C && pid != 0x0268 && g_padCfg.sony) return DIENUM_CONTINUE;   // read over HID instead
@@ -424,9 +428,9 @@ static BOOL CALLBACK DiEnumDev(LPCDIDEVICEINSTANCEW di, LPVOID)
     // XInput pads also show up in DirectInput (with "IG_" in their path): XInput reads them properly
     DIPROPGUIDANDPATH gp = {}; gp.diph.dwSize = sizeof gp; gp.diph.dwHeaderSize = sizeof gp.diph; gp.diph.dwHow = DIPH_DEVICE;
     if (SUCCEEDED(d->GetProperty(DIPROP_GUIDANDPATH, &gp.diph)) && (wcsstr(gp.wszPath, L"IG_") || wcsstr(gp.wszPath, L"ig_"))) {
-        d->Release(); return DIENUM_CONTINUE;
+        d->Release(); skip(); return DIENUM_CONTINUE;
     }
-    if (FAILED(d->SetDataFormat(&c_dfDIJoystick2))) { d->Release(); return DIENUM_CONTINUE; }
+    if (FAILED(d->SetDataFormat(&c_dfDIJoystick2))) { d->Release(); skip(); return DIENUM_CONTINUE; }
     if (g_hwnd) d->SetCooperativeLevel(g_hwnd, DISCL_NONEXCLUSIVE | DISCL_BACKGROUND);
     d->EnumObjects(DiEnumAxes, d, DIDFT_AXIS);
     DiDev& e = g_diDev[g_diN];

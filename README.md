@@ -1,4 +1,4 @@
-# APRenewal 0.20.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.20.2 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -27,6 +27,17 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.20.2
+- **Light shafts: no more bands where rays cross other lights.** 0.20.1 smoothed all shafts together,
+  along a blend of the lights' directions - so one light's rays stayed striped wherever they passed
+  near another light (the distant ones). Each light is now blurred and smoothed on its own and the
+  results are added up.
+- **Menu vs. camera**: with the APRenewal menu open the game now also sees a frozen mouse cursor (it
+  can recentre the cursor and read the camera from it, which got past the DirectInput blocking).
+  When the menu closes, the log lists what the game tried to read while it was open - if the camera
+  still moves, send that line.
+- The controller scan no longer re-creates (and logs) DirectInput copies of Xbox pads every 2 s.
 
 ## New in 0.20.1
 - **Gamepad and keyboard + mouse switch automatically.** The game's own "Enable gamepad" option turns

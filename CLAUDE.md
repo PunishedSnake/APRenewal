@@ -346,6 +346,13 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
     game hasn't read the DI mouse for 250 ms.
   - Shafts: user saw stripes next to lamps (radial blur comb). kShaftFillPS: 8 taps across one coarse tap
     spacing along each light's ray, lights weighted by z / dist². Dither in the radial pass only without it.
+- 0.20.2 (user on 0.20.1: auto switch works; bands on distant lights; mouse moves the camera with the menu open):
+  - Shafts: fill along a share-weighted mix left one light's comb unfilled near another light. Now per light:
+    radial (only L0 set) → shB, fill → shC with ONE/ONE blending (cleared first), composite from shC.
+  - Menu: exe IAT GetCursorPos / SetCursorPos hooked - frozen while the menu is open (UE3 can recentre and
+    read deltas). Cause not confirmed: MenuInputReport logs on close how often the game read the DI mouse
+    (state / buffer), other DI devices (with input), GetCursorPos / SetCursorPos while open.
+  - pad.h: DI devices refused (IG_ / data format) remembered by instance GUID (were re-created every scan).
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 
