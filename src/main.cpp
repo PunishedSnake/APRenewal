@@ -30,6 +30,7 @@
 #endif
 #include "imgui/imgui.h"
 #include "matclass.h"
+#include "smaa.h"
 #include "imgui/imgui_impl_dx9.h"
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
@@ -184,6 +185,9 @@ struct Config {
     int  console       = 1;   // developer console in the menu
     int  noOcclusion   = 1;   // occlusion queries always report visible (fixes late pop-in)
     int  drawDistance  = 150; // % of the game's draw / LOD distances (PlayerController.LODDistanceFactor)
+    int  anisotropy    = 16;  // forced anisotropic filtering on the game's textures (0/1 = off)
+    int  contactShadows = 60; // % contact shadows in the soft shadow filter
+    int  lodBias       = 0;   // texture mip LOD bias x100 (negative = sharper)
     int  shadowSoft    = 0;   // shadow filter width: 0 = matches the enlarged map, 100 = game's original
     // highlight roll-off in the game's final HDR->LDR pass (replaces its hard clip)
     int  tmEnable      = 1;
@@ -200,6 +204,14 @@ struct Config {
     int  dofSmooth     = 1;
     int  fogDensity    = 100;
     int  motionBlur    = 100;
+    int  motionBlurObj = 100; // % of the game's per-object motion blur (motionBlur = camera)
+    int  aaMode        = 2;   // 0 FXAA, 1 FXAA quality, 2 SMAA
+    int  taa           = 1;   // temporal stabiliser
+    int  taaBlend      = 85;  // % history kept per frame
+    int  shafts        = 60;  // % light shafts from bright lamps / windows
+    int  shaftThr      = 150; // brightness threshold x100 (HDR)
+    int  bokeh         = 1;   // round bokeh for the background blur of the game's DOF
+    int  bokehSize     = 100; // %
     int  edgeAA        = 100; // the game's directional edge blur (inside its motion blur pass)
     int  gameSharpen   = 100; // the game's unsharp mask (same pass)
     int  shadowFilter  = 2;   // 0 game's PCF, 1 soft (16 taps), 2 softer (32), 3 smoothest (48)
@@ -319,6 +331,9 @@ static void LoadConfig()
     cfg.console       = GetPrivateProfileIntA("Game", "Console", 1, g_ini) ? 1 : 0;
     cfg.noOcclusion   = GetPrivateProfileIntA("Game", "NoOcclusionCulling", 1, g_ini) ? 1 : 0;
     cfg.drawDistance  = GetPrivateProfileIntA("Game", "DrawDistance", 150, g_ini);
+    cfg.anisotropy    = GetPrivateProfileIntA("Textures", "Anisotropy", 16, g_ini);
+    cfg.contactShadows = GetPrivateProfileIntA("Shadows", "ContactShadows", 60, g_ini);
+    cfg.lodBias       = GetPrivateProfileIntA("Textures", "LodBias", 0, g_ini);
     cfg.shadowScale   = GetPrivateProfileIntA("Shadows", "Scale", 1, g_ini);
     if (cfg.shadowScale != 2 && cfg.shadowScale != 4) cfg.shadowScale = 1;
     cfg.shadowSoft    = GetPrivateProfileIntA("Shadows", "Softness", 0, g_ini);
@@ -336,6 +351,14 @@ static void LoadConfig()
     cfg.dofSmooth     = GetPrivateProfileIntA("Effects", "DepthOfFieldSmooth", 1, g_ini) ? 1 : 0;
     cfg.fogDensity    = GetPrivateProfileIntA("Effects", "FogDensity", 100, g_ini);
     cfg.motionBlur    = GetPrivateProfileIntA("Effects", "MotionBlur", 100, g_ini);
+    cfg.motionBlurObj = GetPrivateProfileIntA("Effects", "MotionBlurObjects", cfg.motionBlur, g_ini);
+    cfg.aaMode        = GetPrivateProfileIntA("PostFX", "AAMode", GetPrivateProfileIntA("PostFX", "FXAAQuality", 1, g_ini) ? 2 : 0, g_ini);
+    cfg.taa           = GetPrivateProfileIntA("PostFX", "TemporalAA", 1, g_ini) ? 1 : 0;
+    cfg.taaBlend      = GetPrivateProfileIntA("PostFX", "TemporalHistory", 85, g_ini);
+    cfg.shafts        = GetPrivateProfileIntA("Effects", "LightShafts", 60, g_ini);
+    cfg.shaftThr      = GetPrivateProfileIntA("Effects", "LightShaftThreshold", 150, g_ini);
+    cfg.bokeh         = GetPrivateProfileIntA("Effects", "Bokeh", 1, g_ini) ? 1 : 0;
+    cfg.bokehSize     = GetPrivateProfileIntA("Effects", "BokehSize", 100, g_ini);
     cfg.edgeAA        = GetPrivateProfileIntA("Effects", "GameEdgeAA", 100, g_ini);
     cfg.gameSharpen   = GetPrivateProfileIntA("Effects", "GameSharpen", 100, g_ini);
     cfg.shadowFilter  = GetPrivateProfileIntA("Shadows", "Filter", 2, g_ini);
@@ -1531,6 +1554,169 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 }
 )HLSL";
 
+// SMAA wrappers (the SMAA source is prepended at compile time). Offsets the SMAA vertex shaders would
+// compute are computed here, so our one fullscreen VS serves all three passes.
+static const char* kSmaaPrefix = R"HLSL(
+#define SMAA_HLSL_3 1
+#define SMAA_PRESET_HIGH 1
+float4 apRtm : register(c0);
+#define SMAA_RT_METRICS apRtm
+)HLSL";
+static const char* kSmaaEdgeMain = R"HLSL(
+sampler2D colorTex : register(s0);
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float4 offset[3];
+    SMAAEdgeDetectionVS(uv, offset);
+    return float4(SMAALumaEdgeDetectionPS(uv, offset, colorTex), 0, 0);
+}
+)HLSL";
+static const char* kSmaaWeightMain = R"HLSL(
+sampler2D edgesTex : register(s0);
+sampler2D areaTex : register(s1);
+sampler2D searchTex : register(s2);
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float2 pixcoord; float4 offset[3];
+    SMAABlendingWeightCalculationVS(uv, pixcoord, offset);
+    return SMAABlendingWeightCalculationPS(uv, pixcoord, offset, edgesTex, areaTex, searchTex, float4(0, 0, 0, 0));
+}
+)HLSL";
+static const char* kSmaaBlendMain = R"HLSL(
+sampler2D colorTex : register(s0);
+sampler2D blendTex : register(s1);
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float4 offset;
+    SMAANeighborhoodBlendingVS(uv, offset);
+    return SMAANeighborhoodBlendingPS(uv, offset, colorTex, blendTex);
+}
+)HLSL";
+
+// Temporal stabiliser: reproject last frame's result through the camera motion (depth + this and last
+// frame's view-projection), clamp it to this pixel's 3x3 neighbourhood (YCoCg) so it can't ghost, and
+// blend. No sub-pixel jitter (the game's projection is left alone), so this calms shimmer and our own
+// AO/SSR/SSS noise rather than doing full super-sampled TAA.
+static const char* kTaaPS = R"HLSL(
+sampler2D sCur  : register(s0);
+sampler2D sHist : register(s1);
+sampler2D sDepth : register(s2);
+float4 rcpFrame : register(c0);
+float4 dP  : register(c6);
+float4 sw0 : register(c8);  float4 sw1 : register(c9);  float4 sw2 : register(c10); float4 sw3 : register(c11);
+float4 pv0 : register(c12); float4 pv1 : register(c13); float4 pv2 : register(c14); float4 pv3 : register(c15);
+float4 tp  : register(c16);   // x history weight, y history valid
+float LinD(float2 uv)
+{
+    float4 t = tex2Dlod(sDepth, float4(uv, 0, 0));
+    return dP.x > 0.5 ? 1.0 / max(dP.y + dP.z * t.r, 1e-6) : t.a;
+}
+float3 ToYCoCg(float3 c) { return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25))); }
+float3 FromYCoCg(float3 c) { return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float4 c0 = tex2Dlod(sCur, float4(uv, 0, 0));
+    float2 b = rcpFrame.xy;
+    float3 mn = ToYCoCg(c0.rgb), mx = mn;
+    float3 m1 = mn, m2 = mn * mn;
+    [unroll] for (int ty = -1; ty <= 1; ty++)
+    [unroll] for (int tx = -1; tx <= 1; tx++) {
+        if (tx == 0 && ty == 0) continue;
+        float3 c = ToYCoCg(tex2Dlod(sCur, float4(uv + float2(tx, ty) * b, 0, 0)).rgb);
+        mn = min(mn, c); mx = max(mx, c); m1 += c; m2 += c * c;
+    }
+    // variance clipping box (tighter than min/max, less ghosting)
+    float3 mu = m1 / 9, sg = sqrt(abs(m2 / 9 - mu * mu));
+    mn = max(mn, mu - 1.25 * sg); mx = min(mx, mu + 1.25 * sg);
+    float d = LinD(uv);
+    float sx = uv.x * 2 - 1, sy = 1 - uv.y * 2;
+    float3 wp = (sx * d) * sw0.xyz + (sy * d) * sw1.xyz + d * sw2.xyz + sw3.xyz;
+    float4 pc = wp.x * pv0 + wp.y * pv1 + wp.z * pv2 + pv3;
+    float2 puv = float2(pc.x / max(pc.w, 1e-3) * 0.5 + 0.5, 0.5 - pc.y / max(pc.w, 1e-3) * 0.5);
+    float inside = (pc.w > 1 && all(puv > 0) && all(puv < 1)) ? 1.0 : 0.0;
+    float3 h = ToYCoCg(tex2Dlod(sHist, float4(puv, 0, 0)).rgb);
+    h = clamp(h, mn, mx);
+    // less history when the pixel moved a lot (fast motion would smear)
+    float mv = length((puv - uv) / b);
+    float w = tp.x * tp.y * inside * saturate(1 - mv / 40);
+    return float4(FromYCoCg(lerp(ToYCoCg(c0.rgb), h, w)), c0.a);
+}
+)HLSL";
+
+// Light shafts (screen-space, GPU Gems 3 style): bright HDR areas are blurred radially toward up to
+// four light positions found on screen (brightest spots of a tiny max-map, read back a frame late).
+static const char* kShaftBrightPS = R"HLSL(
+sampler2D sHdr : register(s0);
+float4 sp : register(c1);   // x threshold, yz source texel
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float3 c = 0;
+    [unroll] for (int i = 0; i < 4; i++) {
+        float2 o = float2((i & 1) ? 0.5 : -0.5, (i & 2) ? 0.5 : -0.5) * sp.yz;
+        c += tex2Dlod(sHdr, float4(uv + o, 0, 0)).rgb;
+    }
+    c *= 0.25;
+    float l = dot(c, float3(0.2126, 0.7152, 0.0722));
+    return float4(c * saturate((l - sp.x) / max(sp.x, 0.01)), 1);
+}
+)HLSL";
+static const char* kShaftMaxPS = R"HLSL(
+sampler2D sSrc : register(s0);
+float4 sp : register(c1);   // xy source texel, zw cell size in uv
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float2 o0 = uv - sp.zw * 0.5;
+    float best = 0;
+    [loop] for (int y = 0; y < 12; y++)
+    [loop] for (int x = 0; x < 12; x++) {
+        float3 c = tex2Dlod(sSrc, float4(o0 + (float2(x, y) + 0.5) / 12.0 * sp.zw, 0, 0)).rgb;
+        best = max(best, dot(c, float3(0.2126, 0.7152, 0.0722)));
+    }
+    return float4(best, best, best, 1);
+}
+)HLSL";
+static const char* kShaftRadialPS = R"HLSL(
+sampler2D sSrc : register(s0);
+float4 L0 : register(c2); float4 L1 : register(c3); float4 L2 : register(c4); float4 L3 : register(c5);   // xy uv, z strength, w aspect
+float4 sp : register(c6);   // x length (fraction of the way to the light), y decay
+float3 Shaft(float2 uv, float4 L)
+{
+    float2 delta = (uv - L.xy) * sp.x / 32.0;
+    float2 tc = uv;
+    float illum = 1;
+    float3 acc = 0;
+    [unroll] for (int i = 0; i < 32; i++) {
+        tc -= delta;
+        acc += tex2Dlod(sSrc, float4(saturate(tc), 0, 0)).rgb * illum;
+        illum *= sp.y;
+    }
+    // weaker the further the pixel is from the light
+    float2 dd = (uv - L.xy) * float2(L.w, 1);
+    return acc / 32.0 * L.z * saturate(1 - length(dd) * 0.8);
+}
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float3 c = 0;
+    if (L0.z > 0) c += Shaft(uv, L0);
+    if (L1.z > 0) c += Shaft(uv, L1);
+    if (L2.z > 0) c += Shaft(uv, L2);
+    if (L3.z > 0) c += Shaft(uv, L3);
+    return float4(c, 1);
+}
+)HLSL";
+static const char* kShaftCompPS = R"HLSL(
+sampler2D sCur : register(s0);
+sampler2D sShaft : register(s1);
+float4 sp : register(c1);   // x strength
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float4 c = tex2Dlod(sCur, float4(uv, 0, 0));
+    float3 sh = tex2Dlod(sShaft, float4(uv, 0, 0)).rgb * sp.x;
+    // screen-style add in display space: brightens without clipping to white
+    return float4(1 - (1 - c.rgb) * exp(-sh), c.a);
+}
+)HLSL";
+
 // Wide HDR bloom (Call of Duty: AW style): 13-tap downsamples with a soft threshold, tent upsamples.
 static const char* kBloomDownPS = R"HLSL(
 sampler2D s0 : register(s0);
@@ -1753,6 +1939,12 @@ struct PostFX {
     IDirect3DPixelShader9* psFxaaQ = nullptr;
     IDirect3DPixelShader9* psSSR = nullptr;
     IDirect3DPixelShader9* psSSS = nullptr;
+    IDirect3DPixelShader9 *psSmaaE = nullptr, *psSmaaW = nullptr, *psSmaaN = nullptr, *psTaa = nullptr;
+    IDirect3DPixelShader9 *psShB = nullptr, *psShM = nullptr, *psShR = nullptr, *psShC = nullptr;
+    IDirect3DTexture9 *smaaEdge = nullptr, *smaaWeight = nullptr, *taaHist = nullptr;      // default pool
+    IDirect3DTexture9 *shA = nullptr, *shB = nullptr, *shTiny[2] = {};                     // default pool
+    IDirect3DSurface9* shSys = nullptr;                                                     // system memory
+    IDirect3DTexture9 *smaaArea = nullptr, *smaaSearch = nullptr;                          // managed
     IDirect3DPixelShader9* psSharp = nullptr;
     IDirect3DPixelShader9* psAO = nullptr;
     IDirect3DPixelShader9* psAOBlur = nullptr;
@@ -1873,7 +2065,9 @@ static IDirect3DVertexShader9* CompileVS(IDirect3DDevice9* dev, const char* src,
 
 static void PostFXReleaseDefault()
 {
-    IDirect3DTexture9** texs[] = { &g_fx.L0, &g_fx.L1, &g_fx.L2, &g_fx.aoA, &g_fx.aoB, &g_fx.depth, &g_fx.fitRT, &g_fx.zcopy };
+    IDirect3DTexture9** texs[] = { &g_fx.L0, &g_fx.L1, &g_fx.L2, &g_fx.aoA, &g_fx.aoB, &g_fx.depth, &g_fx.fitRT, &g_fx.zcopy,
+                                   &g_fx.smaaEdge, &g_fx.smaaWeight, &g_fx.taaHist, &g_fx.shA, &g_fx.shB, &g_fx.shTiny[0], &g_fx.shTiny[1] };
+    if (g_fx.shSys) { g_fx.shSys->Release(); g_fx.shSys = nullptr; }
     if (g_fx.fitSys) { g_fx.fitSys->Release(); g_fx.fitSys = nullptr; }
     for (auto t : texs) if (*t) { (*t)->Release(); *t = nullptr; }
     if (g_fx.sb) { g_fx.sb->Release(); g_fx.sb = nullptr; }
@@ -1908,6 +2102,18 @@ static bool PostFXReady(IDirect3DDevice9* dev)
         if (g_fx.vs) g_fx.psFxaaQ = CompilePS(dev, kFxaaQPS, "FXAA 3.11 quality");
         if (g_fx.vs) g_fx.psSSR   = CompilePS(dev, kSSRPS, "screen-space reflections");
         if (g_fx.vs) g_fx.psSSS   = CompilePS(dev, kSSSPS, "skin subsurface scattering");
+        if (g_fx.vs) {
+            std::string smaa = kSmaaPrefix;
+            for (const char* part : kSmaaHlslParts) smaa += part;
+            g_fx.psSmaaE = CompilePS(dev, (smaa + kSmaaEdgeMain).c_str(), "SMAA edges");
+            if (g_fx.psSmaaE) g_fx.psSmaaW = CompilePS(dev, (smaa + kSmaaWeightMain).c_str(), "SMAA weights");
+            if (g_fx.psSmaaW) g_fx.psSmaaN = CompilePS(dev, (smaa + kSmaaBlendMain).c_str(), "SMAA blending");
+        }
+        if (g_fx.vs) g_fx.psTaa   = CompilePS(dev, kTaaPS, "temporal stabiliser");
+        if (g_fx.vs) g_fx.psShB   = CompilePS(dev, kShaftBrightPS, "light shafts (bright pass)");
+        if (g_fx.vs) g_fx.psShM   = CompilePS(dev, kShaftMaxPS, "light shafts (light finder)");
+        if (g_fx.vs) g_fx.psShR   = CompilePS(dev, kShaftRadialPS, "light shafts (radial blur)");
+        if (g_fx.vs) g_fx.psShC   = CompilePS(dev, kShaftCompPS, "light shafts (composite)");
         if (g_fx.vs) g_fx.psSharp = CompilePS(dev, kSharpenPS, "Sharpen");
         if (g_fx.vs) g_fx.psGrade = CompilePS(dev, kGradePS, "Colour grade");
         if (g_fx.vs) {
@@ -2063,6 +2269,91 @@ static bool VpInverse(const float vp[4][4], float M[3][3], float A[3][3], float 
 }
 static bool MatMaskValid() { return cfg.matEnable && g_matMask && g_matMaskFrame == GlassMaskKey(); }
 
+// Extra post-processing resources (SMAA, temporal, light shafts), created when first needed.
+static bool MkRT(IDirect3DDevice9* dev, IDirect3DTexture9** t, UINT w, UINT h, D3DFORMAT f)
+{
+    if (*t) return true;
+    if (FAILED(dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, f, D3DPOOL_DEFAULT, t, nullptr))) { *t = nullptr; return false; }
+    return true;
+}
+static bool SmaaTextures(IDirect3DDevice9* dev)
+{
+    if (g_fx.smaaArea && g_fx.smaaSearch) return true;
+    auto fill = [&](IDirect3DTexture9** t, UINT w, UINT h, D3DFORMAT f, const unsigned char* src, UINT bpp) {
+        if (FAILED(dev->CreateTexture(w, h, 1, 0, f, D3DPOOL_MANAGED, t, nullptr))) { *t = nullptr; return false; }
+        D3DLOCKED_RECT lr;
+        if (FAILED((*t)->LockRect(0, &lr, nullptr, 0))) return false;
+        for (UINT y = 0; y < h; y++) memcpy((BYTE*)lr.pBits + y * lr.Pitch, src + y * w * bpp, w * bpp);
+        (*t)->UnlockRect(0);
+        return true;
+    };
+    const bool ok = fill(&g_fx.smaaArea, 160, 560, D3DFMT_A8L8, kSmaaAreaTex, 2) && fill(&g_fx.smaaSearch, 64, 16, D3DFMT_L8, kSmaaSearchTex, 1);
+    Log("postfx: SMAA lookup textures %s", ok ? "ready" : "could not be created - FXAA instead");
+    return ok;
+}
+static void SamplerSet(IDirect3DDevice9* dev, DWORD st, DWORD filt)
+{
+    dev->SetSamplerState(st, D3DSAMP_MINFILTER, filt);
+    dev->SetSamplerState(st, D3DSAMP_MAGFILTER, filt);
+    dev->SetSamplerState(st, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    dev->SetSamplerState(st, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(st, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(st, D3DSAMP_SRGBTEXTURE, FALSE);
+}
+static float HalfToFloat(WORD h)
+{
+    const DWORD sgn = (h & 0x8000u) << 16, ex = (h >> 10) & 0x1F, mant = h & 0x3FF;
+    DWORD f;
+    if (ex == 0) { if (!mant) f = sgn; else { float v = mant / 1024.0f / 16384.0f; return (h & 0x8000) ? -v : v; } }
+    else if (ex == 31) f = sgn | 0x7F800000u | (mant << 13);
+    else f = sgn | ((ex + 112) << 23) | (mant << 13);
+    float r; memcpy(&r, &f, 4); return r;
+}
+// light shaft sources: up to four, tracked across frames so they fade in/out instead of popping
+struct ShaftLight { float x, y, s; };
+static ShaftLight g_shaft[4] = {};
+static int g_shaftTiny = 0;
+static unsigned g_taaFrame = ~0u;
+static float g_taaVp[4][4];
+static void ShaftFindLights(IDirect3DDevice9* dev)
+{
+    const int W = 32, H = 18;
+    ShaftLight found[4] = {}; int nf = 0;
+    IDirect3DSurface9* src = nullptr;
+    if (g_fx.shSys && g_fx.shTiny[g_shaftTiny ^ 1] && SUCCEEDED(g_fx.shTiny[g_shaftTiny ^ 1]->GetSurfaceLevel(0, &src))) {
+        if (SUCCEEDED(dev->GetRenderTargetData(src, g_fx.shSys))) {
+            D3DLOCKED_RECT lr;
+            if (SUCCEEDED(g_fx.shSys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+                float v[18][32];
+                for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) v[y][x] = HalfToFloat(((const WORD*)((const BYTE*)lr.pBits + y * lr.Pitch))[x * 4]);
+                g_fx.shSys->UnlockRect();
+                for (nf = 0; nf < 4; nf++) {
+                    int bx = -1, by = -1; float bv = 0.02f;
+                    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) if (v[y][x] > bv) { bv = v[y][x]; bx = x; by = y; }
+                    if (bx < 0) break;
+                    found[nf] = { (bx + 0.5f) / W, (by + 0.5f) / H, std::min(bv * 2.0f, 1.0f) };
+                    for (int y = std::max(by - 3, 0); y <= std::min(by + 3, H - 1); y++)
+                        for (int x = std::max(bx - 4, 0); x <= std::min(bx + 4, W - 1); x++) v[y][x] = 0;
+                }
+            }
+        }
+        src->Release();
+    }
+    // match to the tracked lights: move toward the nearest new one, fade the rest out
+    bool used[4] = {};
+    for (auto& L : g_shaft) {
+        int best = -1; float bd = 0.12f;
+        for (int i = 0; i < nf; i++) if (!used[i]) {
+            const float d = hypotf(found[i].x - L.x, found[i].y - L.y);
+            if (d < bd) { bd = d; best = i; }
+        }
+        if (best >= 0 && L.s > 0) { used[best] = true; L.x += (found[best].x - L.x) * 0.5f; L.y += (found[best].y - L.y) * 0.5f; L.s += (found[best].s - L.s) * 0.25f; }
+        else L.s *= 0.8f;
+    }
+    for (int i = 0; i < nf; i++) if (!used[i])
+        for (auto& L : g_shaft) if (L.s < 0.02f) { L = { found[i].x, found[i].y, found[i].s * 0.25f }; break; }
+}
+
 // Run SSAO / FXAA / sharpen on `target` in place. `inScene`: called between
 // the game's BeginScene/EndScene (mid-frame), so we must not open our own scene.
 static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inScene)
@@ -2071,10 +2362,12 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
     D3DSURFACE_DESC bd; target->GetDesc(&bd);
     if (bd.MultiSampleType != D3DMULTISAMPLE_NONE) return;
     const bool doAO = cfg.aoEnable && g_fx.aoMode != 0 && g_fx.depthValid && g_fx.depth && g_fx.psAO && g_fx.psAOBlur && g_fx.psAOComp;
-    const bool doFxaa = cfg.fxaa && g_fx.psFxaa != nullptr, doSharp = cfg.sharpen > 0 && g_fx.psSharp != nullptr;
+    const bool smaaOk = g_fx.psSmaaE && g_fx.psSmaaW && g_fx.psSmaaN;
+    const bool doSmaa = cfg.fxaa && cfg.aaMode == 2 && smaaOk;
+    const bool doFxaa = cfg.fxaa && !doSmaa && g_fx.psFxaa != nullptr, doSharp = cfg.sharpen > 0 && g_fx.psSharp != nullptr;
     const bool doGrade = cfg.gradeEnable && g_fx.psGrade != nullptr;
     // previous frame's finished HDR scene for the glass reflections (half res is plenty)
-    if (cfg.glassEnable && cfg.glassSsr > 0 && g_hdrSceneSurf && g_vpKey / 64u == g_frameNo) {
+    if (((cfg.glassEnable && cfg.glassSsr > 0) || cfg.shafts > 0) && g_hdrSceneSurf && g_vpKey / 64u == g_frameNo) {
         D3DSURFACE_DESC hd; g_hdrSceneSurf->GetDesc(&hd);
         D3DSURFACE_DESC pd = {};
         if (g_prevHdrSurf) g_prevHdrSurf->GetDesc(&pd);
@@ -2106,7 +2399,9 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
             Log("ssr: not running -%s%s%s%s", why & 1 ? " shader not compiled" : "", why & 2 ? " depth not calibrated" : "",
                 why & 4 ? " no depth" : "", why & 8 ? " no view-projection this frame" : ""); }
     }
-    if (!doAO && !doFxaa && !doSharp && !doGrade && !doSSR && !doSSS) return;
+    const bool doTaa = cfg.taa && g_fx.psTaa && g_fx.depthValid && g_fx.depth && g_vpKey / 64u == g_frameNo;
+    const bool doShafts = cfg.shafts > 0 && g_fx.psShB && g_fx.psShM && g_fx.psShR && g_fx.psShC && g_prevHdr && g_prevHdrFrame == g_frameNo;
+    if (!doAO && !doFxaa && !doSmaa && !doSharp && !doGrade && !doSSR && !doSSS && !doTaa && !doShafts) return;
     if (!EnsureTargets(dev, bd)) return;
     if (doAO && !g_fx.aoA) return;
 
@@ -2152,7 +2447,10 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
         dev->SetPixelShaderConstantF(0, rcp, 1);
         dev->SetPixelShaderConstantF(1, prm, 1);
 
-        int remaining = (doAO ? 1 : 0) + (doSSR ? 1 : 0) + (doGrade ? 1 : 0) + (doFxaa ? 1 : 0) + (doSharp ? 1 : 0);
+        // every pass that writes through nextOut must be counted here (0.16-0.17 forgot the two SSS
+        // passes, so FXAA and sharpening silently fell off whenever skin was on screen)
+        int remaining = (doAO ? 1 : 0) + (doSSS ? 2 : 0) + (doSSR ? 1 : 0) + (doShafts ? 1 : 0) + (doGrade ? 1 : 0) +
+                        (doFxaa || doSmaa ? 1 : 0) + (doTaa ? 1 : 0) + (doSharp ? 1 : 0);
         IDirect3DTexture9* cur = g_fx.L0;
         // next output: the real target for the last pass, otherwise whichever ping-pong buffer isn't `cur`
         auto nextOut = [&](IDirect3DTexture9** asTex) -> IDirect3DSurface9* {
@@ -2251,6 +2549,60 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
                 if (outTex) cur = outTex;
             }
         }
+        if (doShafts) {
+            const UINT qw = std::max(bd.Width / 4, 1u), qh = std::max(bd.Height / 4, 1u);
+            bool ok = MkRT(dev, &g_fx.shA, qw, qh, D3DFMT_A16B16G16R16F) && MkRT(dev, &g_fx.shB, qw, qh, D3DFMT_A16B16G16R16F) &&
+                      MkRT(dev, &g_fx.shTiny[0], 32, 18, D3DFMT_A16B16G16R16F) && MkRT(dev, &g_fx.shTiny[1], 32, 18, D3DFMT_A16B16G16R16F);
+            if (ok && !g_fx.shSys && FAILED(dev->CreateOffscreenPlainSurface(32, 18, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM, &g_fx.shSys, nullptr))) g_fx.shSys = nullptr;
+            IDirect3DSurface9 *sA = nullptr, *sB = nullptr, *sT = nullptr;
+            if (ok) { g_fx.shA->GetSurfaceLevel(0, &sA); g_fx.shB->GetSurfaceLevel(0, &sB); g_fx.shTiny[g_shaftTiny]->GetSurfaceLevel(0, &sT); }
+            if (sA && sB && sT) {
+                D3DSURFACE_DESC hd; g_prevHdr->GetLevelDesc(0, &hd);
+                const float hpq[4] = { -1.0f / qw, 1.0f / qh, 0, 0 };
+                dev->SetVertexShaderConstantF(0, hpq, 1);
+                const float b1[4] = { cfg.shaftThr / 100.0f, 1.0f / hd.Width, 1.0f / hd.Height, 0 };
+                dev->SetPixelShaderConstantF(1, b1, 1);
+                DrawFullscreen(dev, g_prevHdr, sA, g_fx.psShB);                       // bright areas, quarter res
+                const float hpt[4] = { -1.0f / 32, 1.0f / 18, 0, 0 };
+                dev->SetVertexShaderConstantF(0, hpt, 1);
+                const float m1[4] = { 1.0f / qw, 1.0f / qh, 1.0f / 32, 1.0f / 18 };
+                dev->SetPixelShaderConstantF(1, m1, 1);
+                SamplerSet(dev, 0, D3DTEXF_POINT);
+                DrawFullscreen(dev, g_fx.shA, sT, g_fx.psShM);                        // brightest value per cell
+                ShaftFindLights(dev);                                                 // reads last frame's cells
+                g_shaftTiny ^= 1;
+                float L[4][4] = {};
+                for (int i = 0; i < 4; i++) { L[i][0] = g_shaft[i].x; L[i][1] = g_shaft[i].y; L[i][2] = g_shaft[i].s > 0.02f ? g_shaft[i].s : 0.0f; L[i][3] = (float)bd.Width / bd.Height; }
+                const float r6[4] = { 0.85f, 0.96f, 0, 0 };
+                dev->SetPixelShaderConstantF(2, &L[0][0], 4);
+                dev->SetPixelShaderConstantF(6, r6, 1);
+                dev->SetVertexShaderConstantF(0, hpq, 1);
+                SamplerSet(dev, 0, D3DTEXF_LINEAR);
+                DrawFullscreen(dev, g_fx.shA, sB, g_fx.psShR);                        // radial blur toward the lights
+                const float hp2[4] = { -1.0f / bd.Width, 1.0f / bd.Height, 0, 0 };
+                dev->SetVertexShaderConstantF(0, hp2, 1);
+                const float c1[4] = { std::max(cfg.shafts, 0) / 100.0f * 1.5f, 0, 0, 0 };
+                dev->SetPixelShaderConstantF(1, c1, 1);
+                SamplerSet(dev, 1, D3DTEXF_LINEAR);
+                dev->SetTexture(1, g_fx.shB);
+                IDirect3DSurface9* o = nextOut(&outTex);
+                DrawFullscreen(dev, cur, o, g_fx.psShC);
+                dev->SetTexture(1, nullptr);
+                SamplerSet(dev, 1, D3DTEXF_POINT);
+                if (outTex) cur = outTex;
+                static bool logged = false;
+                if (!logged) { logged = true; Log("postfx: light shafts running"); }
+            } else {
+                const float z1[4] = { 0, 0, 0, 0 };              // strength 0: plain copy, keeps the chain intact
+                dev->SetPixelShaderConstantF(1, z1, 1);
+                IDirect3DSurface9* o = nextOut(&outTex);
+                DrawFullscreen(dev, cur, o, g_fx.psShC);
+                if (outTex) cur = outTex;
+            }
+            if (sA) sA->Release(); if (sB) sB->Release(); if (sT) sT->Release();
+            const float prm1[4] = { cfg.sharpen / 100.0f, 0, 0, 0 };
+            dev->SetPixelShaderConstantF(1, prm1, 1);
+        }
         if (doGrade) {
             const float g0[4] = { powf(2.0f, cfg.gradeExposure / 100.0f), cfg.gradeContrast / 100.0f,
                                   cfg.gradeVibrance / 100.0f, cfg.gradeSaturation / 100.0f };
@@ -2261,10 +2613,67 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
             DrawFullscreen(dev, cur, o, g_fx.psGrade);
             if (outTex) cur = outTex;
         }
-        if (doFxaa) {
+        bool smaaDone = false;
+        if (doSmaa && SmaaTextures(dev) && MkRT(dev, &g_fx.smaaEdge, bd.Width, bd.Height, D3DFMT_A8R8G8B8) &&
+            MkRT(dev, &g_fx.smaaWeight, bd.Width, bd.Height, D3DFMT_A8R8G8B8)) {
+            IDirect3DSurface9 *se = nullptr, *sw = nullptr;
+            g_fx.smaaEdge->GetSurfaceLevel(0, &se); g_fx.smaaWeight->GetSurfaceLevel(0, &sw);
+            if (se && sw) {
+                dev->ColorFill(se, nullptr, 0);
+                dev->ColorFill(sw, nullptr, 0);
+                SamplerSet(dev, 0, D3DTEXF_LINEAR);
+                DrawFullscreen(dev, cur, se, g_fx.psSmaaE);
+                SamplerSet(dev, 1, D3DTEXF_LINEAR); SamplerSet(dev, 2, D3DTEXF_POINT);
+                dev->SetTexture(1, g_fx.smaaArea); dev->SetTexture(2, g_fx.smaaSearch);
+                DrawFullscreen(dev, g_fx.smaaEdge, sw, g_fx.psSmaaW);
+                dev->SetTexture(1, g_fx.smaaWeight); dev->SetTexture(2, nullptr);
+                IDirect3DSurface9* o = nextOut(&outTex);
+                DrawFullscreen(dev, cur, o, g_fx.psSmaaN);
+                dev->SetTexture(1, nullptr);
+                SamplerSet(dev, 1, D3DTEXF_POINT);
+                if (outTex) cur = outTex;
+                smaaDone = true;
+                static bool logged = false;
+                if (!logged) { logged = true; Log("postfx: SMAA running"); }
+            }
+            if (se) se->Release(); if (sw) sw->Release();
+        }
+        if (doFxaa || (doSmaa && !smaaDone)) {
             IDirect3DSurface9* o = nextOut(&outTex);
-            DrawFullscreen(dev, cur, o, cfg.fxaaQuality && g_fx.psFxaaQ ? g_fx.psFxaaQ : g_fx.psFxaa);
+            DrawFullscreen(dev, cur, o, cfg.aaMode == 1 && g_fx.psFxaaQ ? g_fx.psFxaaQ : g_fx.psFxaa);
             if (outTex) cur = outTex;
+        }
+        if (doTaa) {
+            float M[3][3], t[3], A[3][3], cam[3];
+            const bool inv = VpInverse(g_vp, M, A, t, cam);
+            const bool histOk = inv && g_fx.taaHist && g_taaFrame + 1 == g_frameNo;
+            MkRT(dev, &g_fx.taaHist, bd.Width, bd.Height, bd.Format);
+            float c[17][4] = {};
+            const bool precise = g_fx.aoIsGtao && cfg.aoPrecise && g_fx.zcopy && g_fx.zValid && g_fx.fitValid;
+            c[6][0] = precise ? 1.0f : 0.0f; c[6][1] = g_fx.fitA; c[6][2] = g_fx.fitB;
+            for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) c[8 + i][j] = A[i][j];
+            for (int j = 0; j < 3; j++) c[11][j] = cam[j];
+            memcpy(c[12], g_taaVp, sizeof g_taaVp);
+            c[16][0] = std::min(std::max(cfg.taaBlend, 0), 97) / 100.0f; c[16][1] = histOk ? 1.0f : 0.0f;
+            dev->SetPixelShaderConstantF(6, c[6], 1);
+            dev->SetPixelShaderConstantF(8, c[8], 9);
+            SamplerSet(dev, 1, D3DTEXF_LINEAR); SamplerSet(dev, 2, D3DTEXF_POINT);
+            dev->SetTexture(1, g_fx.taaHist);
+            dev->SetTexture(2, precise ? (IDirect3DBaseTexture9*)g_fx.zcopy : g_fx.depth);
+            IDirect3DSurface9* o = nextOut(&outTex);
+            DrawFullscreen(dev, cur, o, g_fx.psTaa);
+            dev->SetTexture(1, nullptr); dev->SetTexture(2, nullptr);
+            SamplerSet(dev, 1, D3DTEXF_POINT);
+            IDirect3DSurface9* hs = nullptr;
+            if (g_fx.taaHist && SUCCEEDED(g_fx.taaHist->GetSurfaceLevel(0, &hs))) {
+                dev->StretchRect(o, nullptr, hs, nullptr, D3DTEXF_NONE);   // this result is next frame's history
+                hs->Release();
+            }
+            memcpy(g_taaVp, g_vp, sizeof g_vp);
+            g_taaFrame = g_frameNo;
+            if (outTex) cur = outTex;
+            static bool logged = false;
+            if (!logged) { logged = true; Log("postfx: temporal stabiliser running"); }
         }
         if (doSharp) {
             IDirect3DSurface9* o = nextOut(&outTex);
@@ -3276,6 +3685,7 @@ struct GameShader {
     int paramReg = -1;                       // our extra constant (blend shaders)
     int offReg[3] = { -1, -1, -1 }, offCnt[3] = {};   // shadow sample offsets (UV units of the 2048 map)
     int sizeReg = -1;                        // ShadowBufferSize
+    int stsmReg = -1;                        // ScreenToShadowMatrix (contact shadows)
     // effects: registers of the constants we scale (-1 = absent)
     int fogScaleReg = -1;
     int velStaticReg = -1, velDynReg = -1, edgeTableReg = -1, unsharpReg = -1;
@@ -3402,9 +3812,28 @@ void main(float2 UV : TEXCOORD0, float2 SceneUV : TEXCOORD1, out float4 OutColor
     f.w = min(f.w, 65000);
     float coc = saturate(apUnfocused(f.w) * apTM2.w);
     float4 back = apTent(NewDOF_noBleedBlurMap, SceneUV);
+    float2 px = c_finalColorScaleLow.xy;
     float4 fore = apTent(NewDOF_bleedBlurMap, SceneUV);
     float3 cLarge = f.a < PackedParameters.r ? f.rgb : back.rgb;
-    float2 px = c_finalColorScaleLow.xy;
+    // round bokeh for the background: gather a golden-angle disc from the full-res scene, each tap
+    // accepted only if its own blur reaches this far (sharp foreground doesn't smear into the blur),
+    // bright taps weighted up so lamps turn into discs. apTM4.z = max radius in pixels, apTM4.w = highlight boost
+    if (apTM4.z > 0 && f.a >= PackedParameters.r && coc > 0.05) {
+        float R = coc * apTM4.z;
+        float3 acc = f.rgb; float wsum = 1;
+        [unroll] for (int bi = 0; bi < 24; bi++) {
+            float br = sqrt((bi + 0.5) / 24.0) * R;
+            float ba = bi * 2.3999632;
+            float2 bo = SceneUV + float2(cos(ba), sin(ba)) * br * px;
+            float4 bs = tex2Dlod(SceneColorTexture, float4(bo, 0, 0));
+            float bc = saturate(apUnfocused(min(bs.a, 65000)) * apTM2.w) * apTM4.z;
+            float bw = saturate(bc - br + 1) * (bs.a >= PackedParameters.r ? 1.0 : 0.0);
+            float bl = dot(bs.rgb, float3(0.3, 0.59, 0.11));
+            bw *= 1 + bl * bl * apTM4.w;
+            acc += bs.rgb * bw; wsum += bw;
+        }
+        cLarge = acc / wsum;
+    }
     float3 cSmall = 0.25 * (tex2D(SceneColorTexture, SceneUV + px * float2( 0.5, -1.5)).rgb +
                            tex2D(SceneColorTexture, SceneUV + px * float2(-1.5,  0.5)).rgb +
                            tex2D(SceneColorTexture, SceneUV + px * float2(-0.5,  1.5)).rgb +
@@ -3515,6 +3944,31 @@ void main(float4 ScreenPosition : TEXCOORD0, float2 vp : VPOS, out float4 OutCol
 #else
     cov = cov * cov;
 #endif
+#if CONTACT
+    // contact shadows: walk a short way toward the light (same shadow-map texel, smaller shadow depth),
+    // map each point back to the screen with the inverse matrix (apX[0..3]) and test it against the scene
+    // depth - catches the small gaps (feet, hands, furniture legs) the shadow map is too coarse for.
+    // apX[4] = (P00, P11 of the view, strength, length in world units), apX[5].x = thickness
+    {
+        float4 h0 = apMul(p, ScreenToShadowMatrix[0], ScreenToShadowMatrix[1], ScreenToShadowMatrix[2], ScreenToShadowMatrix[3]);
+        float eps = 0.001 * h0.w;
+        float4 qe = apMul(h0 - float4(0, 0, eps, 0), apX[0], apX[1], apX[2], apX[3]);
+        qe /= qe.w;
+        float3 dv = float3((qe.x - p.x) / apX[4].x, (qe.y - p.y) / apX[4].y, qe.z - p.z);
+        float dz = eps * apX[4].w / max(length(dv), 1e-4) / 8.0;
+        float cj = apIGN(vp + float2(17, 31));
+        float occ = 0;
+        [unroll] for (int ci = 0; ci < 8; ci++) {
+            float4 q = apMul(h0 - float4(0, 0, dz * (ci + cj), 0), apX[0], apX[1], apX[2], apX[3]);
+            q /= q.w;
+            float2 cuv = q.xy / max(q.z, 1) * ScreenPositionScaleBias.xy + ScreenPositionScaleBias.wz;
+            float sd = tex2Dlod(SceneColorTexture, float4(cuv, 0, 0)).a;
+            float df = q.z - sd;
+            occ = max(occ, step(1.0, df) * step(df, apX[5].x) * step(1, q.z) * (1 - ci / 12.0));
+        }
+        cov *= 1 - occ * apX[4].z;
+    }
+#endif
 #if MODSHADOW
     float att = 1;
 #if ATTEN
@@ -3535,17 +3989,49 @@ void main(float4 ScreenPosition : TEXCOORD0, float2 vp : VPOS, out float4 OutCol
 }
 )HLSL";
 
+static int CtabMaxC(const std::vector<CtabConst>& ct)
+{
+    int m = -1;
+    for (auto& k : ct) if (k.set == 2) m = std::max(m, k.reg + k.count - 1);
+    return m;
+}
+// 4x4 inverse (row-vector convention: if q = h * M then h = q * inverse(M))
+static bool Inverse4(const float m[16], float o[16])
+{
+    float inv[16];
+    inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+    inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+    inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+    inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+    inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+    inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (fabsf(det) < 1e-30f) return false;
+    det = 1.0f / det;
+    for (int i = 0; i < 16; i++) o[i] = inv[i] * det;
+    return true;
+}
 static IDirect3DPixelShader9* BuildSoftShadow(IDirect3DDevice9* dev, GameShader& gs, bool hw, int q)
 {
     static const int taps[4] = { 0, 16, 32, 48 };
     const auto& ct = gs.ct;
     char defs[320];
     snprintf(defs, sizeof defs,
-             "#define HW %d\n#define NTAPS %d\n#define MODSHADOW %d\n#define ATTEN %d\n#define SPOT %d\n#define CUBE %d\n#define CLAMPUV %d\n",
+             "#define HW %d\n#define NTAPS %d\n#define MODSHADOW %d\n#define ATTEN %d\n#define SPOT %d\n#define CUBE %d\n#define CLAMPUV %d\n#define CONTACT %d\n",
              hw ? 1 : 0, taps[q], CtabFind(ct, "ShadowModulateColor") ? 1 : 0,
              (CtabFind(ct, "LightPosition") && CtabFind(ct, "ScreenToWorld") && CtabFind(ct, "FalloffParameters")) ? 1 : 0,
              (CtabFind(ct, "SpotDirection") && CtabFind(ct, "SpotAngles")) ? 1 : 0,
-             CtabFind(ct, "EdgeSampleOffsets") ? 1 : 0, CtabFind(ct, "apTextureCoordsClampParameter") ? 1 : 0);
+             CtabFind(ct, "EdgeSampleOffsets") ? 1 : 0, CtabFind(ct, "apTextureCoordsClampParameter") ? 1 : 0, CtabMaxC(ct) + 1 + 16 <= 224 ? 1 : 0);
     char name[64]; snprintf(name, sizeof name, "soft shadow (%s, %d taps)", hw ? "hardware PCF" : "manual", taps[q]);
     int reg = -1;
     IDirect3DPixelShader9* ps = BuildReplacement(dev, ct, kShadowBodyHLSL, reg, name, kShadowCommonHLSL, defs);
@@ -3707,7 +4193,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.17.1") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.18.0") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -3716,7 +4202,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.17.1", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.18.0", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -3806,6 +4292,7 @@ static volatile bool g_censusArm = false;
 static bool g_censusOn = false;
 static IDirect3DPixelShader9* g_curGamePS = nullptr;
 static std::unordered_map<IDirect3DPixelShader9*, int> g_census;
+static std::unordered_map<IDirect3DPixelShader9*, std::vector<float>> g_censusVals;   // constants at the first draw
 static void CensusDump()
 {
     Log("census: %u pixel shaders drew this frame", (unsigned)g_census.size());
@@ -3823,8 +4310,24 @@ static void CensusDump()
         auto it = g_gameShaders.find(e.first);
         Log("census:   ps %p hash %08x %4d draws %s| %s", (void*)e.first, h, e.second,
             it != g_gameShaders.end() ? "[patched] " : "", names.c_str());
+        // material parameter values (first draw): what each UniformScalar_N / UniformVector_N holds
+        auto vi = g_censusVals.find(e.first);
+        if (vi != g_censusVals.end()) {
+            std::string vals; char b[96];
+            for (auto& k : ct) {
+                if (k.set != 2 || k.reg * 4 + 3 >= (int)vi->second.size()) continue;
+                const float* v = &vi->second[k.reg * 4];
+                if (!k.name.compare(0, 14, "UniformScalar_")) snprintf(b, sizeof b, "S%s=%g ", k.name.c_str() + 14, v[0]);
+                else if (!k.name.compare(0, 14, "UniformVector_")) snprintf(b, sizeof b, "V%s=(%g,%g,%g,%g) ", k.name.c_str() + 14, v[0], v[1], v[2], v[3]);
+                else continue;
+                vals += b;
+                if (vals.size() > 900) { vals += "..."; break; }
+            }
+            if (!vals.empty()) Log("census:     values %s", vals.c_str());
+        }
     }
     g_census.clear();
+    g_censusVals.clear();
 }
 
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CreatePS)(IDirect3DDevice9*, const DWORD*, IDirect3DPixelShader9**);
@@ -3911,6 +4414,7 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
         for (int i = 0; i < 3; i++)
             if (const CtabConst* k = CtabFind(ct, names[i])) if (k->set == 2) { gs.offReg[i] = k->reg; gs.offCnt[i] = k->count; }
         if (const CtabConst* k = CtabFind(ct, "ShadowBufferSize")) if (k->set == 2) gs.sizeReg = k->reg;
+        if (const CtabConst* k = CtabFind(ct, "ScreenToShadowMatrix")) if (k->set == 2 && k->count == 4) gs.stsmReg = k->reg;
         if (gs.offReg[0] < 0 && gs.offReg[1] < 0 && gs.offReg[2] < 0) return hr;
     } else if (!tag) return hr;
     if (tag) {
@@ -4100,7 +4604,8 @@ static void PreDraw(IDirect3DDevice9* d)
             Log("ssr: view-projection found in the game's vertex shader (c%d): r0 %.3f %.3f %.3f %.3f  r3 %.1f %.1f %.1f %.1f",
                 g_curVSvp, g_vp[0][0], g_vp[0][1], g_vp[0][2], g_vp[0][3], g_vp[3][0], g_vp[3][1], g_vp[3][2], g_vp[3][3]); }
     }
-    if (g_censusOn && !g_inPostFX && g_curGamePS) g_census[g_curGamePS]++;
+    if (g_censusOn && !g_inPostFX && g_curGamePS && !g_census[g_curGamePS]++)
+        g_censusVals[g_curGamePS].assign(&g_psc[0][0], &g_psc[0][0] + 96 * 4);
     if (g_curGS && g_curGS->tagged && cfg.matEnable && g_curRTIsHDR) {
         g_matMaskBound = BindMaskRT(d, &g_matMask, &g_matMaskSurf, &g_matMaskFrame, 0, "material");
         if (g_matMaskBound && !g_matTaggedDraws++) Log("materials: first skin/metal draw tagged");
@@ -4141,7 +4646,8 @@ static void PreDraw(IDirect3DDevice9* d)
             { cfg.tmEnable ? 1.0f : 0.0f, cfg.tmKnee / 100.0f, cfg.tmWhite / 100.0f, cfg.tmHue / 100.0f },
             { cfg.gammaMode == 1 ? 1.0f : 0.0f, cfg.gammaMode == 2 ? 1.0f : 0.0f, std::max(cfg.bloomIntensity, 0) / 100.0f, std::max(cfg.dofStrength, 0) / 100.0f },
             { bw, bh, cfg.bloomSmooth ? 1.0f : 0.0f, cfg.dofSmooth ? 1.0f : 0.0f },
-            { g_bloomBound ? std::max(cfg.bloomModern, 0) / 100.0f * 0.3f : 0.0f, std::min(std::max(cfg.shadowDetail, 0), 100) / 100.0f, 0, 0 } };
+            { g_bloomBound ? std::max(cfg.bloomModern, 0) / 100.0f * 0.3f : 0.0f, std::min(std::max(cfg.shadowDetail, 0), 100) / 100.0f,
+              cfg.bokeh ? 14.0f * std::max(cfg.bokehSize, 10) / 100.0f * (g_ppH ? g_ppH : 1440) / 1440.0f : 0.0f, 4.0f } };
         o_SetPSConstF(d, gs->paramReg, &p[0][0], 4);   // our own registers - nothing of the game's to restore
         return;
     }
@@ -4165,6 +4671,18 @@ static void PreDraw(IDirect3DDevice9* d)
                 const float base  = (float)(g_shadowSize ? g_shadowSize : 2048);
                 const float r[4] = { std::max(cfg.shadowRadius, 1) / 10.0f / base, mapPx, 0, 0 };
                 o_SetPSConstF(d, gs->paramReg, r, 1);
+                if (gs->paramReg + 16 <= 224) {
+                    float x[6][4] = {};
+                    if (cfg.contactShadows > 0 && gs->stsmReg >= 0 && gs->stsmReg + 4 <= 256 && g_vpKey / 64u == g_frameNo &&
+                        Inverse4(&g_psc[gs->stsmReg][0], &x[0][0])) {
+                        x[4][0] = sqrtf(g_vp[0][0] * g_vp[0][0] + g_vp[1][0] * g_vp[1][0] + g_vp[2][0] * g_vp[2][0]);
+                        x[4][1] = sqrtf(g_vp[0][1] * g_vp[0][1] + g_vp[1][1] * g_vp[1][1] + g_vp[2][1] * g_vp[2][1]);
+                        x[4][2] = std::min(cfg.contactShadows, 100) / 100.0f; x[4][3] = 30.0f;
+                        x[5][0] = 12.0f;
+                        if (x[4][0] < 1e-4f || x[4][1] < 1e-4f) x[4][2] = 0;
+                    }
+                    o_SetPSConstF(d, gs->paramReg + 4, &x[0][0], 6);
+                }
                 return;
             }
         }
@@ -4203,10 +4721,14 @@ static void PreDraw(IDirect3DDevice9* d)
         return;
     }
     case SK_MBLUR: {
-        if (cfg.motionBlur != 100) {
+        // camera motion (static velocity: the whole scene moving with the view) and object motion separately
+        if (cfg.motionBlur != 100 && gs->velStaticReg >= 0) {
             const float m = std::max(cfg.motionBlur, 0) / 100.0f;   // velocity scale; the clamp (zw) stays
-            if (gs->velStaticReg >= 0) { const float* o = g_psc[gs->velStaticReg]; const float v[4] = { o[0] * m, o[1] * m, o[2], o[3] }; PdSet(gs->velStaticReg, v); }
-            if (gs->velDynReg >= 0)    { const float* o = g_psc[gs->velDynReg];    const float v[4] = { o[0] * m, o[1] * m, o[2], o[3] }; PdSet(gs->velDynReg, v); }
+            const float* o = g_psc[gs->velStaticReg]; const float v[4] = { o[0] * m, o[1] * m, o[2], o[3] }; PdSet(gs->velStaticReg, v);
+        }
+        if (cfg.motionBlurObj != 100 && gs->velDynReg >= 0) {
+            const float m = std::max(cfg.motionBlurObj, 0) / 100.0f;
+            const float* o = g_psc[gs->velDynReg]; const float v[4] = { o[0] * m, o[1] * m, o[2], o[3] }; PdSet(gs->velDynReg, v);
         }
         if (cfg.edgeAA != 100 && gs->edgeTableReg >= 0) {      // table[0].w = weight of the edge blur
             const float* o = g_psc[gs->edgeTableReg];
@@ -4345,6 +4867,60 @@ static HRESULT STDMETHODCALLTYPE hk_SetPS(IDirect3DDevice9* d, IDirect3DPixelSha
     return o_SetPS(d, ps);
 }
 
+// Texture filtering: the game's material textures get anisotropic filtering (and an optional mip
+// bias) wherever it asked for linear minification. Render targets, depth and shadow maps keep exactly
+// what the game set (hardware shadow compares need plain linear filtering).
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetTexture)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetSamplerState)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
+static PFN_SetTexture o_SetTexture = nullptr;
+static PFN_SetSamplerState o_SetSamplerState = nullptr;
+static bool  g_stagePlain[16];
+static DWORD g_gameMin[16], g_gameAniso[16], g_gameBias[16];
+static bool TexIsPlain(IDirect3DBaseTexture9* t)
+{
+    if (!t || t->GetLevelCount() <= 1) return false;     // render targets / shadow maps have one level
+    D3DSURFACE_DESC d = {};
+    const D3DRESOURCETYPE ty = t->GetType();
+    if (ty == D3DRTYPE_TEXTURE) { if (FAILED(((IDirect3DTexture9*)t)->GetLevelDesc(0, &d))) return false; }
+    else if (ty == D3DRTYPE_CUBETEXTURE) { if (FAILED(((IDirect3DCubeTexture9*)t)->GetLevelDesc(0, &d))) return false; }
+    else return false;
+    return !(d.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) && d.Format != (D3DFORMAT)MAKEFOURCC('I','N','T','Z');
+}
+static bool AnisoOn() { return cfg.anisotropy > 1 || cfg.lodBias != 0; }
+static void ApplyFilter(IDirect3DDevice9* d, DWORD st)
+{
+    const bool on = g_stagePlain[st] && !g_inPostFX;
+    const bool lin = g_gameMin[st] == D3DTEXF_LINEAR || g_gameMin[st] == D3DTEXF_ANISOTROPIC;
+    if (on && cfg.anisotropy > 1 && lin) {
+        o_SetSamplerState(d, st, D3DSAMP_MINFILTER, D3DTEXF_ANISOTROPIC);
+        o_SetSamplerState(d, st, D3DSAMP_MAXANISOTROPY, (DWORD)std::min(cfg.anisotropy, 16));
+    } else {
+        o_SetSamplerState(d, st, D3DSAMP_MINFILTER, g_gameMin[st]);
+        o_SetSamplerState(d, st, D3DSAMP_MAXANISOTROPY, g_gameAniso[st] ? g_gameAniso[st] : 1);
+    }
+    float bias; memcpy(&bias, &g_gameBias[st], 4);
+    if (on && cfg.lodBias != 0) bias += cfg.lodBias / 100.0f;
+    DWORD b; memcpy(&b, &bias, 4);
+    o_SetSamplerState(d, st, D3DSAMP_MIPMAPLODBIAS, b);
+}
+static HRESULT STDMETHODCALLTYPE hk_SetTexture(IDirect3DDevice9* d, DWORD st, IDirect3DBaseTexture9* t)
+{
+    HRESULT hr = o_SetTexture(d, st, t);
+    if (st < 16 && !g_inPostFX && AnisoOn()) {
+        const bool plain = TexIsPlain(t);
+        if (plain != g_stagePlain[st]) { g_stagePlain[st] = plain; ApplyFilter(d, st); }
+    }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hk_SetSamplerState(IDirect3DDevice9* d, DWORD st, D3DSAMPLERSTATETYPE ty, DWORD v)
+{
+    if (st >= 16 || g_inPostFX || !AnisoOn()) return o_SetSamplerState(d, st, ty, v);
+    if (ty == D3DSAMP_MINFILTER) { g_gameMin[st] = v; ApplyFilter(d, st); return D3D_OK; }
+    if (ty == D3DSAMP_MAXANISOTROPY) { g_gameAniso[st] = v; ApplyFilter(d, st); return D3D_OK; }
+    if (ty == D3DSAMP_MIPMAPLODBIAS) { g_gameBias[st] = v; ApplyFilter(d, st); return D3D_OK; }
+    return o_SetSamplerState(d, st, ty, v);
+}
+
 static void HookTraceVtbl(IDirect3DDevice9* dev)
 {
     void* p;
@@ -4371,6 +4947,10 @@ static void HookTraceVtbl(IDirect3DDevice9* dev)
     if ((p = PatchVtbl(dev, 92, (void*)hk_SetVS)))        o_SetVS = (PFN_SetVS)p;
     if ((p = PatchVtbl(dev, 94, (void*)hk_SetVSConstF)))  o_SetVSConstF = (PFN_SetVSConstF)p;
     if ((p = PatchVtbl(dev, 118, (void*)hk_CreateQuery))) o_CreateQuery = (PFN_CreateQuery)p;
+    for (int i = 0; i < 16; i++) { g_gameMin[i] = D3DTEXF_POINT; g_gameAniso[i] = 1; g_gameBias[i] = 0; g_stagePlain[i] = false; }
+    if ((p = PatchVtbl(dev, 65, (void*)hk_SetTexture)))      o_SetTexture = (PFN_SetTexture)p;
+    if ((p = PatchVtbl(dev, 69, (void*)hk_SetSamplerState))) o_SetSamplerState = (PFN_SetSamplerState)p;
+    Log("textures: %dx anisotropic filtering, mip bias %+.2f on the game's material textures", cfg.anisotropy, cfg.lodBias / 100.0f);
 }
 
 // Called at every Present (before PostFX). Ends a running trace, starts an armed one.
@@ -4918,6 +5498,9 @@ static bool SaveConfig()
     WriteIniInt("Game", "SkipIntros", cfg.skipIntros);
     WriteIniInt("Game", "NoOcclusionCulling", cfg.noOcclusion);
     WriteIniInt("Game", "DrawDistance", cfg.drawDistance);
+    WriteIniInt("Textures", "Anisotropy", cfg.anisotropy);
+    WriteIniInt("Shadows", "ContactShadows", cfg.contactShadows);
+    WriteIniInt("Textures", "LodBias", cfg.lodBias);
     WritePrivateProfileStringA("Shaders", "Compiler", cfg.compiler == 2 ? "game" : cfg.compiler == 1 ? "47" : "auto", g_ini);
     WriteIniInt("Shadows", "Scale", cfg.shadowScale);
     WriteIniInt("Shadows", "Softness", cfg.shadowSoft);
@@ -4934,6 +5517,14 @@ static bool SaveConfig()
     WriteIniInt("Effects", "DepthOfFieldSmooth", cfg.dofSmooth);
     WriteIniInt("Effects", "FogDensity", cfg.fogDensity);
     WriteIniInt("Effects", "MotionBlur", cfg.motionBlur);
+    WriteIniInt("Effects", "MotionBlurObjects", cfg.motionBlurObj);
+    WriteIniInt("PostFX", "AAMode", cfg.aaMode);
+    WriteIniInt("PostFX", "TemporalAA", cfg.taa);
+    WriteIniInt("PostFX", "TemporalHistory", cfg.taaBlend);
+    WriteIniInt("Effects", "LightShafts", cfg.shafts);
+    WriteIniInt("Effects", "LightShaftThreshold", cfg.shaftThr);
+    WriteIniInt("Effects", "Bokeh", cfg.bokeh);
+    WriteIniInt("Effects", "BokehSize", cfg.bokehSize);
     WriteIniInt("Effects", "GameEdgeAA", cfg.edgeAA);
     WriteIniInt("Effects", "GameSharpen", cfg.gameSharpen);
     WriteIniInt("Shadows", "Filter", cfg.shadowFilter);
@@ -5082,7 +5673,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.17.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.18.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -5091,11 +5682,22 @@ static void DrawMenu()
                 bool en = g_fx.enabled;
                 if (ImGui::Checkbox("Post-processing (F11)", &en)) g_fx.enabled = en;
                 CheckboxInt("Apply before the UI (keeps HUD and menus sharp)", &cfg.beforeHud);
-                CheckboxInt("FXAA anti-aliasing", &cfg.fxaa);
+                CheckboxInt("Anti-aliasing", &cfg.fxaa);
                 if (cfg.fxaa) {
-                    static const char* fq[] = { "Fast (console style)", "Quality (FXAA 3.11, edge search)" };
-                    ImGui::Combo("FXAA type", &cfg.fxaaQuality, fq, 2);
+                    static const char* fq[] = { "FXAA fast (console style)", "FXAA 3.11 quality", "SMAA (sharpest edges)" };
+                    ImGui::Combo("Anti-aliasing type", &cfg.aaMode, fq, 3);
+                    if (cfg.aaMode == 2 && g_fx.shadersTried && !(g_fx.psSmaaE && g_fx.psSmaaW && g_fx.psSmaaN))
+                        ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "SMAA shaders failed to compile (see log) - FXAA is used.");
                 }
+                CheckboxInt("Temporal stabiliser (TAA)", &cfg.taa);
+                if (cfg.taa) ImGui::SliderInt("History", &cfg.taaBlend, 50, 95, "%d %%");
+                ImGui::TextDisabled("Blends in the previous frame, reprojected and clamped: calms shimmer and effect noise.");
+                ImGui::SeparatorText("Textures");
+                static const char* af[] = { "Off (game's)", "2x", "4x", "8x", "16x" };
+                int ai = cfg.anisotropy >= 16 ? 4 : cfg.anisotropy >= 8 ? 3 : cfg.anisotropy >= 4 ? 2 : cfg.anisotropy >= 2 ? 1 : 0;
+                if (ImGui::Combo("Anisotropic filtering", &ai, af, 5)) cfg.anisotropy = ai ? 1 << ai : 0;
+                ImGui::SliderInt("Texture sharpness (mip bias)", &cfg.lodBias, -100, 50, "%d (1/100)");
+                ImGui::TextDisabled("Negative = sharper textures at a distance (may shimmer below -50).");
                 ImGui::SliderInt("Sharpening", &cfg.sharpen, 0, 100, cfg.sharpen ? "%d %%" : "off");
                 ImGui::SeparatorText("Display");
                 ImGui::SliderInt("Frame cap", &cfg.fpsLimit, 0, 240, cfg.fpsLimit ? "%d fps" : "off");
@@ -5153,6 +5755,10 @@ static void DrawMenu()
                 ImGui::SliderInt("Bloom threshold", &cfg.bloomThreshold, -50, 150, cfg.bloomThreshold ? "%+d" : "game's");
                 CheckboxInt("Smooth bloom (no blocky, shimmering glow)", &cfg.bloomSmooth);
                 ImGui::SliderInt("Wide HDR bloom", &cfg.bloomModern, 0, 200, cfg.bloomModern ? "%d %%" : "off");
+                ImGui::SliderInt("Light shafts", &cfg.shafts, 0, 200, cfg.shafts ? "%d %%" : "off");
+                ImGui::SliderInt("Light shaft threshold", &cfg.shaftThr, 50, 500, "%d (1/100)");
+                CheckboxInt("Round bokeh in depth of field", &cfg.bokeh);
+                if (cfg.bokeh) ImGui::SliderInt("Bokeh size", &cfg.bokehSize, 25, 250, "%d %%");
                 ImGui::SliderInt("Wide bloom threshold", &cfg.bloomModernThr, 0, 400, "%d %%");
                 ImGui::TextDisabled("APRenewal's own bloom: a soft, wide glow from the HDR scene, added to the game's.");
                 ImGui::SeparatorText("Depth of field");
@@ -5162,12 +5768,13 @@ static void DrawMenu()
                 ImGui::SeparatorText("Fog");
                 ImGui::SliderInt("Fog density", &cfg.fogDensity, 0, 300, cfg.fogDensity ? "%d %%" : "off");
                 ImGui::SeparatorText("Motion blur pass");
-                ImGui::SliderInt("Motion blur", &cfg.motionBlur, 0, 200, cfg.motionBlur ? "%d %%" : "off");
+                ImGui::SliderInt("Motion blur (camera)", &cfg.motionBlur, 0, 200, cfg.motionBlur ? "%d %%" : "off");
+                ImGui::SliderInt("Motion blur (objects)", &cfg.motionBlurObj, 0, 200, cfg.motionBlurObj ? "%d %%" : "off");
                 ImGui::SliderInt("Game's edge anti-aliasing", &cfg.edgeAA, 0, 100, cfg.edgeAA ? "%d %%" : "off");
                 ImGui::SliderInt("Game's sharpening", &cfg.gameSharpen, 0, 300, cfg.gameSharpen ? "%d %%" : "off");
                 ImGui::TextDisabled("The game's edge AA blurs along edges; with FXAA on you may prefer it lower.");
                 if (ImGui::Button("Game defaults")) { cfg.bloomIntensity = 100; cfg.bloomThreshold = 0; cfg.dofStrength = 100; cfg.fogDensity = 100;
-                                                       cfg.motionBlur = 100; cfg.edgeAA = 100; cfg.gameSharpen = 100; }
+                                                       cfg.motionBlur = 100; cfg.motionBlurObj = 100; cfg.edgeAA = 100; cfg.gameSharpen = 100; }
                 ImGui::SeparatorText("Window glass");
             CheckboxInt("Improved glass", &cfg.glassEnable);
             ImGui::SliderInt("Glass opacity", &cfg.glassClarity, 10, 150, "%d %%");
@@ -5189,6 +5796,7 @@ static void DrawMenu()
                 ImGui::SeparatorText("Shadows");
                 static const char* sf[] = { "Game's (sharp, grainy)", "Soft (16 samples)", "Softer (32 samples)", "Smoothest (48 samples)" };
                 ImGui::Combo("Shadow filter", &cfg.shadowFilter, sf, 4);
+                if (cfg.shadowFilter > 0) ImGui::SliderInt("Contact shadows", &cfg.contactShadows, 0, 100, cfg.contactShadows ? "%d %%" : "off");
                 if (cfg.shadowFilter > 0) ImGui::SliderInt("Shadow softness radius", &cfg.shadowRadius, 5, 120, "%d (1/10 texel)");
                 static const char* sh[] = { "1x (game default)", "2x", "4x" };
                 int si = cfg.shadowScale == 4 ? 2 : cfg.shadowScale == 2 ? 1 : 0;
@@ -5671,6 +6279,7 @@ static HRESULT STDMETHODCALLTYPE hk_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARA
     MenuOnReset();
     IntzForget(); g_fx.intz = nullptr;
     g_rt0Scale = 1;
+    for (int i = 0; i < 16; i++) { g_gameMin[i] = D3DTEXF_POINT; g_gameAniso[i] = 1; g_gameBias[i] = 0; g_stagePlain[i] = false; }
     GlassMaskRelease();
     BloomRelease();
     g_bbPtr = nullptr; g_curRT = nullptr; g_worldRT = nullptr; g_bbW = g_bbH = 0;
@@ -5834,7 +6443,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.17.1 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.18.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

@@ -1,4 +1,4 @@
-# APRenewal 0.17.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.18.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,26 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.18.0
+- **Anisotropic filtering** (`[Textures]`, Image tab): 16x on the game's material textures, plus an
+  optional mip bias for sharper distant textures. Render targets and shadow maps are left alone.
+- **SMAA** (`[PostFX] AAMode=2`, the new default): sharper anti-aliased edges than FXAA (SMAA 1.0 by
+  Jorge Jimenez et al., MIT licence - see `docs/SMAA-LICENSE.txt`).
+- **Temporal stabiliser** (`[PostFX] TemporalAA`): the previous frame, reprojected through the camera
+  motion and clamped to the current neighbourhood, is blended in. It calms shimmer and the noise of
+  the AO / reflections. It doesn't jitter the game's camera, so it isn't full super-sampled TAA.
+- **Contact shadows** (`[Shadows] ContactShadows`, with the soft shadow filter): short rays toward
+  the light catch the small gaps the shadow map is too coarse for (feet, hands, furniture legs).
+- **Light shafts** (`[Effects] LightShafts`): rays streaming from up to four bright lamps or windows
+  on screen. The lights are found automatically each frame and fade in and out smoothly.
+- **Round bokeh** (`[Effects] Bokeh`): the background blur of the game's depth of field becomes
+  disc-shaped, with bright spots turning into bokeh circles.
+- **Motion blur split**: separate sliders for camera and object motion blur.
+- **Fixed**: whenever skin was on screen, FXAA and sharpening were silently skipped (the skin pass
+  wasn't counted in the post-processing chain since 0.16.0).
+- Shader census now also logs each material's parameter values (groundwork for the weapon and skin
+  material rework).
 
 ## New in 0.17.1
 - **Shadow detail** (`[Colour] ShadowDetail`, Colour tab): the game's own colour grading subtracts a

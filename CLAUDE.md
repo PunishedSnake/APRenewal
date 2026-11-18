@@ -277,6 +277,31 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   Glass SSR: tMin = 8 + 2 % of the glass distance, 16 steps, thickness + 1.5 × step length, hits within
   4 px of the glass pixel ignored, conf × saturate(|N·V|·6), gain × apTM.y. HLSL: `near`/`far` are
   reserved words.
+- 0.18.0 (user: "do everything except the long shot" - part 1):
+  - AF: SetTexture 65 / SetSamplerState 69 hooks; stage "plain" = texture/cube with >1 level, not RT/DS/INTZ;
+    game's MINFILTER/MAXANISOTROPY/MIPMAPLODBIAS remembered per stage and re-applied (aniso only where the
+    game asked for linear). Reset clears the tracking. Our own passes (g_inPostFX) untouched.
+  - SMAA: src/smaa.h embeds SMAA.hlsl (ASCII-cleaned, raw-string chunks) + AreaTexDX9 (A8L8 160x560) and
+    SearchTex (L8 64x16) pixels. Wrappers call the SMAA *VS functions inside the PS (one fullscreen VS);
+    SMAA_RT_METRICS = c0 (= rcpFrame). Edges/weights ColorFill-cleared each frame.
+  - BUG FIXED: `remaining` (nextOut pass count) didn't include SSS's two passes → FXAA + sharpen were
+    dropped whenever skin was on screen (0.16.0–0.17.1). Every nextOut pass must be counted.
+  - Chain: AO → SSS(2) → SSR → shafts → grade → SMAA/FXAA → TAA → sharpen.
+  - TAA (kTaaPS): no jitter. World pos from depth (c8-11 like SSR), previous VP g_taaVp at c12-15,
+    YCoCg variance clip (1.25σ), weight × saturate(1 − motion px / 40); history = StretchRect of the output.
+  - Light shafts: bright pass from g_prevHdr (now also copied when shafts > 0) → quarter-res shA;
+    max per 32x18 cell (shTiny[2], ping-pong) → GetRenderTargetData of LAST frame's → up to 4 peaks,
+    tracked/faded (g_shaft); radial blur 32 taps per light → shB; screen-blend composite.
+  - Contact shadows: soft-shadow variant CONTACT (needs paramReg+16 ≤ 224): apX[0..3] = Inverse4 of
+    ScreenToShadowMatrix (from g_psc), march h0 − (0,0,dz·k,0) (same shadow texel, closer to the light),
+    map back to (sxW, syW, W), compare with scene-alpha depth; dz scaled so 8 steps ≈ 30 world units.
+  - Bokeh: DOF blend, background only, 24-tap golden-angle gather of SceneColorTexture, tap accepted
+    if its own CoC × radius reaches it, highlight weight 1 + 4·lum². apTM4.z radius px, .w boost.
+  - Motion blur: StaticVelocityParameters = camera ([Effects] MotionBlur), Dynamic = objects (MotionBlurObjects).
+  - Census logs UniformScalar_N / UniformVector_N values at each shader's first draw (`census:     values`).
+  - Still to do (part 2): weapon master + skin sheen rebuild (needs a values census near a weapon /
+    face), dixi absorption (user's dixi.ini: Sony pads via DirectInput, button/axis remaps; dixi exposes
+    them as XInput), HUD/subtitle scale (Scaleform canvas RE), 120 fps physics check.
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 
