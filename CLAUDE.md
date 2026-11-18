@@ -210,6 +210,18 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
     TOGGLEOCCLUSION, DOORLIGHTINGFIX, TOGGLEDOFFIX, EDAA/DEDAA/EDAAOFF, value commands MINAMBIENT,
     IRRADIANCESCALE/CONTRAST, LIGHTSCALE, STATICLIGHTSCALE, SHADOWINTENSITY(MIN), SHARPNESS,
     DESATURATE, VIGNETTEFADE*, MOTIONBLURAMOUNT/STRETCH, MAGICRIMSCALE/Z/ROTATION, SHADOWFALLOFFRANGE.
+- 0.15.1: SSR failed to compile in 0.15.0 ("redefinition of 'k'": the legacy D3DX compiler scopes
+  for-loop variables to the function — never reuse a loop variable's name later). `ssr:` log lines
+  now report the VP capture and why SSR is off. SSR can't reach glass (translucent, no depth, drawn
+  before our pass); glass reflections stay cubemap-only.
+  Script packages: UE3 v539/licensee 91, zlib-chunked. `tools/re/upk.py` (tables + decompression),
+  `execs.py` (FUNC_Exec 0x200; flags = u32 at end−12, or end−14 with FUNC_Net), `sigs.py` (params:
+  CPF_Parm 0x80 in the u64 at +24 of a property export, children listed in reverse). Function
+  export: bytecode size at +40, code at +44. Commands → docs/script-commands.md. Pawn/HUD/
+  CheatManager execs are in the console's exec chain; CheatManager needs EnableCheats.
+  User's Materials folder (MasterMATS, Material_Skin, Material_Cloth, Material_VehicleAndWeapon,
+  PhysicalMATS, GenericMATS = Glass_0001/0002) has the material graphs (expressions) — the source
+  for mapping Texture2D_N / UniformScalar_N of material shaders.
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 

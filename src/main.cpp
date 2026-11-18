@@ -1341,7 +1341,7 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR0
     if (tHit < 0) return float4(col, 1);
     // refine between the last miss and the hit
     float lo = tPrev, hi = tHit;
-    [unroll] for (int k = 0; k < 5; k++) {
+    [unroll] for (int r = 0; r < 5; r++) {
         float mid = 0.5 * (lo + hi);
         float3 s = S(p + Rd * mid);
         if (s.z - LinD(s.xy) > 0) hi = mid; else lo = mid;
@@ -1351,8 +1351,8 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR0
     float2 e = min(sh.xy, 1 - sh.xy);
     float edge = saturate(min(e.x, e.y) * 12);
     float fres = pow(1 - saturate(dot(-V, n)), 3);
-    float k = sp.x * up * edge * lerp(0.35, 1.0, fres) * (1 - hi / sp.y);
-    return float4(lerp(col, rc, saturate(k)), 1);
+    float amt = sp.x * up * edge * lerp(0.35, 1.0, fres) * (1 - hi / sp.y);
+    return float4(lerp(col, rc, saturate(amt)), 1);
 }
 )HLSL";
 
@@ -1844,6 +1844,12 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
     const bool doFxaa = cfg.fxaa && g_fx.psFxaa != nullptr, doSharp = cfg.sharpen > 0 && g_fx.psSharp != nullptr;
     const bool doGrade = cfg.gradeEnable && g_fx.psGrade != nullptr;
     const bool doSSR = cfg.ssr && cfg.ssrStrength > 0 && g_fx.psSSR && g_fx.depthValid && g_fx.depth && g_vpKey / 64u == g_frameNo;
+    if (cfg.ssr && cfg.ssrStrength > 0 && !doSSR) {
+        static unsigned lastWhy = 0; unsigned why = (!g_fx.psSSR) | (!g_fx.depthValid) << 1 | (!g_fx.depth) << 2 | (g_vpKey / 64u != g_frameNo) << 3;
+        if (why != lastWhy) { lastWhy = why;
+            Log("ssr: not running -%s%s%s%s", why & 1 ? " shader not compiled" : "", why & 2 ? " depth not calibrated" : "",
+                why & 4 ? " no depth" : "", why & 8 ? " no view-projection this frame" : ""); }
+    }
     if (!doAO && !doFxaa && !doSharp && !doGrade && !doSSR) return;
     if (!EnsureTargets(dev, bd)) return;
     if (doAO && !g_fx.aoA) return;
@@ -3641,6 +3647,10 @@ static void PreDraw(IDirect3DDevice9* d)
     if (g_curVSvp >= 0 && g_curRTIsHDR && g_curVSvp + 4 <= 256) {   // main-view view-projection (reflections)
         memcpy(g_vp, g_vsc[g_curVSvp], sizeof g_vp);
         g_vpKey = GlassMaskKey();
+        static bool vpLogged = false;
+        if (!vpLogged) { vpLogged = true;
+            Log("ssr: view-projection found in the game's vertex shader (c%d): r0 %.3f %.3f %.3f %.3f  r3 %.1f %.1f %.1f %.1f",
+                g_curVSvp, g_vp[0][0], g_vp[0][1], g_vp[0][2], g_vp[0][3], g_vp[3][0], g_vp[3][1], g_vp[3][2], g_vp[3][3]); }
     }
     if (g_censusOn && !g_inPostFX && g_curGamePS) g_census[g_curGamePS]++;
     GameShader* gs = g_curGS;
@@ -4579,7 +4589,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.15.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.15.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -4821,19 +4831,26 @@ static void DrawMenu()
                 ImGui::TextDisabled("Commands run when the game next pumps messages (close the menu if one seems stuck).");
                 // Shortcuts: commands found in the game's own exec handler (APGame.exe), plus UE3 cheats
                 struct Sc { const char* label; const char* cmd; const char* tip; };
-                static const Sc sc[] = {
+                // Groups: engine / exe commands (APGame.exe exec handler) and UnrealScript exec functions
+                // mapped from the cooked scripts (APGame.u / Engine.u, FUNC_Exec).
+                static const Sc scView[] = {
                     { "Hide / show HUD", "TOGGLEUI", "Toggles the whole game UI (screenshots)." },
                     { "Screenshot", "SHOT", "Saved by the game to APGame\\ScreenShots." },
                     { "Hi-res screenshot (2x)", "TILEDSHOT 2", "Renders the frame in tiles at twice the resolution." },
+                    { "Camera bob on/off", "ToggleCameraBob", "APPawn_Player: the camera's walking bob." },
+                    { "Copyright text on/off", "ToggleCopyright", "APPawn_Player: the build/copyright overlay." },
+                    { "Free camera (cheats)", "ToggleDebugCamera", "CheatManager: fly the camera around. Run 'Enable cheats' first; run again to return." },
+                    { "Freeze world (cheats)", "PlayersOnly", "CheatManager: everything but the player stops - for photos. Run again to resume." },
                     { "FPS counter", "STAT FPS", "Toggles the engine's FPS display." },
                     { "Frame timing", "STAT UNIT", "Game / draw / GPU times." },
-                    { "Slow motion", "slomo 0.3", "UE3 cheat; may need the cheat manager." },
-                    { "Normal speed", "slomo 1", "" },
+                };
+                static const Sc scRender[] = {
                     { "Occlusion culling on/off", "TOGGLEOCCLUSION", "The game's own switch (APRenewal also has 'No occlusion culling' above)." },
                     { "High-quality character light on/off", "HQDLE", "Obsidian's high-quality dynamic light environments (on by default)." },
                     { "Character rim light on/off", "USEMAGICRIM", "Obsidian's 'magic rim' light on characters (on by default)." },
                     { "Door lighting fix on/off", "DOORLIGHTINGFIX", "Obsidian's fix for lighting on doors." },
                     { "DOF bleeding fix on/off", "TOGGLEDOFFIX", "" },
+                    { "Aim depth of field on/off", "ToggleAimDOF", "APPlayerController: the blur while aiming." },
                     { "Lit view", "VIEWMODE LIT", "" },
                     { "Lighting only", "VIEWMODE LIGHTINGONLY", "Shows only lighting - nice for checking lights." },
                     { "Unlit", "VIEWMODE UNLIT", "" },
@@ -4843,15 +4860,35 @@ static void DrawMenu()
                     { "Decals on/off", "SHOW DECALS", "" },
                     { "Post-processing on/off", "SHOW POSTPROCESS", "The game's own post-processing." },
                 };
-                ImGui::SeparatorText("Shortcuts");
-                for (int i = 0; i < (int)(sizeof sc / sizeof sc[0]); i++) {
-                    if (i % 3) ImGui::SameLine();
-                    if (ImGui::Button(sc[i].label, ImVec2(ImGui::GetFontSize() * 11.0f, 0))) ConQueue(sc[i].cmd);
-                    if (sc[i].tip[0] && ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", sc[i].cmd, sc[i].tip);
-                    else if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", sc[i].cmd);
-                }
+                static const Sc scPlay[] = {
+                    { "Subtitles on/off", "ToggleSubtitles", "" },
+                    { "Aim assist on/off", "ToggleAimAssist", "APPawn_Player." },
+                    { "Recoil on/off", "ToggleRecoil", "APPawn_Player." },
+                    { "Infinite ammo on/off", "ToggleInfiniteAmmo", "APPawn_Player." },
+                    { "Slow motion", "slomo 0.3", "Needs 'Enable cheats'." },
+                    { "Normal speed", "slomo 1", "" },
+                    { "Enable cheats", "EnableCheats", "Creates UE3's cheat manager (God, Ghost, Walk, SloMo, ToggleDebugCamera, PlayersOnly...)." },
+                    { "God mode (cheats)", "God", "CheatManager. Run again to turn off." },
+                    { "Noclip / walk (cheats)", "Ghost", "CheatManager. 'Walk' returns to normal." },
+                };
+                auto group = [&](const char* title, const Sc* v, int n) {
+                    ImGui::SeparatorText(title);
+                    for (int i = 0; i < n; i++) {
+                        if (i % 3) ImGui::SameLine();
+                        ImGui::PushID(v[i].cmd);
+                        if (ImGui::Button(v[i].label, ImVec2(ImGui::GetFontSize() * 11.0f, 0))) ConQueue(v[i].cmd);
+                        ImGui::PopID();
+                        if (v[i].tip[0] && ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", v[i].cmd, v[i].tip);
+                        else if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", v[i].cmd);
+                    }
+                };
+                group("Screenshots & camera", scView, (int)(sizeof scView / sizeof scView[0]));
+                group("Rendering switches", scRender, (int)(sizeof scRender / sizeof scRender[0]));
+                group("Gameplay", scPlay, (int)(sizeof scPlay / sizeof scPlay[0]));
                 ImGui::TextDisabled("Value commands (type them): MINAMBIENT x, IRRADIANCESCALE x, IRRADIANCECONTRAST x,");
-                ImGui::TextDisabled("LIGHTSCALE x, SHADOWINTENSITY x, SHARPNESS x, DESATURATE x, MOTIONBLURAMOUNT x, MAGICRIMSCALE x.");
+                ImGui::TextDisabled("LIGHTSCALE x, SHADOWINTENSITY x, SHARPNESS x, DESATURATE x, MOTIONBLURAMOUNT x, MAGICRIMSCALE x,");
+                ImGui::TextDisabled("SetSensitivity x, SpecialSloMo x. Progress-changing ones (GiveMoney n, GiveAP n, GiveXP n,");
+                ImGui::TextDisabled("UnlockVeteran, GiveAllWeapons...) also exist - they change your save, use with care.");
             }
             ImGui::EndTabItem();
         }
@@ -5280,7 +5317,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.15.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.15.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

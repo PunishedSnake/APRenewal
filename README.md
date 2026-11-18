@@ -1,4 +1,4 @@
-# APRenewal 0.15.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.15.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,14 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.15.1
+- **Screen-space reflections fixed**: the reflection shader failed to compile in 0.15.0 (a variable
+  name clash only the real compiler catches), so nothing was reflected. The log now also says why
+  reflections aren't running if something else is missing (`ssr:` lines).
+- **More console shortcuts** (Game tab, now grouped): camera bob, copyright overlay, free camera,
+  freeze world, aim depth of field, subtitles, aim assist, recoil, infinite ammo, cheats (God,
+  Ghost). The full list of the game's script commands is in `source/docs/script-commands.md`.
 
 ## New in 0.15.0
 - **AO fades with fog** (`[AO] FadeWithFog`). The game's height fog is rebuilt so it also writes
