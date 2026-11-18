@@ -250,6 +250,15 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
 - 0.16.1: user's 0.16.0 crashed in the main menu (native d3d9, no DXVK; log stopped ~3 s after the last
   line, "window closing" but no "shutdown"). Cause unknown → MessageBoxW/A IAT hooks log UE3's error box
   text (its call stack), vectored handler logs the first fatal exceptions with module+offset (`crash?:`).
+- 0.16.2: the 0.16.1 logs showed the crash: AV in d3dcompiler_42.dll+0xf21a8 (reading 0x5b) on a
+  worker thread while a save loads = compiling our glass replacement (first glass shader of the level).
+  The game's D3DX (d3dx9_42 → d3dcompiler_42, Aug 2009) crashed on the SSR helper (function with
+  [loop] + break + early returns + VPOS). Glass SSR is now `#if GLASSSSR`, branch-free (12 unrolled
+  steps, masks), built as a second variant (gs.replSsr) after the plain one, between a marker file
+  (APRenewal_glass_compile.lock containing the version): marker present at startup → variant skipped.
+  Keep new HLSL for game-thread compiles simple: no loops with break in helper functions.
+  A real d3dcompiler_43 is in the Microsoft.DXSDK.D3DX NuGet package, but running it under Wine was
+  refused by the permission classifier — ask the user before trying that again.
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 

@@ -3220,6 +3220,7 @@ struct GameShader {
     int distReg = -1;                        // glass refraction: UniformScalar_1 (normal offset scale)
     int sceneTexReg = -1;                    // final blend: SceneColorTexture sampler (source of our bloom)
     int matTag = 0;                          // 1 skin, 2 metal (base pass, by bytecode hash)
+    IDirect3DPixelShader9* replSsr = nullptr; // glass: the replacement with screen-space reflections
     IDirect3DPixelShader9* tagged = nullptr; // the game's bytecode + 'mov oC1, tag' (material mask)
     int uses = 0;
 };
@@ -3483,47 +3484,17 @@ static IDirect3DPixelShader9* BuildSoftShadow(IDirect3DDevice9* dev, GameShader&
 // apTM: x opacity scale, y reflection strength, z our Fresnel amount, w game's luminance weighting
 // apTM2: x normal-map strength
 static const char* kGlassBodyHLSL = R"HLSL(
-// screen-space reflections from the previous frame: apX[0..3] this frame's view-projection rows,
-// apX[4..7] the previous frame's, apX[8] camera xyz + strength, apX[9] (depth fit A, B, max distance),
-// apX[10] x thickness. s12 = this frame's depth (24-bit z snapshot), s13 = last frame's HDR scene.
+// GLASSSSR: screen-space reflections from the previous frame. apX[0..3] this frame's view-projection
+// rows, apX[4..7] the previous frame's, apX[8] camera xyz + strength, apX[9] (depth fit A, B, max
+// distance), apX[10] x thickness. s12 = this frame's 24-bit depth snapshot, s13 = last frame's HDR scene.
+// Written without flow control or helper functions (fixed unrolled steps, masks instead of breaks):
+// 0.16.0's version with loops/breaks/early returns crashed the game's D3DX compiler.
+#if GLASSSSR
 sampler2D apZTex : register(s12);
 sampler2D apPrevTex : register(s13);
-float apLinZ(float2 uv) { return 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(uv, 0, 0)).r, 1e-6); }
-float4 apClipNow(float3 p)  { return p.x * apX[0] + p.y * apX[1] + p.z * apX[2] + apX[3]; }
-float4 apClipPrev(float3 p) { return p.x * apX[4] + p.y * apX[5] + p.z * apX[6] + apX[7]; }
-float2 apUV(float4 c) { return float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5); }
-// returns rgb = reflected colour, a = confidence (0 = use the cubemap)
-float4 apGlassSSR(float3 wp, float3 R, float2 vpos)
-{
-    float noise = frac(52.9829189 * frac(dot(vpos, float2(0.06711056, 0.00583715))));
-    float tPrev = 0, tHit = -1;
-    [loop] for (int i = 1; i <= 20; i++) {
-        float t = (i - 1 + noise) / 20.0;
-        t = t * t * apX[9].z + 4;
-        float4 c = apClipNow(wp + R * t);
-        if (c.w <= 1) break;
-        float2 uv = apUV(c);
-        if (uv.x < 0 || uv.x > 1 || uv.y < 0 || uv.y > 1) break;
-        float diff = c.w - apLinZ(uv);
-        if (diff > 0 && diff < apX[10].x * (1 + c.w * 0.002)) { tHit = t; break; }
-        tPrev = t;
-    }
-    if (tHit < 0) return 0;
-    float lo = tPrev, hi = tHit;
-    [unroll] for (int r = 0; r < 4; r++) {
-        float mid = 0.5 * (lo + hi);
-        float4 c = apClipNow(wp + R * mid);
-        if (c.w - apLinZ(apUV(c)) > 0) hi = mid; else lo = mid;
-    }
-    float4 pc = apClipPrev(wp + R * hi);
-    if (pc.w <= 1) return 0;
-    float2 puv = apUV(pc);
-    float2 e = min(puv, 1 - puv);
-    float conf = saturate(min(e.x, e.y) * 10) * (1 - hi / (apX[9].z + 4));
-    return float4(tex2Dlod(apPrevTex, float4(puv, 0, 0)).rgb, conf);
-}
+#endif
 void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 fog : TEXCOORD4, float3 camv : TEXCOORD6,
-          float2 vpos : VPOS, out float4 OutColor : COLOR0, out float4 OutMask : COLOR1)
+          out float4 OutColor : COLOR0, out float4 OutMask : COLOR1)
 {
 #if DUALNORMAL
     float4 m = tex2D(Texture2D_2, uv);
@@ -3556,16 +3527,41 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
     // angle-dependent reflection: weaker head-on, much stronger at grazing angles (Schlick-like)
     float fr = pow(saturate(1 - abs(ndv)), 4);
     refl *= apTM.y * lerp(1, 0.35 + 2.5 * fr, apTM.z);
-    if (apX[8].w > 0) {
+#if GLASSSSR
+    {
         // the glass pixel in world space: the vertex shader's camera vector is (camera - position) in the
         // tangent basis, unnormalised, so taking it back through the basis and LocalToWorld gives the offset
-        float3 lc = camv.x * b + camv.y * bin + camv.z * a;
-        float3 wc = lc.x * LocalToWorldMatrix[0].xyz + lc.y * LocalToWorldMatrix[1].xyz + lc.z * LocalToWorldMatrix[2].xyz;
-        float3 wp = apX[8].xyz - wc;
-        float4 sr = apGlassSSR(wp, normalize(W), vpos);
-        float f = 0.04 + 0.96 * pow(saturate(1 - abs(ndv)), 5);
-        refl = lerp(refl, sr.rgb * apX[8].w * lerp(0.6, 2.5, f), sr.a);
+        float3 lcv = camv.x * b + camv.y * bin + camv.z * a;
+        float3 wcv = lcv.x * LocalToWorldMatrix[0].xyz + lcv.y * LocalToWorldMatrix[1].xyz + lcv.z * LocalToWorldMatrix[2].xyz;
+        float3 gwp = apX[8].xyz - wcv;
+        float3 Rw = normalize(W);
+        float jit = frac(52.9829189 * frac(dot(uv * 1024, float2(0.06711056, 0.00583715))));
+        float alive = 1, found = 0, hitT = 0;
+        [unroll] for (int si = 1; si <= 12; si++) {
+            float st = (si - 1 + jit) / 12.0;
+            st = st * st * apX[9].z + 4;
+            float3 rp = gwp + Rw * st;
+            float4 rc4 = rp.x * apX[0] + rp.y * apX[1] + rp.z * apX[2] + apX[3];
+            float rw = max(rc4.w, 1);
+            float2 suv = float2(rc4.x / rw * 0.5 + 0.5, 0.5 - rc4.y / rw * 0.5);
+            alive *= step(0, suv.x) * step(suv.x, 1) * step(0, suv.y) * step(suv.y, 1) * step(1, rc4.w);
+            float zd = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(saturate(suv), 0, 0)).r, 1e-6);
+            float dz = rc4.w - zd;
+            float hit = (1 - found) * alive * step(0, dz) * step(dz, apX[10].x * (1 + rc4.w * 0.002));
+            hitT += hit * st;
+            found += hit;
+        }
+        float3 hp = gwp + Rw * hitT;
+        float4 pc = hp.x * apX[4] + hp.y * apX[5] + hp.z * apX[6] + apX[7];
+        float pw = max(pc.w, 1);
+        float2 puv = float2(pc.x / pw * 0.5 + 0.5, 0.5 - pc.y / pw * 0.5);
+        float2 pe = saturate(min(puv, 1 - puv) * 10);
+        float conf = found * step(1, pc.w) * min(pe.x, pe.y) * saturate(1 - hitT / (apX[9].z + 4)) * step(0.001, apX[8].w);
+        float3 srgb = tex2Dlod(apPrevTex, float4(saturate(puv), 0, 0)).rgb;
+        float fre = 0.04 + 0.96 * pow(saturate(1 - abs(ndv)), 5);
+        refl = lerp(refl, srgb * apX[8].w * lerp(0.6, 2.5, fre), conf);
     }
+#endif
     float mask = m.x;
     float3 mr = mask * refl;
     float3 emis = mr + UniformVector_0.rgb;
@@ -3598,6 +3594,29 @@ static uint32_t ShaderHash(const DWORD* code, UINT* lenOut = nullptr)
     if (lenOut) *lenOut = len;
     return h;
 }
+// Marker file around the risky glass-reflection compile (D3DX crashed on 0.16.0's version): present at
+// startup with this version's name = the compile crashed last time, so the variant is skipped.
+static int g_glassSsrBlocked = -1;
+static void GlassSsrPath(char* out) { PathJoin(out, g_dir, "APRenewal_glass_compile.lock"); }
+static bool GlassSsrBlocked()
+{
+    if (g_glassSsrBlocked < 0) {
+        char p[MAX_PATH]; GlassSsrPath(p);
+        char buf[64] = "";
+        if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.16.2") ? 1 : 0;
+        if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
+        else if (buf[0]) DeleteFileA(p);
+    }
+    return g_glassSsrBlocked == 1;
+}
+static void GlassSsrMarker(bool on)
+{
+    char p[MAX_PATH]; GlassSsrPath(p);
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.16.2", f); fclose(f); } }
+    else DeleteFileA(p);
+}
+
 // Material mask: the game's own bytecode with two extra instructions - "def cK, tag" after the
 // header and "mov oC1, cK" before the end token - so the base pass also writes which pixels are skin
 // or metal to a second render target. cK is above every constant the shader uses (CTAB and defs).
@@ -3718,9 +3737,21 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
     if (hash == 0xcb2f41c2u || hash == 0x23836016u || hash == 0xcc79d4cdu) {
         const bool fres = hash == 0x23836016u, dual = hash == 0xcc79d4cdu;
         gs.kind = SK_GLASS;
-        gs.repl = BuildReplacement(d, ct, kGlassBodyHLSL, gs.paramReg, fres ? "window glass (fresnel)" : dual ? "door glass" : "window glass", "",
-                                   fres ? "#define GAMEFRESNEL 1\n#define DUALNORMAL 0\n" : dual ? "#define GAMEFRESNEL 0\n#define DUALNORMAL 1\n"
-                                        : "#define GAMEFRESNEL 0\n#define DUALNORMAL 0\n");
+        const char* name = fres ? "window glass (fresnel)" : dual ? "door glass" : "window glass";
+        char defs[160];
+        snprintf(defs, sizeof defs, "#define GAMEFRESNEL %d\n#define DUALNORMAL %d\n#define GLASSSSR 0\n", fres ? 1 : 0, dual ? 1 : 0);
+        gs.repl = BuildReplacement(d, ct, kGlassBodyHLSL, gs.paramReg, name, "", defs);
+        // the reflection variant is compiled separately, behind a marker file: if the game's compiler
+        // ever crashes on it, the next launch sees the marker and leaves it out
+        if (gs.repl && cfg.glassSsr > 0 && !GlassSsrBlocked()) {
+            snprintf(defs, sizeof defs, "#define GAMEFRESNEL %d\n#define DUALNORMAL %d\n#define GLASSSSR 1\n", fres ? 1 : 0, dual ? 1 : 0);
+            GlassSsrMarker(true);
+            int reg = -1;
+            gs.replSsr = BuildReplacement(d, ct, kGlassBodyHLSL, reg, name, "", defs);
+            GlassSsrMarker(false);
+            if (gs.replSsr && reg != gs.paramReg) { gs.replSsr->Release(); gs.replSsr = nullptr; }
+            Log("glass: %s with screen-space reflections %s", name, gs.replSsr ? "ready" : "FAILED to build - cubemap reflections only");
+        }
         if (!gs.repl) g_shReplFail++;
         Log("shaders: window glass material %08x recognised - %s", hash, gs.repl ? "improved version ready" : "replacement FAILED, game shader kept");
     } else if (hash == 0x3e0261ffu || hash == 0x98160836u || hash == 0x855d48c7u) {
@@ -4203,7 +4234,7 @@ static HRESULT STDMETHODCALLTYPE hk_SetPS(IDirect3DDevice9* d, IDirect3DPixelSha
         auto it = g_gameShaders.find(ps);
         if (it != g_gameShaders.end()) {
             g_curGS = &it->second;
-            if (ReplActive(g_curGS)) return o_SetPS(d, g_curGS->repl);
+            if (ReplActive(g_curGS)) return o_SetPS(d, g_curGS->replSsr && cfg.glassSsr > 0 ? g_curGS->replSsr : g_curGS->repl);
             if (g_curGS->tagged && cfg.matEnable) return o_SetPS(d, g_curGS->tagged);
         }
     }
@@ -4943,7 +4974,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.16.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.16.2", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -5686,7 +5717,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.16.1 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.16.2 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();
