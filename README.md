@@ -1,4 +1,4 @@
-# APRenewal 0.9.5 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.9.6 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -12,6 +12,13 @@ A research-and-fix base layer. It sits alongside the mods you already have:
 ## Install
 Copy `d3d9.dll` + `APRenewal.ini` into `Alpha Protocol\Binaries\`. Uninstall = delete both.
 The log goes to `Binaries\APRenewal\APRenewal.log`.
+
+## New in 0.9.6
+- HDR: "Compensate" toggle (`[HDR] CompensateSRGB`). The 0.9.4/0.9.5 test pattern fits one model
+  exactly: our linear scRGB output is decoded as sRGB a second time somewhere after DXVK and shown
+  at SDR white. Compensate pre-encodes the output with the sRGB curve relative to paper white, so
+  that second decode cancels out. Test it with the test pattern: all 32 grey steps visible and the
+  bars matching hdr_testpattern.png = fixed. (NVIDIA "layered on DXGI" made no difference.)
 
 ## New in 0.9.5
 - Fixed: the game could stay in memory after quitting. While closing, its window loses focus,

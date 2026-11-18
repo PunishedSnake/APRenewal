@@ -115,6 +115,7 @@ struct Config {
     int  hdrSaturation = 100;   // percent, HDR only
     int  hdrCurve      = 0;     // 0 = sRGB like Windows shows SDR, 1 = gamma 2.2
     int  hdrReference  = 0;     // A/B: plain SDR-in-HDR exactly as Windows would show it
+    int  hdrCompensate = 0;     // pre-encode for a driver/compositor that decodes the scRGB swapchain as sRGB
     // audio
     int  hrtf          = 1;     // 0 off, 1 on (headphones), 2 leave to OpenAL
     // view (replaces AlphaFixer)
@@ -186,6 +187,7 @@ static void LoadConfig()
     cfg.hdrEnable     = GetPrivateProfileIntA("HDR", "Enable", 0, g_ini);
     cfg.hdrPaper      = GetPrivateProfileIntA("HDR", "PaperWhite", 0, g_ini);   // 0 = Windows' SDR content brightness
     cfg.hdrCurve      = GetPrivateProfileIntA("HDR", "Curve", 0, g_ini) ? 1 : 0;
+    cfg.hdrCompensate = GetPrivateProfileIntA("HDR", "CompensateSRGB", 0, g_ini) ? 1 : 0;
     cfg.hdrPeak       = GetPrivateProfileIntA("HDR", "PeakNits", 0, g_ini);
     cfg.hdrHighlights = GetPrivateProfileIntA("HDR", "Highlights", 100, g_ini);
     cfg.hdrEncoding   = 1;
@@ -853,6 +855,7 @@ static const char* kHdrEncodePS = R"HLSL(
 sampler2D sSrc : register(s0);
 float4 e : register(c1);    // x paper white nits, y peak nits, z 1 = PQ / 0 = scRGB, w 1 = sRGB curve / 0 = gamma 2.2
 float4 e2 : register(c2);   // xy uv scale (only part of the source holds the image), z game gamma ramp exponent, w saturation
+float4 e3 : register(c3);   // x = 1: something after us decodes the swapchain as sRGB once more - pre-encode
 float3 PQ(float3 nits)
 {
     float3 y = pow(saturate(nits / 10000.0), 0.1593017578125);
@@ -872,7 +875,10 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
     float3 c2020 = float3(dot(c, float3(0.6274, 0.3293, 0.0433)),
                           dot(c, float3(0.0691, 0.9195, 0.0114)),
                           dot(c, float3(0.0164, 0.0880, 0.8956)));
-    return float4(lerp(c / 80.0, PQ(max(c2020, 0)), e.z), 1);
+    float3 sc = c / lerp(80.0, e.x, e3.x);       // compensated: 1.0 = paper white (what that path treats as white)
+    float3 enc = lerp(sc * 12.92, 1.055 * pow(max(sc, 1e-8), 1 / 2.4) - 0.055, saturate((sc - 0.0031308) * 1e6));
+    sc = lerp(sc, enc, e3.x);
+    return float4(lerp(sc, PQ(max(c2020, 0)), e.z), 1);
 }
 )HLSL";
 
@@ -1663,7 +1669,7 @@ static bool CopyToTex(IDirect3DDevice9* dev, IDirect3DSurface9* src, IDirect3DTe
 // One fullscreen pass into `dst`, drawing only the vw x vh corner. s0/s1 textures, c1/c2 constants.
 static void XPass(IDirect3DDevice9* dev, IDirect3DSurface9* dst, UINT vw, UINT vh,
                   IDirect3DBaseTexture9* t0, bool lin0, IDirect3DBaseTexture9* t1, bool lin1,
-                  IDirect3DPixelShader9* ps, const float* c1, const float* c2, bool inScene)
+                  IDirect3DPixelShader9* ps, const float* c1, const float* c2, bool inScene, const float* c3 = nullptr)
 {
     if (!g_xvs || !ps) return;
     if (!g_xsb && FAILED(dev->CreateStateBlock(D3DSBT_ALL, &g_xsb))) return;
@@ -1701,6 +1707,7 @@ static void XPass(IDirect3DDevice9* dev, IDirect3DSurface9* dst, UINT vw, UINT v
         }
         if (c1) dev->SetPixelShaderConstantF(1, c1, 1);
         if (c2) dev->SetPixelShaderConstantF(2, c2, 1);
+        if (c3) dev->SetPixelShaderConstantF(3, c3, 1);
         struct V { float x, y, z, u, v; };
         static const V quad[4] = { { -1.f, 1.f, 0, 0, 0 }, { 1.f, 1.f, 0, 1, 0 }, { -1.f, -1.f, 0, 0, 1 }, { 1.f, -1.f, 0, 1, 1 } };
         dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
@@ -1872,7 +1879,8 @@ static const RECT* PresentExtras(IDirect3DDevice9* dev)
                              (ref || cfg.hdrCurve == 0) ? 1.0f : 0.0f };
         const float e2[4] = { (float)iw / bd.Width, (float)ih / bd.Height, g_hdrPattern ? 1.0f : g_gammaExp,
                               (cfg.hdrReference || g_hdrPattern) ? 1.0f : cfg.hdrSaturation / 100.0f };
-        XPass(dev, bb, iw, ih, g_xCopy, false, nullptr, false, g_psHdrEncode, e, e2, false);
+        const float e3[4] = { cfg.hdrCompensate ? 1.0f : 0.0f, 0, 0, 0 };
+        XPass(dev, bb, iw, ih, g_xCopy, false, nullptr, false, g_psHdrEncode, e, e2, false, e3);
     }
     bb->Release();
     return ret;
@@ -2905,6 +2913,7 @@ static bool SaveConfig()
     WriteIniInt("HDR", "Enable", cfg.hdrEnable);
     WriteIniInt("HDR", "PaperWhite", cfg.hdrPaper);
     WriteIniInt("HDR", "Curve", cfg.hdrCurve);
+    WriteIniInt("HDR", "CompensateSRGB", cfg.hdrCompensate);
     WriteIniInt("HDR", "PeakNits", cfg.hdrPeak);
     WriteIniInt("HDR", "Highlights", cfg.hdrHighlights);
     WriteIniInt("HDR", "Saturation", cfg.hdrSaturation);
@@ -2993,7 +3002,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.9.5", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.9.6", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -3022,6 +3031,7 @@ static void DrawMenu()
             CheckboxInt("HDR output (applies at next launch)", &cfg.hdrEnable);
             CheckboxInt("Reference: plain SDR exactly as Windows shows it (A/B)", &cfg.hdrReference);
             ImGui::Checkbox("Test pattern (compare with hdr_testpattern.png in an SDR viewer)", &g_hdrPattern);
+            CheckboxInt("Compensate: output gets decoded as sRGB twice (fixes washed-to-neon look)", &cfg.hdrCompensate);
             if (g_hdrPattern)
                 ImGui::TextWrapped("If the grey ramp turns flat white after about half way and the 75%% bars look like pure primaries, "
                                    "Windows is treating the game's HDR picture as SDR. On NVIDIA: Control Panel > Manage 3D settings > "
@@ -3507,7 +3517,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.9.5 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.9.6 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         ApplySavedToggles();

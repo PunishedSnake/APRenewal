@@ -89,7 +89,9 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   mode; we still keep the game's ramp out of the HDR path.
   0.9.4 test pattern on the user's PC (monitor on the RTX, Windows HDR on, scRGB swapchain per DXVK log):
   output came out as if decoded as SDR sRGB at SDR white and clipped at 1.0 — the HDR colour space
-  gets lost after DXVK. Prime suspect: NVIDIA Vulkan "present method" (native vs layered on DXGI).
+  gets lost after DXVK. NVIDIA "layered on DXGI" changed nothing. Measured shape = our linear output
+  decoded as sRGB again at ~SDR white; 0.9.6 adds CompensateSRGB (pre-encode relative to paper white).
+  Quit fix confirmed by the user (log ends with shutdown).
 - Focus pause must never park the thread while the window is closing/hidden (0.9.5: g_exiting) —
   that kept the process alive after quitting.
 - **Audio**: game loads OpenAL at runtime (`DeviceName=Generic Software` in APEngine.ini). With OpenAL
