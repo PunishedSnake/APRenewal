@@ -513,11 +513,12 @@ static void DiPoll()
 // ---------------------------------------------------------------- background thread
 static DWORD WINAPI PadThread(LPVOID)
 {
+    g_padThreadId = GetCurrentThreadId();
     DWORD lastScan = 0;
     bool diTried = false;
     while (!g_exiting) {
         const DWORD now = GetTickCount();
-        if (now - lastScan > 2000 || !lastScan) {
+        if (now - lastScan > 3000 || !lastScan) {
             lastScan = now;
             if (g_padCfg.enable && g_padCfg.sony) SonyScan();
             if (g_padCfg.enable && g_padCfg.dinput) {

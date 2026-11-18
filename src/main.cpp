@@ -4222,8 +4222,9 @@ static IDirect3DPixelShader9* BuildSoftShadow(IDirect3DDevice9* dev, GameShader&
 // apTM: x opacity scale, y reflection strength, z our Fresnel amount, w game's luminance weighting
 // apTM2: x normal-map strength
 static const char* kGlassBodyHLSL = R"HLSL(
-// GLASSSSR: screen-space reflections. apX[0..3] this frame's view-projection rows, apX[4..7] the
-// matrix the colour source was rendered with (this frame's when s13 is the same-frame copy), apX[8]
+// GLASSSSR: screen-space reflections. apX[0..3] this frame's view-projection rows; apX[4..7] the
+// previous frame's (s13 = previous frame), or with apX[11].x = 1 (s13 = this frame's scene) the inverse
+// rows + camera for a back-face test at the hit; apX[8]
 // camera xyz + strength, apX[9] (depth fit A, B, max distance), apX[10] x thickness, y frame (jitter),
 // zw screen size. s12 = this frame's 24-bit depth snapshot, s13 = the HDR scene to reflect.
 // Written without flow control or helper functions (fixed unrolled steps, masks instead of breaks):
@@ -4316,17 +4317,47 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
         }
         hitT = lerp(hitT, rhi, found);
         float3 hp = gwp + Rw * hitT;
-        float4 pc = hp.x * apX[4] + hp.y * apX[5] + hp.z * apX[6] + apX[7];
+        // apX[11].x = 1: the colour source is this frame's scene, so project with this frame's matrix
+        // (apX[0..3]) - apX[4..6] then hold its inverse and apX[7] the camera, for the back-face test below
+        float curSrc = step(0.5, apX[11].x);
+        float4 pcCur = hp.x * apX[0] + hp.y * apX[1] + hp.z * apX[2] + apX[3];
+        float4 pcPrev = hp.x * apX[4] + hp.y * apX[5] + hp.z * apX[6] + apX[7];
+        float4 pc = lerp(pcPrev, pcCur, curSrc);
         float pw = max(pc.w, 1);
         float2 puv = float2(pc.x / pw * 0.5 + 0.5, 0.5 - pc.y / pw * 0.5);
         float2 pe = saturate(min(puv, 1 - puv) * 10);
         float conf = found * step(1, pc.w) * min(pe.x, pe.y) * saturate(1 - (hitT - tMin) / apX[9].z) * step(0.001, apX[8].w);
         // fade out at grazing angles, where the reconstructed position is least reliable
         conf *= saturate(abs(ndv) * 6);
-        // rays that turn back toward the camera can only hit the backs of things (Mike seen from behind
-        // instead of his front) - that is the dark "ghost"; leave those to the cubemap
+        // back-face test: the surface the ray "hit" must face the ray. A ray from a window back toward
+        // Mike lands on his back (the side the camera sees) from behind - that was the dark ghost.
+        // Normal from this frame's depth around the hit (the neighbour with the smaller step per axis).
+        {
+            float2 tx = 1.0 / apX[10].zw;
+            float2 huv = saturate(puv);
+            float d0 = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(huv, 0, 0)).r, 1e-6);
+            float dxp = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(huv + float2(tx.x, 0), 0, 0)).r, 1e-6);
+            float dxm = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(huv - float2(tx.x, 0), 0, 0)).r, 1e-6);
+            float dyp = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(huv + float2(0, tx.y), 0, 0)).r, 1e-6);
+            float dym = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(huv - float2(0, tx.y), 0, 0)).r, 1e-6);
+            float ux = step(abs(dxp - d0), abs(dxm - d0)), uy = step(abs(dyp - d0), abs(dym - d0));
+            float2 ox = float2(lerp(-tx.x, tx.x, ux), 0), oy = float2(0, lerp(-tx.y, tx.y, uy));
+            float dX = lerp(dxm, dxp, ux), dY = lerp(dym, dyp, uy);
+            float2 s0 = float2(huv.x * 2 - 1, 1 - huv.y * 2);
+            float2 sX = float2((huv.x + ox.x) * 2 - 1, 1 - huv.y * 2);
+            float2 sY = float2(huv.x * 2 - 1, 1 - (huv.y + oy.y) * 2);
+            float3 p0 = (s0.x * d0) * apX[4].xyz + (s0.y * d0) * apX[5].xyz + d0 * apX[6].xyz + apX[7].xyz;
+            float3 pX = (sX.x * dX) * apX[4].xyz + (sX.y * dX) * apX[5].xyz + dX * apX[6].xyz + apX[7].xyz;
+            float3 pY = (sY.x * dY) * apX[4].xyz + (sY.y * dY) * apX[5].xyz + dY * apX[6].xyz + apX[7].xyz;
+            float3 hn = cross(pX - p0, pY - p0);
+            hn *= sign(dot(hn, apX[7].xyz - p0) + 1e-6);          // the visible side faces the camera
+            hn /= max(length(hn), 1e-6);
+            float frontHit = saturate(-dot(hn, Rw) * 5 + 0.1);
+            conf *= lerp(1, frontHit, curSrc);
+        }
+        // and rays turning almost straight back toward the camera have nothing on screen to hit
         float facing = dot(Rw, -wcv / max(length(wcv), 1e-3));
-        conf *= saturate(0.6 + 1.6 * facing);
+        conf *= saturate(1.0 + 1.5 * facing);
         // small cross filter: half-res source, softens the hit edges
         float2 ht = 0.75 / apX[10].zw * 2;
         float3 srgb = (tex2Dlod(apPrevTex, float4(saturate(puv), 0, 0)).rgb * 2 +
@@ -4380,7 +4411,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.21.0") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.21.1") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4389,7 +4420,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.21.0", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.21.1", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -5019,7 +5050,12 @@ static void PreDraw(IDirect3DDevice9* d)
             const bool ok = base && (cur || prev);
             if (ok) {
                 memcpy(x[0], g_vp, sizeof g_vp);
-                if (cur) memcpy(x[4], g_vp, sizeof g_vp); else memcpy(x[4], g_vpPrev, sizeof g_vpPrev);
+                if (cur) {
+                    // inverse for the back-face test (world = (sx·w, sy·w, w)·A + camera)
+                    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) x[4 + i][j] = A[i][j];
+                    x[7][0] = cam[0]; x[7][1] = cam[1]; x[7][2] = cam[2];
+                    x[11][0] = 1.0f;
+                } else memcpy(x[4], g_vpPrev, sizeof g_vpPrev);
                 x[8][0] = cam[0]; x[8][1] = cam[1]; x[8][2] = cam[2]; x[8][3] = cfg.glassSsr / 100.0f;
                 x[9][0] = g_fx.fitA; x[9][1] = g_fx.fitB; x[9][2] = 2000.0f;
                 static unsigned jf = 0;
@@ -5677,14 +5713,25 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetData(void* self, DWORD cbObj, void* rgd
     return hr;
 }
 
+static volatile DWORD g_padThreadId = 0;   // pad.h's DirectInput scan thread
 static HRESULT STDMETHODCALLTYPE hk_DICreateDevice(void* self, REFGUID guid, void** dev, void* outer)
 {
     auto orig = (PFN_DICreateDevice)FindOrig(g_vtCreate, 4, self);
     HRESULT hr = orig ? orig(self, guid, dev, outer) : E_FAIL;
+    // our controller scan shares DirectInput's vtables: its devices (and the mouse / keyboard objects
+    // DirectInput creates while enumerating) must not replace the game's mouse - that broke the menu's
+    // mouse blocking (camera moved with the menu open) and flooded the log every 2 s
+    if (GetCurrentThreadId() == g_padThreadId) return hr;
     if (SUCCEEDED(hr) && dev && *dev) {
         const char* kind = "other";
-        if (IsEqualGUID(guid, kGUID_SysMouse))    { if (g_diMouse && g_diMouse != *dev) Log("menu: the game made a new mouse device (old %p)", g_diMouse); g_diMouse = *dev; kind = "mouse"; }
-        if (IsEqualGUID(guid, kGUID_SysKeyboard)) { g_diKeyboard = *dev; kind = "keyboard"; }
+        // once the game has its mouse / keyboard, only its own (main) thread may replace them
+        const bool mayReplace = !g_mainThread || GetCurrentThreadId() == g_mainThread;
+        if (IsEqualGUID(guid, kGUID_SysMouse) && (!g_diMouse || mayReplace)) {
+            if (g_diMouse && g_diMouse != *dev) Log("menu: the game made a new mouse device (old %p)", g_diMouse);
+            g_diMouse = *dev; kind = "mouse";
+        }
+        if (IsEqualGUID(guid, kGUID_SysKeyboard) && (!g_diKeyboard || mayReplace)) { g_diKeyboard = *dev; kind = "keyboard"; }
+        if (!strcmp(kind, "other") && !mayReplace) { HookSlot(g_vtState, 8, *dev, 9, (void*)hk_DIGetState); HookSlot(g_vtData, 8, *dev, 10, (void*)hk_DIGetData); return hr; }
         HookSlot(g_vtState, 8, *dev, 9, (void*)hk_DIGetState);   // IDirectInputDevice8::GetDeviceState
         HookSlot(g_vtData, 8, *dev, 10, (void*)hk_DIGetData);    // IDirectInputDevice8::GetDeviceData
         Log("menu: DirectInput %s device %p hooked", kind, *dev);
@@ -5990,7 +6037,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.21.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.21.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -6809,7 +6856,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.21.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.21.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

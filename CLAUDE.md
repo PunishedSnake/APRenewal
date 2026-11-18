@@ -61,6 +61,9 @@ README = current feature list only (no changelog). These notes = current knowled
   Clear 43, SetViewport 47/48, SetTexture 65, SetSamplerState 69, SetScissorRect 75/76, DP/DIP/DPUP/DIPUP
   81-84, CreateVertexShader 91, SetVS 92, SetVSConstantF 94, CreatePixelShader 106, SetPS 107,
   SetPSConstantF 109, CreateQuery 118 (→ query GetData 7).
+- DirectInput: pad.h's scan thread shares dinput8's vtables, so hk_DICreateDevice ignores its thread
+  (g_padThreadId) and only the main thread may replace the game's mouse/keyboard (the scan used to steal
+  g_diMouse every 2 s → menu didn't blank the real mouse → camera moved with the menu open).
 - Menu input blocking: WndProc subclass, DI mouse/keyboard GetDeviceState/GetDeviceData blanked (mouse
   buffer drained), XInput zeroed. Menu close logs what the game read while open (`MenuInputReport`).
 
@@ -95,8 +98,10 @@ res, world into full-res LDR target, one draw to the backbuffer, then UI.
   `APRenewal_glass_compile.lock` survives a crash).
   Glass SSR colour source = this frame's HDR scene StretchRect'd (half res, `g_glassSrc`) at the first glass
   draw of each scene key (RT0 == g_hdrSceneSurf), apX[4..7] = current VP; fallback g_prevHdr + g_vpPrev.
-  Rays turning back toward the camera faded (saturate(0.6 + 1.6·dot(R, camera→glass))) — they only hit
-  backs of things (the "dark Mike ghost"). Jitter IGN(pixel + frame) so TAA averages it; 5-tap cross on the hit.
+  With the same-frame source apX[11].x = 1 and apX[4..6] = inverse rows (A), apX[7] = camera: back-face
+  test at the hit (normal from 3 depth taps, oriented to the camera; ray must hit the front: −n·R > 0) —
+  rays from a window back toward Mike land on his back from behind (the "dark Mike ghost"). Rays almost
+  straight back to the camera faded too. Jitter IGN(pixel + frame) so TAA averages it; 5-tap cross on the hit.
 - Fog OneLayerMain rebuilt to write transmittance to RT1 (AO fades with fog).
 - Material mask: `BuildTaggedShader` patches base-pass bytecode (`def cK`, `mov oC1, cK`) for skin / metal /
   rough hashes (src/matclass.h from tools/re/matclass.py over RefShaderCache); RT1 = g_matMask (r skin,
@@ -165,5 +170,4 @@ AO → SSS (2 passes) → SSR → light shafts → grade → SMAA/FXAA → TAA �
 - Steam APGame.exe: user will supply it → make exe patches version-agnostic (signature scans instead of
   fixed addresses).
 - HUD/subtitle scale (Scaleform canvas RE), 120 fps physics check.
-- Menu + mouse: game camera moved with the menu open in KBM mode; cursor freeze added, cause unconfirmed
-  (see the `menu closed (...)` log line).
+- Menu + mouse: fix for the stolen g_diMouse in 0.21.1 — confirm with the user.
