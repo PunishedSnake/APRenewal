@@ -64,3 +64,18 @@ game's native C++ classes (`AAP*`, `UAP*`).
 ### Shadows (0.10.0)
 - The shadow depth buffer is a 2048² R32F render-target texture regardless of MaxShadowResolution.
   SystemSettings are bound by name→field tables (e.g. around 0x498230); the 2048 clamp itself is not found yet.
+
+### Shaders and caches (user's files, 0.10.1 — not in the repo, they're Epic/Obsidian's)
+- The game ships its shader **source** (`Shaders/*.usf`, UE3 2008 + Obsidian `AP_*` files) and the
+  compiled caches: `GlobalShaderCache-PC-D3D-SM3.bin` (334 global shaders with CTAB, compiler
+  9.27.952.3022) and `RefShaderCache-PC-D3D-SM3.upk` (60 MB, material shaders). The game never calls
+  D3DXCompileShader (log: 0 calls) — everything comes from the caches via CreatePixelShader.
+- CTAB constant names identify each shader at creation time, e.g.:
+  - Final HDR→LDR blend (3 variants: bloom only `AP_BloomBlendPixelShader`, AP DOF+bloom+vignette,
+    Epic DOF/uber): constants HSBContrast, GammaColorScaleAndInverse, LensFilterImage, FilterColor…
+    It does `saturate(LinearColor)` → **hard clip of highlights**, then `sqrt` as a cheap gamma 2.0,
+    then brightness/contrast/colour filter. Scene colour range is [0, 4] (MAX_SCENE_COLOR).
+  - Shadow projection (`TBranchingPCFModProjectionPixelShader<Light, Quality, Manual/Hw/Fetch4 PCF>`,
+    modulated shadows): SampleOffsets / RefiningSampleOffsets / EdgeSampleOffsets / ShadowBufferSize,
+    all in texels of the 2048 map → with [Shadows] Scale they could be divided by the scale.
+- Packages: Arch_Glass.upk is a 109-byte stub; glass materials live in the material caches.

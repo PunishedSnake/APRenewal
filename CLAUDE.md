@@ -116,7 +116,9 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
 ## Game module (0.10.0, Steam exe addresses, all verified by bytes before patching)
 - Intro skip: movie player vtable slot 0x12173B0 = GameThreadPlayMovie 0x4E49F0 (thiscall, mode,
   name, startFrame; ret 0xC). Refused (return 0) until `g_worldEverSeen` (first HDR base pass in
-  BeforeHudOnSetRT). `-nomovie` would install the null player and kill in-game .sfd movies too.
+  BeforeHudOnSetRT) — not enough: the logos `slate_sega/obsidian/ap.sfd` (mode 0) start just after the
+  menu's first 3D frame, so 0.10.1 also skips by name prefix ([Game] SkipMovies=slate_). Loading movie =
+  `simple_loading_v02.sfd` (mode 129). User confirmed console + 4x shadows work (0.10.0). `-nomovie` would install the null player and kill in-game .sfd movies too.
 - Shadows: the shadow map is a square R32F RT texture (2048) + square depth buffer. With
   [Shadows] Scale they're created k× larger (CreateTexture 23 / CreateDS 29); while RT0 is the big
   shadow map, SetViewport 47 / GetViewport 48 / SetScissorRect 75 / GetScissorRect 76 / Clear rects

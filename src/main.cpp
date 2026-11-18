@@ -116,6 +116,7 @@ struct Config {
     int  hdrWindows    = 0;
     // game
     int  skipIntros    = 1;   // skip startup logo movies
+    char skipMovies[256] = "slate_";   // comma-separated name prefixes always skipped
     int  shadowScale   = 1;   // shadow map resolution multiplier (1, 2, 4)
     int  console       = 1;   // developer console in the menu   // HDR on native Windows (never got above SDR white there)
     int  hdrPaper      = 200;   // nits for UI / SDR white
@@ -197,6 +198,7 @@ static void LoadConfig()
     cfg.hdrEnable     = GetPrivateProfileIntA("HDR", "Enable", 0, g_ini);
     cfg.hdrWindows    = GetPrivateProfileIntA("HDR", "AllowWindows", 0, g_ini) ? 1 : 0;
     cfg.skipIntros    = GetPrivateProfileIntA("Game", "SkipIntros", 1, g_ini) ? 1 : 0;
+    GetPrivateProfileStringA("Game", "SkipMovies", "slate_", cfg.skipMovies, sizeof cfg.skipMovies, g_ini);
     cfg.console       = GetPrivateProfileIntA("Game", "Console", 1, g_ini) ? 1 : 0;
     cfg.shadowScale   = GetPrivateProfileIntA("Shadows", "Scale", 1, g_ini);
     if (cfg.shadowScale != 2 && cfg.shadowScale != 4) cfg.shadowScale = 1;
@@ -462,8 +464,16 @@ static int __thiscall hk_PlayMovie(void* self, int mode, const wchar_t* name, in
 {
     char n[160] = "";
     if (name) WideCharToMultiByte(CP_UTF8, 0, name, -1, n, sizeof n, nullptr, nullptr);
-    if (cfg.skipIntros && !g_worldEverSeen) {
-        Log("movie: '%s' (mode %d) skipped - startup movie", n, mode);
+    // The logos (slate_sega / slate_obsidian / slate_ap) start right after the main menu's 3D
+    // scene, so they are matched by name; anything before the first 3D scene is skipped too.
+    bool listed = false;
+    {
+        char list[256]; snprintf(list, sizeof list, "%s", cfg.skipMovies);
+        for (char* t = strtok(list, ", "); t && !listed; t = strtok(nullptr, ", "))
+            if (*t && !_strnicmp(n, t, strlen(t))) listed = true;
+    }
+    if (cfg.skipIntros && (listed || !g_worldEverSeen)) {
+        Log("movie: '%s' (mode %d) skipped - %s", n, mode, listed ? "intro logo" : "before the first 3D scene");
         return 0;
     }
     Log("movie: '%s' (mode %d) playing", n, mode);
@@ -3282,7 +3292,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.10.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.10.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -3860,7 +3870,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.10.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.10.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();
