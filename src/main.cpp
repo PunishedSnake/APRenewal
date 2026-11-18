@@ -149,7 +149,7 @@ struct Config {
     int  ssrLength   = 1500;  // max ray length, world units
     int  ssrFloor    = 70;    // surfaces whose normal points up at least this much (% of straight up)
     int  matEnable   = 1;     // tag skin / metal materials (by shader hash) for the effects below
-    int  sssStrength = 50;    // % screen-space subsurface scattering on skin
+    int  sssStrength = 40;    // % screen-space subsurface scattering on skin
     int  sssWidth    = 100;   // scatter width, % of ~1 cm
     int  metalRefl   = 25;    // % screen-space reflections on metal (weapons, metal props)
     int  ssrRough    = 40;    // % blur of floor reflections (roughness)
@@ -207,9 +207,9 @@ struct Config {
     int  motionBlurObj = 100; // % of the game's per-object motion blur (motionBlur = camera)
     int  aaMode        = 2;   // 0 FXAA, 1 FXAA quality, 2 SMAA
     int  taa           = 1;   // temporal stabiliser
-    int  taaBlend      = 85;  // % history kept per frame
+    int  taaBlend      = 75;  // % history kept per frame
     int  shafts        = 60;  // % light shafts from bright lamps / windows
-    int  shaftThr      = 150; // brightness threshold x100 (HDR)
+    int  shaftThr      = 250; // brightness threshold x100 (HDR)
     int  bokeh         = 1;   // round bokeh for the background blur of the game's DOF
     int  bokehSize     = 100; // %
     int  edgeAA        = 100; // the game's directional edge blur (inside its motion blur pass)
@@ -298,7 +298,7 @@ static void LoadConfig()
     cfg.ssrLength   = GetPrivateProfileIntA("Reflections", "Length", 1500, g_ini);
     cfg.ssrFloor    = GetPrivateProfileIntA("Reflections", "FloorsOnly", 70, g_ini);
     cfg.matEnable   = GetPrivateProfileIntA("Materials", "Enable", 1, g_ini) ? 1 : 0;
-    cfg.sssStrength = GetPrivateProfileIntA("Materials", "SkinScatter", 50, g_ini);
+    cfg.sssStrength = GetPrivateProfileIntA("Materials", "SkinScatter", 40, g_ini);
     cfg.sssWidth    = GetPrivateProfileIntA("Materials", "SkinScatterWidth", 100, g_ini);
     cfg.metalRefl   = GetPrivateProfileIntA("Materials", "MetalReflections", 25, g_ini);
     cfg.metalRough  = GetPrivateProfileIntA("Materials", "MetalRoughness", 50, g_ini);
@@ -354,9 +354,9 @@ static void LoadConfig()
     cfg.motionBlurObj = GetPrivateProfileIntA("Effects", "MotionBlurObjects", cfg.motionBlur, g_ini);
     cfg.aaMode        = GetPrivateProfileIntA("PostFX", "AAMode", GetPrivateProfileIntA("PostFX", "FXAAQuality", 1, g_ini) ? 2 : 0, g_ini);
     cfg.taa           = GetPrivateProfileIntA("PostFX", "TemporalAA", 1, g_ini) ? 1 : 0;
-    cfg.taaBlend      = GetPrivateProfileIntA("PostFX", "TemporalHistory", 85, g_ini);
+    cfg.taaBlend      = GetPrivateProfileIntA("PostFX", "TemporalHistory", 75, g_ini);
     cfg.shafts        = GetPrivateProfileIntA("Effects", "LightShafts", 60, g_ini);
-    cfg.shaftThr      = GetPrivateProfileIntA("Effects", "LightShaftThreshold", 150, g_ini);
+    cfg.shaftThr      = GetPrivateProfileIntA("Effects", "LightShaftThreshold", 250, g_ini);
     cfg.bokeh         = GetPrivateProfileIntA("Effects", "Bokeh", 1, g_ini) ? 1 : 0;
     cfg.bokehSize     = GetPrivateProfileIntA("Effects", "BokehSize", 100, g_ini);
     cfg.edgeAA        = GetPrivateProfileIntA("Effects", "GameEdgeAA", 100, g_ini);
@@ -1533,7 +1533,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
     float m = tex2Dlod(sMat, float4(uv, 0, 0)).r;
     if (m < 0.02) return c0;
     float d = LinD(uv);
-    float r = min(sp.z / max(d, 1), 48);            // 2 sigma (red) in pixels
+    float r = min(sp.z / max(d, 1), 12);            // 2 sigma (red) in pixels - a few mm on the face, never a smear
     float3 lc = c0.rgb * c0.rgb;
     float3 acc = lc, wsum = 1;
     const float3 isg = float3(1.0, 1.0 / (0.45 * 0.45), 1.0 / (0.25 * 0.25));
@@ -1550,7 +1550,13 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
         }
     }
     float3 b = acc / wsum;
-    return float4(sqrt(max(lerp(lc, b, saturate(sp.w * m)), 0)), c0.a);
+    float3 o = lerp(lc, b, saturate(sp.w * m));
+    // the blur runs on the finished image, so it would also smear the skin texture (pores, stubble,
+    // eyebrows). Put most of the original per-pixel brightness back: what remains is the colour of the
+    // scattering (red bleeding into shadow edges) and a gentle softening of the lighting.
+    const float3 L = float3(0.2126, 0.7152, 0.0722);
+    o *= lerp(1, dot(lc, L) / max(dot(o, L), 1e-5), 0.65);
+    return float4(sqrt(max(o, 0)), c0.a);
 }
 )HLSL";
 
@@ -1601,6 +1607,7 @@ static const char* kTaaPS = R"HLSL(
 sampler2D sCur  : register(s0);
 sampler2D sHist : register(s1);
 sampler2D sDepth : register(s2);
+sampler2D sMat : register(s3);    // r = skin: faces move on their own (talking, blinking) - less history there
 float4 rcpFrame : register(c0);
 float4 dP  : register(c6);
 float4 sw0 : register(c8);  float4 sw1 : register(c9);  float4 sw2 : register(c10); float4 sw3 : register(c11);
@@ -1639,6 +1646,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
     // less history when the pixel moved a lot (fast motion would smear)
     float mv = length((puv - uv) / b);
     float w = tp.x * tp.y * inside * saturate(1 - mv / 40);
+    w *= 1 - 0.75 * (tp.z > 0.5 ? tex2Dlod(sMat, float4(uv, 0, 0)).r : 0);
     return float4(FromYCoCg(lerp(ToYCoCg(c0.rgb), h, w)), c0.a);
 }
 )HLSL";
@@ -1647,7 +1655,8 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 // four light positions found on screen (brightest spots of a tiny max-map, read back a frame late).
 static const char* kShaftBrightPS = R"HLSL(
 sampler2D sHdr : register(s0);
-float4 sp : register(c1);   // x threshold, yz source texel
+sampler2D sMat : register(s1);   // brightly lit faces are not light sources
+float4 sp : register(c1);   // x threshold, yz source texel, w material mask valid
 float4 main(float2 uv : TEXCOORD0) : COLOR0
 {
     float3 c = 0;
@@ -1657,7 +1666,8 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
     }
     c *= 0.25;
     float l = dot(c, float3(0.2126, 0.7152, 0.0722));
-    return float4(c * saturate((l - sp.x) / max(sp.x, 0.01)), 1);
+    float skin = sp.w > 0.5 ? tex2Dlod(sMat, float4(uv, 0, 0)).r : 0;
+    return float4(c * saturate((l - sp.x) / max(sp.x, 0.01)) * (1 - skin), 1);
 }
 )HLSL";
 static const char* kShaftMaxPS = R"HLSL(
@@ -2507,7 +2517,7 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
             dev->SetTexture(2, g_matMask);
             for (int pass = 0; pass < 2; pass++) {
                 const float c7[4] = { pass ? 0.0f : 1.0f / bd.Width, pass ? 1.0f / bd.Height : 0.0f,
-                                      1.0f * std::max(cfg.sssWidth, 10) / 100.0f * focal, std::max(cfg.sssStrength, 0) / 100.0f };
+                                      0.2f * std::max(cfg.sssWidth, 10) / 100.0f * focal, std::max(cfg.sssStrength, 0) / 100.0f };
                 dev->SetPixelShaderConstantF(7, c7, 1);
                 IDirect3DSurface9* o = nextOut(&outTex);
                 DrawFullscreen(dev, cur, o, g_fx.psSSS);
@@ -2560,9 +2570,11 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
                 D3DSURFACE_DESC hd; g_prevHdr->GetLevelDesc(0, &hd);
                 const float hpq[4] = { -1.0f / qw, 1.0f / qh, 0, 0 };
                 dev->SetVertexShaderConstantF(0, hpq, 1);
-                const float b1[4] = { cfg.shaftThr / 100.0f, 1.0f / hd.Width, 1.0f / hd.Height, 0 };
+                const float b1[4] = { cfg.shaftThr / 100.0f, 1.0f / hd.Width, 1.0f / hd.Height, matOk ? 1.0f : 0.0f };
                 dev->SetPixelShaderConstantF(1, b1, 1);
+                dev->SetTexture(1, matOk ? (IDirect3DBaseTexture9*)g_matMask : nullptr);
                 DrawFullscreen(dev, g_prevHdr, sA, g_fx.psShB);                       // bright areas, quarter res
+                dev->SetTexture(1, nullptr);
                 const float hpt[4] = { -1.0f / 32, 1.0f / 18, 0, 0 };
                 dev->SetVertexShaderConstantF(0, hpt, 1);
                 const float m1[4] = { 1.0f / qw, 1.0f / qh, 1.0f / 32, 1.0f / 18 };
@@ -2654,15 +2666,17 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
             for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) c[8 + i][j] = A[i][j];
             for (int j = 0; j < 3; j++) c[11][j] = cam[j];
             memcpy(c[12], g_taaVp, sizeof g_taaVp);
-            c[16][0] = std::min(std::max(cfg.taaBlend, 0), 97) / 100.0f; c[16][1] = histOk ? 1.0f : 0.0f;
+            c[16][0] = std::min(std::max(cfg.taaBlend, 0), 97) / 100.0f; c[16][1] = histOk ? 1.0f : 0.0f; c[16][2] = matOk ? 1.0f : 0.0f;
             dev->SetPixelShaderConstantF(6, c[6], 1);
             dev->SetPixelShaderConstantF(8, c[8], 9);
             SamplerSet(dev, 1, D3DTEXF_LINEAR); SamplerSet(dev, 2, D3DTEXF_POINT);
             dev->SetTexture(1, g_fx.taaHist);
             dev->SetTexture(2, precise ? (IDirect3DBaseTexture9*)g_fx.zcopy : g_fx.depth);
+            SamplerSet(dev, 3, D3DTEXF_POINT);
+            dev->SetTexture(3, matOk ? (IDirect3DBaseTexture9*)g_matMask : nullptr);
             IDirect3DSurface9* o = nextOut(&outTex);
             DrawFullscreen(dev, cur, o, g_fx.psTaa);
-            dev->SetTexture(1, nullptr); dev->SetTexture(2, nullptr);
+            dev->SetTexture(1, nullptr); dev->SetTexture(2, nullptr); dev->SetTexture(3, nullptr);
             SamplerSet(dev, 1, D3DTEXF_POINT);
             IDirect3DSurface9* hs = nullptr;
             if (g_fx.taaHist && SUCCEEDED(g_fx.taaHist->GetSurfaceLevel(0, &hs))) {
@@ -4193,7 +4207,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.18.0") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.18.1") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4202,7 +4216,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.18.0", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.18.1", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -5673,7 +5687,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.18.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.18.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -6443,7 +6457,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.18.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.18.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

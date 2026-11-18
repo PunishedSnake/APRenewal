@@ -299,6 +299,11 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
     if its own CoC × radius reaches it, highlight weight 1 + 4·lum². apTM4.z radius px, .w boost.
   - Motion blur: StaticVelocityParameters = camera ([Effects] MotionBlur), Dynamic = objects (MotionBlurObjects).
   - Census logs UniformScalar_N / UniformVector_N values at each shader's first draw (`census:     values`).
+  - 0.18.1 (user: faces "way too smooth and blurry"): SSS radius was width x focal / depth with width
+    1 unit → ~40 px at close-up (capped 48) and blurred albedo too. Now 0.2 x width x focal / depth, cap
+    12 px, and 65 % of the per-pixel luminance restored after the blend (keeps texture, keeps the red
+    terminator bleed). TAA history × (1 − 0.75·skin) via mask on s3, default 75. Shaft bright pass
+    excludes skin (mask s1), threshold 2.5.
   - Still to do (part 2): weapon master + skin sheen rebuild (needs a values census near a weapon /
     face), dixi absorption (user's dixi.ini: Sony pads via DirectInput, button/axis remaps; dixi exposes
     them as XInput), HUD/subtitle scale (Scaleform canvas RE), 120 fps physics check.

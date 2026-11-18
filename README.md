@@ -1,4 +1,4 @@
-# APRenewal 0.18.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.18.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,16 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.18.1
+- **Faces are sharp again.** The skin scattering blur was far too wide up close (up to 48 px on a
+  close-up face) and it blurred the finished image, skin texture included. It's now a few millimetres
+  (max 12 px), and most of each pixel's original brightness is put back, so pores, stubble and
+  eyebrows stay crisp - what's left is the red glow at shadow edges. Default strength 40 %.
+- Temporal stabiliser: less history on skin (talking and blinking faces move on their own, which
+  camera reprojection can't follow) and a lower default (75 %).
+- Light shafts: brightly lit faces no longer count as light sources (that made the soft glow around
+  faces in cutscenes); default threshold 2.5.
 
 ## New in 0.18.0
 - **Anisotropic filtering** (`[Textures]`, Image tab): 16x on the game's material textures, plus an
