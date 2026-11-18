@@ -1,10 +1,10 @@
-# APRenewal 0.8.3 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.9 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
 | Slot | Who owns it |
 |---|---|
-| `winmm.dll` | AlphaProtocolFixer (FOV / HUD / widescreen) |
+| `winmm.dll` (AlphaFixer, not needed from 0.9) | AlphaProtocolFixer (FOV / HUD / widescreen) |
 | `dinput8.dll`, `xinput1_3.dll` | GOG "dixi" input wrapper |
 | `d3d9.dll` | **APRenewal** |
 | `OpenAL32.dll` | **OpenAL Soft 1.25.2** (optional, replaces Creative's router; for HRTF) |
@@ -12,6 +12,17 @@ A research-and-fix base layer. It sits alongside the mods you already have:
 ## Install
 Copy `d3d9.dll` + `APRenewal.ini` into `Alpha Protocol\Binaries\`. Uninstall = delete both.
 The log goes to `Binaries\APRenewal\APRenewal.log`.
+
+## New in 0.9
+- **AlphaFixer is no longer needed.** Delete `winmm.dll` and `AlphaFixer.ini` from Binaries;
+  APRenewal does its job (menu: View tab, ini: `[View]`), and does it differently:
+  - FOV is scaled per camera module, live, from the size the game is actually rendering at.
+    AlphaFixer overwrote every module with one fixed number worked out at startup, which flattened
+    aim/zoom FOV changes. The FOV factor (default 120%, AlphaFixer's 1.20) now changes live.
+  - HUD and menu width follow the real render size, so supersampling no longer squeezes them.
+    On 16:9 they are left alone; wider screens get a centred 16:9 HUD and menus.
+  - AO now uses the game's live camera FOV instead of a fixed 85 degrees (`[AO] FOVAuto`).
+  - If winmm.dll is still there, APRenewal leaves FOV/HUD alone and says so in the log.
 
 ## New in 0.8.3
 - HDR: found the oversaturation. DXVK's log shows Vulkan never offered HDR colour spaces

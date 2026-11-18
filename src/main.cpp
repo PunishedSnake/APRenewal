@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <initializer_list>
 #ifndef DI_OK
 #define DI_OK S_OK
 #endif
@@ -111,7 +112,12 @@ struct Config {
     int  hdrHighlights = 100;   // percent highlight expansion
     int  hdrEncoding   = 1;     // 0 = HDR10 (PQ, Rec.2020) - we do the conversion; 1 = scRGB - DXVK converts
     // audio
-    int  hrtf          = 1;     // 0 off, 1 on (headphones), 2 leave to OpenAL    // apply PostFX to the finished world image, before the UI is drawn
+    int  hrtf          = 1;     // 0 off, 1 on (headphones), 2 leave to OpenAL
+    // view (replaces AlphaFixer)
+    int  viewEnable    = 1;
+    int  fovScale      = 120;   // percent on top of Hor+ (AlphaFixer's FOVFactor 1.20)
+    int  hudLimit      = 1;     // keep HUD and menus 16:9 on wider screens
+    int  aoFovAuto     = 1;     // AO follows the game's live FOV    // apply PostFX to the finished world image, before the UI is drawn
 } cfg;
 
 static void Log(const char* fmt, ...)
@@ -180,6 +186,19 @@ static void LoadConfig()
     cfg.hdrEncoding   = GetPrivateProfileIntA("HDR", "Encoding", 1, g_ini) ? 1 : 0;
     if (cfg.hdrPaper < 80) cfg.hdrPaper = 80;
     cfg.hrtf          = GetPrivateProfileIntA("Audio", "HRTF", 1, g_ini);
+    {
+        // first run after AlphaFixer: take its FOVFactor as our default
+        int def = 120;
+        char af[MAX_PATH]; PathJoin(af, g_dir, "AlphaFixer.ini");
+        char v[32] = "";
+        if (GetPrivateProfileStringA("Settings", "FOVFactor", "", v, sizeof v, af) && v[0]) def = (int)(atof(v) * 100 + 0.5);
+        cfg.fovScale = GetPrivateProfileIntA("View", "FOVFactor", def, g_ini);
+    }
+    if (cfg.fovScale < 50) cfg.fovScale = 50;
+    if (cfg.fovScale > 200) cfg.fovScale = 200;
+    cfg.viewEnable = GetPrivateProfileIntA("View", "Enable", 1, g_ini);
+    cfg.hudLimit   = GetPrivateProfileIntA("View", "HUD169", 1, g_ini);
+    cfg.aoFovAuto  = GetPrivateProfileIntA("AO", "FOVAuto", 1, g_ini);
     if (cfg.hrtf < 0 || cfg.hrtf > 2) cfg.hrtf = 1;
     if (cfg.aoFov < 30) cfg.aoFov = 30;
     if (cfg.aoFov > 150) cfg.aoFov = 150;
@@ -231,6 +250,164 @@ static void* PatchIAT(void** slot, void* hook)
     *slot = hook;
     VirtualProtect(slot, sizeof(void*), old, &old);
     return orig;
+}
+
+// --------------------------------------------------------------------------
+// View: FOV and HUD aspect (replaces AlphaFixer / winmm.dll)
+//
+// AlphaFixer overwrote every camera module's FOV with one fixed value computed at startup from
+// AlphaFixer.ini (or the desktop resolution), and forced the HUD/menu width to that same
+// resolution. That flattens zoom/aim FOV changes and breaks as soon as the render size differs
+// from the desktop (supersampling). Here the game's own values are scaled live, per module, from
+// the size the game is actually rendering at, and the FOV factor can change from the menu.
+// --------------------------------------------------------------------------
+struct HookRegs { DWORD edi, esi, ebp, esp, ebx, edx, ecx, eax; };   // pushad layout
+typedef void (__cdecl *HookFn)(HookRegs*);
+
+static BYTE* FindPattern(const char* pat)
+{
+    HMODULE exe = GetModuleHandleA(nullptr);
+    auto nt = (IMAGE_NT_HEADERS*)((BYTE*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    BYTE* start = nullptr; size_t size = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if (!memcmp(sec[i].Name, ".text", 5)) { start = (BYTE*)exe + sec[i].VirtualAddress; size = sec[i].Misc.VirtualSize; }
+    if (!start) return nullptr;
+    int bytes[64], n = 0;
+    for (const char* p = pat; *p && n < 64; ) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        if (*p == '?') { bytes[n++] = -1; while (*p == '?') p++; }
+        else { bytes[n++] = (int)strtoul(p, (char**)&p, 16); }
+    }
+    for (size_t i = 0; i + n <= size; i++) {
+        int k = 0;
+        while (k < n && (bytes[k] < 0 || start[i + k] == bytes[k])) k++;
+        if (k == n) return start + i;
+    }
+    return nullptr;
+}
+
+// Mid-function hook: `len` bytes at `site` (whole instructions, no relative operands) are replaced
+// by a jump to a stub that saves flags, general and XMM registers, calls fn(&regs) (fn may edit the
+// registers), restores everything, runs `repl` (or the original bytes) and jumps back.
+static bool MidHook(BYTE* site, size_t len, const BYTE* expect, HookFn fn, const BYTE* repl = nullptr, size_t replLen = 0)
+{
+    if (!site || len < 5 || memcmp(site, expect, len) != 0) return false;
+    static BYTE* pool = nullptr; static size_t used = 0;
+    if (!pool) pool = (BYTE*)VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!pool || used + 160 > 4096) return false;
+    BYTE* s = pool + used; BYTE* p = s;
+    auto put = [&](std::initializer_list<int> b) { for (int x : b) *p++ = (BYTE)x; };
+    auto rel = [&](BYTE op, const void* to) { *p++ = op; *(int32_t*)p = (int32_t)((BYTE*)to - (p + 4)); p += 4; };
+    put({ 0x9C, 0x60 });                                   // pushfd; pushad
+    put({ 0x81, 0xEC, 0x80, 0, 0, 0 });                    // sub esp, 0x80
+    for (int i = 0; i < 8; i++) put({ 0xF3, 0x0F, 0x7F, 0x44 | (i << 3), 0x24, i * 16 });   // movdqu [esp+i*16], xmmi
+    put({ 0x8D, 0x84, 0x24, 0x80, 0, 0, 0, 0x50 });        // lea eax, [esp+0x80]; push eax
+    rel(0xE8, (void*)fn);                                  // call fn
+    put({ 0x83, 0xC4, 0x04 });                             // add esp, 4
+    for (int i = 0; i < 8; i++) put({ 0xF3, 0x0F, 0x6F, 0x44 | (i << 3), 0x24, i * 16 });   // movdqu xmmi, [esp+i*16]
+    put({ 0x81, 0xC4, 0x80, 0, 0, 0, 0x61, 0x9D });        // add esp, 0x80; popad; popfd
+    if (repl) { memcpy(p, repl, replLen); p += replLen; } else { memcpy(p, site, len); p += len; }
+    rel(0xE9, site + len);                                 // jmp back
+    used += (size_t)(p - s + 15) & ~(size_t)15;
+    DWORD old;
+    VirtualProtect(site, len, PAGE_EXECUTE_READWRITE, &old);
+    site[0] = 0xE9; *(int32_t*)(site + 1) = (int32_t)(s - (site + 5));
+    for (size_t i = 5; i < len; i++) site[i] = 0x90;
+    VirtualProtect(site, len, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, len);
+    return true;
+}
+
+static float g_fovScratch = 0;          // the scaled module FOV the game's mulss reads instead of its own
+static volatile float g_gameFov = 0;    // last blended camera FOV (horizontal, degrees) - AO uses it
+static volatile DWORD g_gameFovTick = 0;
+static bool  g_viewHooks = false;
+static int   g_viewSites = 0;
+
+static float ViewAspect()
+{
+    return (g_ppW && g_ppH) ? (float)g_ppW / (float)g_ppH : 16.0f / 9.0f;
+}
+
+// Hor+ with a user factor: keep the game's vertical extent for 16:9, widen for wider screens.
+static float ScaleFov(float deg)
+{
+    if (!(deg > 1.0f && deg < 170.0f)) return deg;
+    const float k = (cfg.fovScale / 100.0f) * (ViewAspect() / (16.0f / 9.0f));
+    if (k > 0.999f && k < 1.001f) return deg;
+    float r = 2.0f * atanf(tanf(deg * 0.5f * 3.14159265f / 180.0f) * k) * 180.0f / 3.14159265f;
+    return r < 170.0f ? r : 170.0f;
+}
+
+// at `mulss xmm0, [eax+0x10C]` inside the camera-module FOV blend: feed it the scaled module FOV
+static void __cdecl View_ModuleFov(HookRegs* r)
+{
+    const float f = *(const float*)(r->eax + 0x10C);
+    g_fovScratch = cfg.viewEnable ? ScaleFov(f) : f;
+}
+// at the blend's `fld [esp+8]` return: remember the final FOV
+static void __cdecl View_BlendResult(HookRegs* r)
+{
+    const float f = *(const float*)(r->esp + 4 + 8);
+    if (f > 10.0f && f < 170.0f) { g_gameFov = f; g_gameFovTick = GetTickCount(); }
+}
+// HUD canvas setup: ecx = width, eax = height, esi = left. Wider than 16:9 -> centred 16:9 HUD.
+static void __cdecl View_Hud(HookRegs* r)
+{
+    if (!cfg.viewEnable || !cfg.hudLimit) return;
+    const int w = (int)r->ecx, h = (int)r->eax;
+    if (w <= 0 || h <= 0 || w * 9 <= h * 16 + 16) return;
+    const int nw = (h * 16 + 8) / 9;
+    r->esi += (w - nw) / 2;
+    r->ecx = (DWORD)nw;
+}
+// Menu viewport size query: eax = width just returned by the viewport
+static void __cdecl View_Menu(HookRegs* r)
+{
+    if (!cfg.viewEnable || !cfg.hudLimit) return;
+    const int w = (int)r->eax, h = (int)g_ppH;
+    if (w <= 0 || h <= 0 || w * 9 <= h * 16 + 16) return;
+    r->eax = (DWORD)((h * 16 + 8) / 9);
+}
+
+static void InstallViewHooks()
+{
+    char path[MAX_PATH] = "";
+    if (HMODULE wm = GetModuleHandleA("winmm.dll")) {
+        GetModuleFileNameA(wm, path, MAX_PATH);
+        if (!_strnicmp(path, g_dir, strlen(g_dir))) {
+            Log("view: AlphaFixer (%s) is still installed - FOV/HUD handling left to it. Delete winmm.dll "
+                "and AlphaFixer.ini to use APRenewal's.", path);
+            return;
+        }
+    }
+    // FOV: per camera module, non-destructive
+    static const BYTE fovOrig[8] = { 0xF3, 0x0F, 0x59, 0x80, 0x0C, 0x01, 0x00, 0x00 };   // mulss xmm0,[eax+10Ch]
+    BYTE* fov = FindPattern("F3 0F 59 80 0C 01 00 00 09 98 10 01 00 00");
+    BYTE repl[8] = { 0xF3, 0x0F, 0x59, 0x05 };                                            // mulss xmm0,[g_fovScratch]
+    *(float**)(repl + 4) = &g_fovScratch;
+    if (MidHook(fov, 8, fovOrig, View_ModuleFov, repl, 8)) g_viewSites |= 1;
+    // FOV: blend result (same function, after the loop: fld [esp+8]; pop esi)
+    static const BYTE resOrig[5] = { 0xD9, 0x44, 0x24, 0x08, 0x5E };
+    if (fov) {
+        BYTE* res = nullptr;
+        for (BYTE* q = fov; q < fov + 0x60; q++) if (!memcmp(q, resOrig, 5)) { res = q; break; }
+        if (MidHook(res, 5, resOrig, View_BlendResult)) g_viewSites |= 2;
+    }
+    // HUD canvas
+    static const BYTE hudOrig[6] = { 0x89, 0x4B, 0x64, 0x89, 0x43, 0x68 };
+    BYTE* hud = FindPattern("89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50");
+    if (MidHook(hud ? hud + 9 : nullptr, 6, hudOrig, View_Hud)) g_viewSites |= 4;
+    // menu viewport
+    static const BYTE menuOrig[6] = { 0x85, 0xC0, 0x89, 0x44, 0x24, 0x08 };
+    BYTE* menu = FindPattern("FF D2 85 C0 89 44 24 08 DB 44 24 08");
+    if (MidHook(menu ? menu + 2 : nullptr, 6, menuOrig, View_Menu)) g_viewSites |= 8;
+    g_viewHooks = g_viewSites != 0;
+    Log("view: hooks - module FOV %s, FOV readback %s, HUD %s, menu %s (FOV factor %d%%)",
+        (g_viewSites & 1) ? "ok" : "NOT FOUND", (g_viewSites & 2) ? "ok" : "NOT FOUND",
+        (g_viewSites & 4) ? "ok" : "NOT FOUND", (g_viewSites & 8) ? "ok" : "NOT FOUND", cfg.fovScale);
 }
 
 // --------------------------------------------------------------------------
@@ -1203,7 +1380,8 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
         IDirect3DTexture9* outTex = nullptr;
 
         if (doAO) {
-            const float tx = tanf(cfg.aoFov * 0.5f * 3.14159265f / 180.0f);
+            const bool liveFov = cfg.aoFovAuto && g_gameFov > 10.0f && GetTickCount() - g_gameFovTick < 2000;
+            const float tx = tanf((liveFov ? g_gameFov : (float)cfg.aoFov) * 0.5f * 3.14159265f / 180.0f);
             const float c2[4] = { tx, tx * bd.Height / bd.Width, (float)cfg.aoRadius, cfg.aoIntensity / 100.0f };
             const float c3[4] = { 0.2f, (float)cfg.aoMaxDist, cfg.aoMaxDist * 0.6f, (float)bd.Width / bd.Height };
             const float c4[4] = { g_fx.aoMode == 2 ? 1.0f : 0.0f, cfg.aoProtect / 100.0f, 0, 0 };
@@ -2591,6 +2769,10 @@ static bool SaveConfig()
     WriteIniInt("HDR", "Highlights", cfg.hdrHighlights);
     WriteIniInt("HDR", "Encoding", cfg.hdrEncoding);
     WriteIniInt("Audio", "HRTF", cfg.hrtf);
+    WriteIniInt("View", "Enable", cfg.viewEnable);
+    WriteIniInt("View", "FOVFactor", cfg.fovScale);
+    WriteIniInt("View", "HUD169", cfg.hudLimit);
+    WriteIniInt("AO", "FOVAuto", cfg.aoFovAuto);
     if (g_saveFailures) Log("menu: save finished with %d failure(s) - %s", g_saveFailures, g_ini);
     else Log("menu: settings saved and verified - %s", g_ini);
     return g_saveFailures == 0;
@@ -2671,7 +2853,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.8.3", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.9", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -2717,6 +2899,17 @@ static void DrawMenu()
             ImGui::TextDisabled("Highlights come from the game's own HDR scene buffer; the HUD stays at paper white.");
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("View")) {
+            CheckboxInt("FOV and HUD fixes (replaces AlphaFixer)", &cfg.viewEnable);
+            ImGui::SliderInt("Field of view", &cfg.fovScale, 50, 200, "%d %%");
+            CheckboxInt("Keep HUD and menus 16:9 on wider screens", &cfg.hudLimit);
+            if (!g_viewHooks) ImGui::TextDisabled("Not active - see the log (AlphaFixer's winmm.dll still installed?)");
+            else {
+                ImGui::TextDisabled("Rendering %ux%u (aspect %.3f). Game FOV now: %.1f deg", g_ppW, g_ppH, ViewAspect(), g_gameFov);
+                ImGui::TextDisabled("Applies live. 100%% = the game's own FOV (widened for wider screens).");
+            }
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Audio")) {
             static const char* hm[] = { "Off", "On (headphones)", "Leave to OpenAL / alsoft.ini" };
             if (ImGui::Combo("HRTF 3D audio", &cfg.hrtf, hm, 3)) AlApplyHrtf();
@@ -2735,7 +2928,9 @@ static void DrawMenu()
             ImGui::Combo("Mode (F10)", &g_fx.aoMode, modes, 3);
             ImGui::SliderInt("Intensity", &cfg.aoIntensity, 0, 200, "%d %%");
             ImGui::SliderInt("Radius", &cfg.aoRadius, 5, 150, "%d units");
-            ImGui::SliderInt("Field of view", &cfg.aoFov, 50, 120, "%d deg");
+            CheckboxInt("Follow the game's field of view", &cfg.aoFovAuto);
+            if (!cfg.aoFovAuto || !(g_viewSites & 2)) ImGui::SliderInt("Field of view", &cfg.aoFov, 50, 120, "%d deg");
+            else ImGui::TextDisabled("Live FOV: %.1f deg", g_gameFov);
             ImGui::SliderInt("Max distance", &cfg.aoMaxDist, 500, 20000, "%d units");
             ImGui::SliderInt("Near fade", &cfg.aoNear, 0, 200, "%d units");
             ImGui::SliderInt("Protect highlights", &cfg.aoProtect, 0, 100, "%d %%");
@@ -3152,13 +3347,14 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.8.3 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.9 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         ApplySavedToggles();
         InstallInputHooks();   // DirectInput / XInput imports, so the menu can capture input
         InstallSupersampling(); // must run before the game reads its command line
         InstallAudioHook();
+        InstallViewHooks();
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_cursorClipped) ClipCursor(nullptr);
         Log("shutdown. total D3DXCompileShader calls: %ld", g_compileCount);

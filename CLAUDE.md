@@ -17,8 +17,13 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   Bump the version string (`"APRenewal X.Y.Z"`, two places) and add a "New in" README section.
 
 ## The user's setup (stack order matters)
-- `winmm.dll` = **AlphaFixer** (FOV factor, HUD width / aspect; reads `AlphaFixer.ini` Width/Height,
-  0 = desktop resolution — so it computes HUD maths for the *desktop*, not the render size).
+- `winmm.dll` = **AlphaFixer** — replaced by our View module in 0.9; user is told to delete it.
+  It was an alphayellow1-style fix (spdlog/safetyhook, source not public). Reversed: three safetyhook
+  mid-hooks — FOV (`F3 0F 59 80 0C 01 00 00 09 98 10 01 00 00`, wrote a fixed HFOV =
+  2·atan(tan(37.5°)·FOVFactor·aspect/(16/9)) into every camera module's +0x10C), HUD canvas
+  (`89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50` at +9: ecx = width, esi = left), menu viewport
+  (`FF D2 85 C0 89 44 24 08 DB 44 24 08` at +2: eax = width; first of 3 matches). HUD width came from
+  AlphaFixer.ini or the desktop — that broke supersampling.
 - `dinput8.dll` / `xinput1_3.dll` = GOG "dixi" controller remapper (`dixi.ini`).
 - MulderConfig launcher edits `APEngine.ini` etc. (`MulderConfig.json`, save file must list every group).
 - `d3d9.dll` = APRenewal, chain-loads `RealD3D9=` (user runs DXVK as `d3d9_dxvk.dll`).
@@ -26,6 +31,12 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
 - RTX 4080 SUPER + AMD iGPU, 2560x1440 desktop, 400-nit HDR display, headphones on a Burson DAC.
 
 ## Hooks (where things are)
+- Code patches: `MidHook(site, len, expect, fn, repl)` — our own mid-function hook (pushfd/pushad/
+  XMM save, `fn(HookRegs*)` may edit registers, then original or replacement bytes, jmp back).
+  Sites must be whole instructions without relative operands; `expect` bytes are verified first.
+  View module (`InstallViewHooks`): FOV blend function at 0xA8F020 in the Steam exe — per-module
+  FOV scaled via a replacement `mulss xmm0,[g_fovScratch]`, blended result read at its `fld [esp+8]`
+  (feeds AO's FOV); HUD and menu hooks only act when wider than 16:9.
 - Proxy exports Direct3DCreate9/Ex + D3DPERF_*. IAT hooks on APGame.exe: D3DXCompileShader, QPC,
   GetTickCount, PeekMessageW (focus pause parks the main thread here — never freeze the clock
   globally: UE3's frame limiter spins on it), DirectInput8Create, XInputGetState (ordinal 2),
@@ -59,7 +70,7 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
 - **SSAA** (`RenderScale`): game renders at scale × desktop via `-ResX/-ResY`, window stays at monitor
   size (WM_WINDOWPOSCHANGING clamp, WM_SIZE + mouse lParam rewrite), Mitchell downscale at Present
   into the backbuffer corner, presented with a source rect (swap effect COPY).
-  Open issue: AlphaFixer computes HUD width from AlphaFixer.ini / desktop res, not render res.
+  (AlphaFixer forced HUD/menu width to the desktop res — gone with the View module.)
 - **HDR**: DXVK only. `ID3D9VkExtInterface::UnlockAdditionalFormats` → fp16 backbuffer;
   `ID3D9VkExtSwapchain::SetColorSpace(scRGB)`. Highlight expansion runs right after the game's
   world→backbuffer copy (before UI), from the HDR scene buffer with an auto-fitted exposure; encode
@@ -77,5 +88,5 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   blocky pants). Parked.
 
 ## Ideas queued
-- Absorb AlphaFixer (FOV + HUD aspect) so it can follow the render size; maybe dixi too.
+- Maybe absorb dixi (controller remapping) too.
 - Shader bytecode replacement, better window glass, physics check at 120 fps.
