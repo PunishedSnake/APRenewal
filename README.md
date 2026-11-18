@@ -68,6 +68,7 @@ Steam Input handles the controller.
 - **No pop-in:** occlusion culling turned off, longer draw and detail distances.
 - **Developer console** in the menu, including Alpha Protocol's own rendering commands.
 - **Raw mouse:** Unreal's mouse smoothing switched off for direct 1:1 aiming.
+- **UI text scale:** bigger subtitles, HUD and menu text at high resolutions.
 - **Pause on focus loss:** game and dialogue timers stop while you alt-tab. Also keeps the cursor
   inside the window.
 
@@ -78,6 +79,8 @@ Steam Input handles the controller.
   - Other **DirectInput** pads: Switch Pro, DualShock 3, Logitech, PS2 adapters, generic, with your own
     maps in the ini
 - **Switches automatically** between gamepad and keyboard + mouse, depending on what you touched last.
+- **PlayStation button prompts** while a DualSense / DualShock 4 is in use, using the PS3 prompt art the game
+  itself ships (Xbox prompts come back the moment the Xbox pad is used).
 - Rumble strength, extra dead zone, Swap A/B and free button remapping.
 
 ### Audio

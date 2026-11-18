@@ -598,6 +598,20 @@ static void PadMergeStick(SHORT& dx, SHORT& dy, SHORT sx, SHORT sy)
     if ((int)sx * sx + (int)sy * sy > (int)dx * dx + (int)dy * dy) { dx = sx; dy = sy; }
 }
 
+// for the button prompts: last real input from a Sony pad vs. any other pad
+static volatile DWORD g_lastSonyAct = 0, g_lastOtherAct = 0;
+static volatile bool g_sonyConnected = false;
+static bool g_xiActive = false;
+// PlayStation prompts: forced by [Controller] ButtonIcons=2, never with 1; automatic otherwise - a Sony pad
+// gave the latest input (Steam Input / DS4Windows mirror it as an Xbox pad at the same moment: ties go to Sony)
+static bool PadIconsPS()
+{
+    if (cfg.btnIcons == 1) return false;
+    if (cfg.btnIcons == 2) return true;
+    const DWORD s = g_lastSonyAct, o = g_lastOtherAct;
+    if (!s) return g_sonyConnected && !o;
+    return !o || (LONG)(s - o) >= -500;
+}
 // returns false when nothing is connected
 static bool PadRead(XIGamepad& g)
 {
@@ -609,6 +623,7 @@ static bool PadRead(XIGamepad& g)
         PadMergeStick(m.lx, m.ly, s.lx, s.ly); PadMergeStick(m.rx, m.ry, s.rx, s.ry);
         any = true;
     };
+    g_xiActive = false;
     if (g_xiGet && (g_padCfg.xinput || !g_padCfg.enable)) {
         const DWORD now = GetTickCount();
         for (DWORD i = 0; i < 4; i++) {
@@ -619,6 +634,7 @@ static bool PadRead(XIGamepad& g)
             if (!g_xiConn[i]) { g_xiRetry[i] = now ? now : 1; continue; }
             PadState p = { s.Gamepad.wButtons, s.Gamepad.bLeftTrigger, s.Gamepad.bRightTrigger,
                            s.Gamepad.sThumbLX, s.Gamepad.sThumbLY, s.Gamepad.sThumbRX, s.Gamepad.sThumbRY };
+            if (p.buttons || p.lt > 40 || p.rt > 40 || abs(p.lx) > 8000 || abs(p.ly) > 8000 || abs(p.rx) > 8000 || abs(p.ry) > 8000) g_xiActive = true;
             add(p);
         }
     }
@@ -631,6 +647,18 @@ static bool PadRead(XIGamepad& g)
     }
     if (!any) return false;
     PadApplyRemap(m.buttons);
+    // which kind of pad is in use (button prompts): the last one with real input
+    {
+        auto active = [](const PadState& s) { return s.buttons || s.lt > 40 || s.rt > 40 || abs(s.lx) > 8000 || abs(s.ly) > 8000 || abs(s.rx) > 8000 || abs(s.ry) > 8000; };
+        const DWORD now = GetTickCount();
+        bool sonyConn = false;
+        AcquireSRWLockShared(&g_padLock);
+        for (auto& d : g_sony) if (d.alive) { sonyConn = true; if (d.tick && now - d.tick < 1500 && active(d.st)) g_lastSonyAct = now; }
+        for (int i = 0; i < g_diN; i++) if (g_diDev[i].ok && active(g_diDev[i].st)) g_lastOtherAct = now;
+        ReleaseSRWLockShared(&g_padLock);
+        if (g_xiActive) g_lastOtherAct = now;
+        g_sonyConnected = sonyConn;
+    }
     PadDeadzone(m.lx, m.ly); PadDeadzone(m.rx, m.ry);
     g = { m.buttons, m.lt, m.rt, m.lx, m.ly, m.rx, m.ry };
     return true;

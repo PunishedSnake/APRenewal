@@ -33,6 +33,7 @@
 #include "matclass.h"
 #include "smaa.h"
 #include "specregs.h"
+#include "buttonicons.h"
 #include <cctype>
 #include "imgui/imgui_impl_dx9.h"
 
@@ -134,6 +135,8 @@ struct Config {
     int  shOverride = 1;
     int  shaderCache = 1;    // compiled shaders cached on disk (APRenewal\shadercache)
     int  rawMouse   = 1;     // turn off UE3's mouse smoothing (1:1 aim)
+    int  uiTextScale = 100;  // % scale of all UI text (UIStyle_Text.Scale; HUD, subtitles, menus)
+    int  btnIcons   = 0;     // gamepad prompts: 0 auto (PlayStation art while a Sony pad is in use), 1 Xbox, 2 PlayStation
     int  compiler   = 0;     // our shaders: 0 auto (Windows' d3dcompiler_47, else the game's), 1 d3dcompiler_47, 2 the game's D3DX
     int  verbose    = 0;
     int  captureFloatDDS = 1;   // save float/16-bit targets losslessly as .dds
@@ -285,6 +288,8 @@ static void LoadConfig()
     cfg.shLog      = GetPrivateProfileIntA("Shaders", "LogCompiles", 1, g_ini);
     cfg.shaderCache = GetPrivateProfileIntA("Shaders", "DiskCache", 1, g_ini) ? 1 : 0;
     cfg.rawMouse   = GetPrivateProfileIntA("Game", "RawMouse", 1, g_ini) ? 1 : 0;
+    cfg.uiTextScale = std::min(std::max((int)GetPrivateProfileIntA("Game", "UITextScale", 100, g_ini), 50), 250);
+    cfg.btnIcons   = std::min(std::max((int)GetPrivateProfileIntA("Controller", "ButtonIcons", 0, g_ini), 0), 2);
     cfg.shDump     = GetPrivateProfileIntA("Shaders", "DumpSource", 0, g_ini);
     cfg.shOverride = GetPrivateProfileIntA("Shaders", "Override", 1, g_ini);
     {
@@ -787,6 +792,18 @@ static void ApplyMouseSmoothing()
     if (!cfg.console) return;
     ConQueue(cfg.rawMouse ? "set PlayerInput bEnableMouseSmoothing False" : "set PlayerInput bEnableMouseSmoothing True", false);
 }
+// UI text scale: AP's UI (UE3 UIScenes) uses fixed-size bitmap fonts made for 720p/1080p and no
+// resolution-based text scaling, so subtitles and HUD text get small at 1440p and up. Every text style's
+// Scale is raised through SET (styles live in the loaded UI skin; screens opened afterwards use it).
+static bool g_uiScaleTouched = false;
+static void ApplyUiTextScale()
+{
+    if (!cfg.console || (cfg.uiTextScale == 100 && !g_uiScaleTouched)) return;
+    g_uiScaleTouched = true;
+    char c[96]; const float k = std::min(std::max(cfg.uiTextScale, 50), 250) / 100.0f;
+    snprintf(c, sizeof c, "set UIStyle_Text Scale (X=%.3f,Y=%.3f)", k, k);
+    ConQueue(c, false);
+}
 static void __cdecl Con_CapturePC(HookRegs* r)
 {
     void* pc = (void*)r->ecx;
@@ -797,7 +814,7 @@ static void __cdecl Con_CapturePC(HookRegs* r)
     const bool fresh = g_pc != pc;
     if (fresh) Log("console: player controller %p (vtable %p)", pc, vt);
     g_pc = pc; g_pcTick = GetTickCount();
-    if (fresh) { ApplyDrawDistance(); ApplyMouseSmoothing(); }   // a new level / controller starts with the defaults
+    if (fresh) { ApplyDrawDistance(); ApplyMouseSmoothing(); ApplyUiTextScale(); }   // a new level / controller starts with the defaults
 }
 static void ConRunOne(const char* cmd);
 static void ConRunQueued()
@@ -4551,7 +4568,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.23.0") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.24.0") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4560,7 +4577,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.23.0", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.24.0", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -5381,8 +5398,172 @@ static void ApplyFilter(IDirect3DDevice9* d, DWORD st)
     DWORD b; memcpy(&b, &bias, 4);
     o_SetSamplerState(d, st, D3DSAMP_MIPMAPLODBIAS, b);
 }
+// ---- PlayStation button prompts
+// The game ships the PS3 prompt art next to the Xbox one (UI_ButtonIcons: Callouts.* vs Generic.gp_* /
+// PDA.gp_*), but the PC build only ever binds the Xbox textures. Both are recognised when the game uploads
+// them (FNV-1a of the top mip at UnlockRect - src/buttonicons.h); for each Xbox icon a texture with the
+// PS art placed where the Xbox art sits is drawn once, and SetTexture swaps it in while a Sony pad is in use.
+static bool PadIconsPS();
+typedef HRESULT (STDMETHODCALLTYPE *PFN_TexLock)(IDirect3DTexture9*, UINT, D3DLOCKED_RECT*, const RECT*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_TexUnlock)(IDirect3DTexture9*, UINT);
+static PFN_TexLock o_TexLock = nullptr;
+static PFN_TexUnlock o_TexUnlock = nullptr;
+static const int kBtnN = sizeof kBtnIcons / sizeof kBtnIcons[0];
+static SRWLOCK g_btnLock = SRWLOCK_INIT;
+struct BtnLockSlot { IDirect3DTexture9* t; BYTE* bits; INT pitch; UINT w, h; };
+static BtnLockSlot g_btnSlots[8];
+static std::unordered_map<IDirect3DTexture9*, int> g_btnXbox;     // game texture -> icon
+static IDirect3DTexture9* g_btnPs[kBtnN] = {};                    // the game's PS art for each icon
+static IDirect3DTexture9* g_btnRepl[kBtnN] = {};                  // built replacement (default pool)
+static bool g_btnFailed[kBtnN] = {};
+static volatile bool g_btnAny = false;
+static IDirect3DPixelShader9* g_btnPS = nullptr;
+static IDirect3DVertexShader9* g_btnVS = nullptr;
+static IDirect3DStateBlock9* g_btnSb = nullptr;
+static const char* kBtnBlitPS = R"HLSL(
+sampler2D s0 : register(s0);
+float4 src : register(c0);   // xy offset, zw size (uv) of the PS art
+float4 main(float2 uv : TEXCOORD0) : COLOR0 { return tex2D(s0, src.xy + uv * src.zw); }
+)HLSL";
+static HRESULT STDMETHODCALLTYPE hk_TexLock(IDirect3DTexture9* t, UINT lvl, D3DLOCKED_RECT* lr, const RECT* rc, DWORD fl)
+{
+    HRESULT hr = o_TexLock(t, lvl, lr, rc, fl);
+    if (SUCCEEDED(hr) && lvl == 0 && !rc && lr && !(fl & D3DLOCK_READONLY) && !g_inPostFX && cfg.btnIcons != 1) {
+        D3DSURFACE_DESC sd;
+        if (SUCCEEDED(t->GetLevelDesc(0, &sd)) && sd.Format == D3DFMT_DXT5 && sd.Width <= 64 && sd.Height <= 64 && sd.Width >= 16 && sd.Height >= 16) {
+            AcquireSRWLockExclusive(&g_btnLock);
+            for (auto& sl : g_btnSlots) if (!sl.t) { sl = { t, (BYTE*)lr->pBits, lr->Pitch, sd.Width, sd.Height }; break; }
+            ReleaseSRWLockExclusive(&g_btnLock);
+        }
+    }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hk_TexUnlock(IDirect3DTexture9* t, UINT lvl)
+{
+    if (lvl == 0) {
+        BtnLockSlot sl = {};
+        AcquireSRWLockExclusive(&g_btnLock);
+        for (auto& x : g_btnSlots) if (x.t == t) { sl = x; x = {}; break; }
+        ReleaseSRWLockExclusive(&g_btnLock);
+        if (sl.t && sl.bits) {
+            uint32_t h = 0x811C9DC5u;
+            const UINT rowBytes = (sl.w / 4) * 16;
+            for (UINT r = 0; r < sl.h / 4; r++) {
+                const BYTE* row = sl.bits + (size_t)r * sl.pitch;
+                for (UINT k = 0; k < rowBytes; k++) { h ^= row[k]; h *= 0x01000193u; }
+            }
+            int hits = 0;
+            AcquireSRWLockExclusive(&g_btnLock);
+            for (int i = 0; i < kBtnN; i++) {
+                if (kBtnIcons[i].xbox == h && !g_btnXbox.count(t)) { t->AddRef(); g_btnXbox[t] = i; hits++; }
+                if (kBtnIcons[i].ps == h && g_btnPs[i] != t) { t->AddRef(); if (g_btnPs[i]) g_btnPs[i]->Release(); g_btnPs[i] = t; hits++; }
+            }
+            if (hits) g_btnAny = true;
+            ReleaseSRWLockExclusive(&g_btnLock);
+            static int logged = 0;
+            if (hits && logged++ < 2) Log("buttons: game prompt textures recognised (%d so far)", (int)g_btnXbox.size());
+        }
+    }
+    return o_TexUnlock(t, lvl);
+}
+static void BtnInstall(IDirect3DDevice9* dev)
+{
+    IDirect3DTexture9* t = nullptr;
+    if (FAILED(dev->CreateTexture(16, 16, 1, 0, D3DFMT_DXT5, D3DPOOL_MANAGED, &t, nullptr)) || !t) {
+        Log("buttons: can't watch texture uploads - PlayStation prompts unavailable"); return;
+    }
+    void* p;
+    if ((p = PatchVtbl(t, 19, (void*)hk_TexLock))) o_TexLock = (PFN_TexLock)p;
+    if ((p = PatchVtbl(t, 20, (void*)hk_TexUnlock))) o_TexUnlock = (PFN_TexUnlock)p;
+    t->Release();
+    Log("buttons: watching texture uploads for the game's prompt icons (%d known)", kBtnN);
+}
+static void BtnReleaseDefault()
+{
+    for (auto& r : g_btnRepl) if (r) { r->Release(); r = nullptr; }
+    for (auto& f : g_btnFailed) f = false;
+    if (g_btnSb) { g_btnSb->Release(); g_btnSb = nullptr; }
+}
+// Draws the missing replacements (a few per frame at most) - called at Present, outside the game's drawing
+static void BtnBuild(IDirect3DDevice9* dev)
+{
+    if (!g_btnAny || !PadIconsPS()) return;
+    int todo[4], n = 0;
+    AcquireSRWLockShared(&g_btnLock);
+    for (auto& kv : g_btnXbox) {
+        const int i = kv.second;
+        if (!g_btnRepl[i] && !g_btnFailed[i] && g_btnPs[i] && n < 4) { bool dup = false; for (int k = 0; k < n; k++) dup |= todo[k] == i; if (!dup) todo[n++] = i; }
+    }
+    ReleaseSRWLockShared(&g_btnLock);
+    if (!n) return;
+    if (!g_btnPS) g_btnPS = CompilePS(dev, kBtnBlitPS, "PlayStation prompt blit");
+    if (!g_btnVS) g_btnVS = CompileVS(dev, kQuadVS, "PlayStation prompt quad");
+    if (!g_btnPS || !g_btnVS) { for (auto& f : g_btnFailed) f = true; return; }
+    if (!g_btnSb && FAILED(dev->CreateStateBlock(D3DSBT_ALL, &g_btnSb))) return;
+    g_inPostFX = true;
+    g_btnSb->Capture();
+    IDirect3DSurface9 *oldRT = nullptr, *oldDS = nullptr;
+    dev->GetRenderTarget(0, &oldRT);
+    dev->GetDepthStencilSurface(&oldDS);
+    dev->SetDepthStencilSurface(nullptr);
+    dev->SetVertexShader(g_btnVS);
+    dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+    const DWORD rs[][2] = { { D3DRS_ZENABLE, FALSE }, { D3DRS_ZWRITEENABLE, FALSE }, { D3DRS_STENCILENABLE, FALSE },
+        { D3DRS_ALPHABLENDENABLE, FALSE }, { D3DRS_ALPHATESTENABLE, FALSE }, { D3DRS_CULLMODE, D3DCULL_NONE },
+        { D3DRS_SCISSORTESTENABLE, FALSE }, { D3DRS_SRGBWRITEENABLE, FALSE }, { D3DRS_COLORWRITEENABLE, 0xF } };
+    for (auto& r : rs) dev->SetRenderState((D3DRENDERSTATETYPE)r[0], r[1]);
+    for (DWORD st = 1; st < 8; st++) dev->SetTexture(st, nullptr);
+    dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+    int built = 0;
+    for (int k = 0; k < n; k++) {
+        const int i = todo[k];
+        const BtnIcon& ic = kBtnIcons[i];
+        IDirect3DTexture9* xt = nullptr;
+        for (auto& kv : g_btnXbox) if (kv.second == i) { xt = kv.first; break; }
+        D3DSURFACE_DESC xd;
+        if (!xt || FAILED(xt->GetLevelDesc(0, &xd))) { g_btnFailed[i] = true; continue; }
+        const UINT W = xd.Width * 2, H = xd.Height * 2;          // a little extra resolution for the PS art
+        IDirect3DTexture9* rt = nullptr; IDirect3DSurface9* s = nullptr;
+        if (FAILED(dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &rt, nullptr)) ||
+            FAILED(rt->GetSurfaceLevel(0, &s))) { if (rt) rt->Release(); g_btnFailed[i] = true; continue; }
+        dev->ColorFill(s, nullptr, 0);                            // transparent
+        const DWORD vx = (DWORD)(ic.dst[0] * W + 0.5f), vy = (DWORD)(ic.dst[1] * H + 0.5f);
+        const DWORD vw = std::max<DWORD>((DWORD)(ic.dst[2] * W + 0.5f), 1), vh = std::max<DWORD>((DWORD)(ic.dst[3] * H + 0.5f), 1);
+        dev->SetRenderTarget(0, s);
+        D3DVIEWPORT9 vp = { vx, vy, std::min(vw, W - vx), std::min(vh, H - vy), 0.0f, 1.0f };
+        dev->SetViewport(&vp);
+        const float hp[4] = { -1.0f / vp.Width, 1.0f / vp.Height, 0, 0 };
+        dev->SetVertexShaderConstantF(0, hp, 1);
+        dev->SetPixelShaderConstantF(0, ic.src, 1);
+        DrawFullscreen(dev, g_btnPs[i], s, g_btnPS);
+        s->Release();
+        g_btnRepl[i] = rt;
+        built++;
+    }
+    dev->SetTexture(0, nullptr);
+    dev->SetRenderTarget(0, oldRT);
+    dev->SetDepthStencilSurface(oldDS);
+    g_btnSb->Apply();
+    if (oldRT) oldRT->Release();
+    if (oldDS) oldDS->Release();
+    g_inPostFX = false;
+    static int total = 0;
+    total += built;
+    if (built && total == built) Log("buttons: PlayStation prompts in use");
+}
 static HRESULT STDMETHODCALLTYPE hk_SetTexture(IDirect3DDevice9* d, DWORD st, IDirect3DBaseTexture9* t)
 {
+    if (g_btnAny && t && !g_inPostFX && PadIconsPS()) {
+        AcquireSRWLockShared(&g_btnLock);
+        auto it = g_btnXbox.find((IDirect3DTexture9*)t);
+        if (it != g_btnXbox.end() && g_btnRepl[it->second]) t = g_btnRepl[it->second];
+        ReleaseSRWLockShared(&g_btnLock);
+    }
     HRESULT hr = o_SetTexture(d, st, t);
     if (st < 16 && !g_inPostFX && AnisoOn()) {
         const bool plain = TexIsPlain(t);
@@ -6069,6 +6250,8 @@ static bool SaveConfig()
     WriteIniInt("Textures", "LodBias", cfg.lodBias);
     WriteIniInt("Shaders", "DiskCache", cfg.shaderCache);
     WriteIniInt("Game", "RawMouse", cfg.rawMouse);
+    WriteIniInt("Controller", "ButtonIcons", cfg.btnIcons);
+    WriteIniInt("Game", "UITextScale", cfg.uiTextScale);
     WritePrivateProfileStringA("Shaders", "Compiler", cfg.compiler == 2 ? "game" : cfg.compiler == 1 ? "47" : "auto", g_ini);
     WriteIniInt("Shadows", "Scale", cfg.shadowScale);
     WriteIniInt("Shadows", "Softness", cfg.shadowSoft);
@@ -6243,7 +6426,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.23.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.24.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -6513,6 +6696,12 @@ static void DrawMenu()
                 ImGui::SliderInt("Rumble", &g_padCfg.rumble, 0, 200, g_padCfg.rumble ? "%d %%" : "off");
                 ImGui::SliderInt("Extra stick dead zone", &g_padCfg.deadzone, 0, 30, g_padCfg.deadzone ? "%d %%" : "game's own");
                 CheckboxInt("Touchpad click = Back", &g_padCfg.touchpadBack);
+                {
+                    static const char* bi[] = { "Automatic (PlayStation while a Sony pad is in use)", "Always Xbox", "Always PlayStation" };
+                    ImGui::Combo("Button prompts", &cfg.btnIcons, bi, 3);
+                    ImGui::TextDisabled("Uses the PS3 prompt art the game ships. %d of the game's prompt textures recognised so far%s.",
+                                        (int)g_btnXbox.size(), PadIconsPS() ? " - PlayStation prompts showing" : "");
+                }
                 bool lightOn = g_padCfg.light >= 0;
                 if (ImGui::Checkbox("Set the Sony light bar colour", &lightOn)) g_padCfg.light = lightOn ? 0x2060FF : -1;
                 if (g_padCfg.light >= 0) {
@@ -6544,6 +6733,11 @@ static void DrawMenu()
             ImGui::TextDisabled("How far away objects are still drawn and keep their detailed models (100 = game). Applied at");
             ImGui::TextDisabled("every level load; needs the console.");
             if (CheckboxInt("Raw mouse (no mouse smoothing)", &cfg.rawMouse)) ApplyMouseSmoothing();
+            ImGui::SliderInt("UI text scale", &cfg.uiTextScale, 50, 250, "%d %%");
+            ImGui::SameLine();
+            if (ImGui::Button("Apply##uits")) { g_uiScaleTouched = true; ApplyUiTextScale(); MenuNote("Applied - screens opened from now on use it."); }
+            ImGui::TextDisabled("Subtitles, HUD and menu text (the game's fonts are made for 720p-1080p). Screens already");
+            ImGui::TextDisabled("on screen keep the old size until they reopen. Needs the console. Try 133 at 1440p, 200 at 4K.");
             ImGui::TextDisabled("Turns off Unreal's mouse smoothing for direct 1:1 aiming. Needs the console.");
             ImGui::SeparatorText("Developer console");
             if (!g_conOk) ImGui::TextDisabled("Unavailable (see the log: console:).");
@@ -6836,6 +7030,7 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDirect3DDevice9* dev, const RECT* a
 {
     TraceFrameBoundary(dev);
     PostFXHotkey();
+    if (dev->TestCooperativeLevel() == D3D_OK) BtnBuild(dev);
     if (dev->TestCooperativeLevel() == D3D_OK) CalibrateDepth(dev);
     if (dev->TestCooperativeLevel() == D3D_OK) {
         // world target still bound at Present (no switch happened): process it now
@@ -6934,6 +7129,7 @@ static HRESULT STDMETHODCALLTYPE hk_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARA
     g_rt0Scale = 1;
     for (int i = 0; i < 16; i++) { g_gameMin[i] = D3DTEXF_POINT; g_gameAniso[i] = 1; g_gameBias[i] = 0; g_stagePlain[i] = false; }
     GlassMaskRelease();
+    BtnReleaseDefault();
     BloomRelease();
     g_bbPtr = nullptr; g_curRT = nullptr; g_worldRT = nullptr; g_bbW = g_bbH = 0;
     DumpPP("Reset (game)", pp);
@@ -6974,6 +7170,7 @@ static HRESULT STDMETHODCALLTYPE hk_CreateDevice(IDirect3D9* d3d, UINT adapter, 
         if ((p = PatchVtbl(*out, 29, (void*)hk_CreateDS))) o_CreateDS = (PFN_CreateDS)p;
         if ((p = PatchVtbl(*out, 21, (void*)hk_SetGammaRamp))) o_SetGammaRamp = (PFN_SetGammaRamp)p;
         HookTraceVtbl(*out);
+        BtnInstall(*out);
         InstallWndProcHook();
     }
     return hr;
@@ -7096,7 +7293,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.23.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.24.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

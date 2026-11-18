@@ -180,18 +180,24 @@ AO → SSS (2 passes) → SSR → light shafts → grade → SMAA/FXAA → TAA �
 - Pads: DualSense (USB, sometimes BT) and Xbox Series X; wants generic support, not tailored.
 - AlphaFixer (winmm.dll) and dixi are replaced; user told to delete them.
 
-## Input / UI (0.23.0)
+## Input / UI
 - Raw mouse: console `set PlayerInput bEnableMouseSmoothing False` queued per new player controller.
+- UI text scale: `set UIStyle_Text Scale (X=k,Y=k)` per new PC (only once touched / != 100). AP's UI is UE3's
+  native UI (UIScenes in Startup_int / UI_Scenes_*, styles in UI_Skin.upk, bitmap fonts in UI_Raw_Fonts, no
+  AutoScaling) - text styles only carry StyleFont, so Scale is the lever. Untested in game.
 - Presets (ApplyPreset): Performance / Balanced / Quality (= defaults) / Ultra over the heavy effects.
-- AP's UI is UE3's native UI (UIScenes, not Scaleform). Button prompts: `<Images:UI_ButtonIcons.Generic.*_btn_gen>`,
-  `UI_ButtonIcons.PDA.pda_{bottom,left,right,top}_btn`, `csa_bottom_btn`, `gp_*`; inline font `GamepadKeyFont`.
-  Icons are named by position, so PS prompts = swap those textures (by content hash at SetTexture) when a
-  Sony pad is the active device — needs the UI packages from the user. Subtitles: UIScene HUD_Subtitles
-  (UIStyle text, ETextAutoScaleMode: None/Normal/ResolutionBased) - HUD scale needs those packages too.
-- Shadow filter / contact noise now rotates per frame (apTM.z) so TAA averages it; contact hits need
+- PS prompts: UI_ButtonIcons.upk ships PS3 art (Callouts.callout_{bottom,left,right}_btn, Callouts.top_btn,
+  L1/L2/R1/R2/L3/R3, sticks, dpad, start/select; pda_optn_*) next to the Xbox art the PC build uses
+  (Generic.gp_*, PDA.gp_pda_*, gp_csa_*). Xbox gamepad icons draw only their top-left ~43/64 (XL/YL markup).
+  `tools/re/buttonicons.py <UI_ButtonIcons.upk>` → src/buttonicons.h (FNV-1a of mip 0 as uploaded, PS art
+  placement). Texture vtable LockRect 19 / UnlockRect 20 hooked (BtnInstall, dummy DXT5 texture): DXT5 ≤ 64²
+  level-0 uploads hashed at unlock; matches AddRef'd. BtnBuild (Present) draws a 2x-size A8R8G8B8 copy with
+  the PS art in the Xbox art's box; hk_SetTexture swaps while PadIconsPS() (Sony input most recent, ties
+  within 500 ms to Sony, [Controller] ButtonIcons 0/1/2). Replacements released on Reset.
+- Shadow filter / contact noise rotates per frame (apTM.z) so TAA averages it; contact hits need
   df > 1 + 0.4 % of depth (dotted self-shadow patches near the camera).
 
 ## Open items
-- PS button prompts + HUD/subtitle scale: waiting for the UI packages.
+- PS prompts and UI text scale: built from the user's UI packages, untested in game.
 - 120 fps: user says cutscenes run at 120 and keep the FOV; physics/minigames untested.
 - Menu + mouse: fix for the stolen g_diMouse in 0.21.1 — confirm with the user.
