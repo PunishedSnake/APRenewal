@@ -113,6 +113,23 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   DXVK. `LoadReal` refuses if the system path resolves to our own module.
 - Windows-only bits (DisplayConfig SDR white, DXGI output diag) fail soft under Wine (paper white falls back to 200).
 
+## Game module (0.10.0, Steam exe addresses, all verified by bytes before patching)
+- Intro skip: movie player vtable slot 0x12173B0 = GameThreadPlayMovie 0x4E49F0 (thiscall, mode,
+  name, startFrame; ret 0xC). Refused (return 0) until `g_worldEverSeen` (first HDR base pass in
+  BeforeHudOnSetRT). `-nomovie` would install the null player and kill in-game .sfd movies too.
+- Shadows: the shadow map is a square R32F RT texture (2048) + square depth buffer. With
+  [Shadows] Scale they're created k× larger (CreateTexture 23 / CreateDS 29); while RT0 is the big
+  shadow map, SetViewport 47 / GetViewport 48 / SetScissorRect 75 / GetScissorRect 76 / Clear rects
+  are scaled. Shadow UVs are normalised. Unknown: whether the PCF shader uses a texel-size constant
+  (filter would then stay 2048-sized — still fine). User's MaxShadowResolution=4096 had no effect.
+- Console: vtable +0x110 on the player controller = ConsoleCommand(FString* ret, const FString& cmd,
+  UBOOL log) (thiscall). PC pointer captured by MidHooks on AAPPlayerController-only exec thunks
+  (ShouldAllowPauseMenu 0xA50230, ShouldAllowPDAMenu 0xA50270, IsPlayerPastTitleScreen 0xA50490,
+  UpdateAIData 0xA50970; InPDAMenu is shared with AAPAIController — don't use). Pointer used only if
+  seen in the last 3 s with the first-seen vtable. Commands run in hk_PeekMessageW on the main
+  thread. Result FString freed with GMalloc (0x16E8030) vtable +0xC.
+- dis.py must run with `python3 -P` (its name shadows the stdlib `dis` module).
+
 ## Reverse engineering
 - `docs/apgame-re.md` has the exe findings; `tools/re/apgame_natives.json` maps 2804 UE3 natives
   (`Class::execFunc` → address, Steam exe); `tools/re/dis.py` disassembles with names. Start there.

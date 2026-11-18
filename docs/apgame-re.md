@@ -54,3 +54,13 @@ game's native C++ classes (`AAP*`, `UAP*`).
 ### Minigames
 - `AAPPlayerController::execStartNewHackingMiniGame` (0xA50790),
   `UAPUIAction_HackingMiniGameManager::execDrawInterface` (0xA51220), lockpick/hacking UI scenes.
+
+### Movies (0.10.0)
+- `nomovie` is checked at 0xD73FD0: it installs a null movie player instead of the real one
+  (0x4E4790), which would also kill in-game Sofdec movies (`Movie_*Aftermath*.sfd`, news reels).
+- Real player vtable: slot 0x12173B0 = GameThreadPlayMovie 0x4E49F0 (compares the name to
+  `OpeningMovie`). APRenewal refuses calls before the first 3D scene.
+
+### Shadows (0.10.0)
+- The shadow depth buffer is a 2048² R32F render-target texture regardless of MaxShadowResolution.
+  SystemSettings are bound by name→field tables (e.g. around 0x498230); the 2048 clamp itself is not found yet.

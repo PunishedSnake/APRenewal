@@ -22,6 +22,8 @@
 #include <cmath>
 #include <algorithm>
 #include <initializer_list>
+#include <vector>
+#include <string>
 #ifndef DI_OK
 #define DI_OK S_OK
 #endif
@@ -51,6 +53,7 @@ static bool    g_ssaa = false;                    // backbuffer larger than the 
 static UINT    g_outW = 0, g_outH = 0;            // window (output) size while supersampling
 static bool    g_hdrUnlocked = false;             // DXVK allowed an fp16 backbuffer
 static bool    g_hdrForced = false;               // we replaced the backbuffer format with fp16
+static volatile bool g_worldEverSeen = false;    // a 3D scene was rendered (intro logos are over)
 static char    g_wineVer[64] = "";                // non-empty = running under Wine/Proton
 static bool    g_steamDeck = false;               // Steam sets SteamDeck=1 on the Deck
 static bool    g_hdrActive = false;               // scRGB colour space is set: encode at Present
@@ -110,7 +113,11 @@ struct Config {
     int  renderScale   = 100;
     // HDR output (needs DXVK as RealD3D9 and Windows HDR on)
     int  hdrEnable     = 0;
-    int  hdrWindows    = 0;   // HDR on native Windows (never got above SDR white there)
+    int  hdrWindows    = 0;
+    // game
+    int  skipIntros    = 1;   // skip startup logo movies
+    int  shadowScale   = 1;   // shadow map resolution multiplier (1, 2, 4)
+    int  console       = 1;   // developer console in the menu   // HDR on native Windows (never got above SDR white there)
     int  hdrPaper      = 200;   // nits for UI / SDR white
     int  hdrPeak       = 0;     // nits, 0 = what the display reports
     int  hdrHighlights = 100;   // percent highlight expansion
@@ -189,6 +196,10 @@ static void LoadConfig()
     if (cfg.renderScale > 200) cfg.renderScale = 200;
     cfg.hdrEnable     = GetPrivateProfileIntA("HDR", "Enable", 0, g_ini);
     cfg.hdrWindows    = GetPrivateProfileIntA("HDR", "AllowWindows", 0, g_ini) ? 1 : 0;
+    cfg.skipIntros    = GetPrivateProfileIntA("Game", "SkipIntros", 1, g_ini) ? 1 : 0;
+    cfg.console       = GetPrivateProfileIntA("Game", "Console", 1, g_ini) ? 1 : 0;
+    cfg.shadowScale   = GetPrivateProfileIntA("Shadows", "Scale", 1, g_ini);
+    if (cfg.shadowScale != 2 && cfg.shadowScale != 4) cfg.shadowScale = 1;
     cfg.hdrPaper      = GetPrivateProfileIntA("HDR", "PaperWhite", 0, g_ini);   // 0 = Windows' SDR content brightness
     cfg.hdrCurve      = GetPrivateProfileIntA("HDR", "Curve", 0, g_ini) ? 1 : 0;
     cfg.hdrCompensate = GetPrivateProfileIntA("HDR", "CompensateSRGB", 0, g_ini) ? 1 : 0;
@@ -432,6 +443,131 @@ static void InstallViewHooks()
 }
 
 // --------------------------------------------------------------------------
+// Game module: intro skip and developer console (Steam APGame.exe addresses, verified before use)
+// --------------------------------------------------------------------------
+static bool Readable(const void* p, size_t n)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    return (const BYTE*)p + n <= (const BYTE*)mbi.BaseAddress + mbi.RegionSize;
+}
+static bool CodeIs(DWORD addr, const char* bytes, size_t n) { return Readable((void*)addr, n) && !memcmp((void*)addr, bytes, n); }
+
+// The full-screen movie player's GameThreadPlayMovie(mode, name, startFrame) (vtable slot at 0x12173B0).
+// Startup logos play before the first 3D scene; with SkipIntros they are refused. In-game movies
+// (news reports etc.) come later and play normally. UE3's "-nomovie" would kill those too.
+typedef int (__thiscall *PFN_PlayMovie)(void*, int, const wchar_t*, int);
+static PFN_PlayMovie o_PlayMovie = nullptr;
+static int __thiscall hk_PlayMovie(void* self, int mode, const wchar_t* name, int start)
+{
+    char n[160] = "";
+    if (name) WideCharToMultiByte(CP_UTF8, 0, name, -1, n, sizeof n, nullptr, nullptr);
+    if (cfg.skipIntros && !g_worldEverSeen) {
+        Log("movie: '%s' (mode %d) skipped - startup movie", n, mode);
+        return 0;
+    }
+    Log("movie: '%s' (mode %d) playing", n, mode);
+    return o_PlayMovie(self, mode, name, start);
+}
+static void InstallMovieHook()
+{
+    const DWORD slot = 0x12173B0, fn = 0x4E49F0;
+    if (!Readable((void*)slot, 4) || *(DWORD*)slot != fn ||
+        !CodeIs(fn, "\x55\x8B\xEC\x83\xE4\xF8\x6A\xFF", 8) || !CodeIs(0x4E4A68, "\x68\xE0\x9E\x1D\x01", 5)) {
+        Log("movie: movie player not found (different exe build) - intro skip unavailable");
+        return;
+    }
+    o_PlayMovie = (PFN_PlayMovie)fn;
+    DWORD old;
+    VirtualProtect((void*)slot, 4, PAGE_READWRITE, &old);
+    *(void**)slot = (void*)hk_PlayMovie;
+    VirtualProtect((void*)slot, 4, old, &old);
+    Log("movie: hook ok - startup movies %s", cfg.skipIntros ? "will be skipped" : "play (SkipIntros=0)");
+}
+
+// Developer console: APlayerController::ConsoleCommand (vtable +0x110) is what script's
+// ConsoleCommand() calls. The player controller pointer comes from AAPPlayerController natives
+// the game calls on it; commands run on the main thread between frames (our PeekMessageW hook).
+struct FStr { wchar_t* data; int num; int max; };
+typedef FStr* (__thiscall *PFN_ConsoleCmd)(void* self, FStr* ret, const FStr* cmd, int writeToLog);
+static void* volatile g_pc = nullptr;
+static void* g_pcVtbl = nullptr;
+static volatile DWORD g_pcTick = 0;
+static bool g_conOk = false;
+static CRITICAL_SECTION g_conCs;
+static char g_conPending[512];
+static volatile bool g_conQueued = false;
+static std::vector<std::string> g_conHistory;
+static void ConAddLine(const std::string& l)
+{
+    EnterCriticalSection(&g_conCs);
+    g_conHistory.push_back(l);
+    if (g_conHistory.size() > 200) g_conHistory.erase(g_conHistory.begin());
+    LeaveCriticalSection(&g_conCs);
+}
+static void __cdecl Con_CapturePC(HookRegs* r)
+{
+    void* pc = (void*)r->ecx;
+    if (!pc) return;
+    void* vt = *(void**)pc;
+    if (!g_pcVtbl) g_pcVtbl = vt;
+    if (vt != g_pcVtbl) return;
+    if (g_pc != pc) Log("console: player controller %p (vtable %p)", pc, vt);
+    g_pc = pc; g_pcTick = GetTickCount();
+}
+static void ConRunQueued()
+{
+    if (!g_conQueued) return;
+    char cmd[512];
+    EnterCriticalSection(&g_conCs);
+    memcpy(cmd, g_conPending, sizeof cmd); g_conQueued = false;
+    LeaveCriticalSection(&g_conCs);
+    void* pc = g_pc;
+    if (!pc || GetTickCount() - g_pcTick > 3000 || !Readable(pc, 4) || *(void**)pc != g_pcVtbl) {
+        ConAddLine("  (no player yet - load a save or start a game first)");
+        Log("console: '%s' - no live player controller", cmd);
+        return;
+    }
+    wchar_t w[512];
+    int n = MultiByteToWideChar(CP_UTF8, 0, cmd, -1, w, 512);
+    if (n <= 1) return;
+    FStr in = { w, n, n }, out = { nullptr, 0, 0 };
+    PFN_ConsoleCmd fn = (PFN_ConsoleCmd)((*(void***)pc)[0x110 / 4]);
+    Log("console: > %s", cmd);
+    fn(pc, &out, &in, 1);
+    if (out.data && out.num > 1) {
+        char r[1024] = "";
+        WideCharToMultiByte(CP_UTF8, 0, out.data, -1, r, sizeof r, nullptr, nullptr);
+        ConAddLine(std::string("  ") + r);
+        Log("console:   %s", r);
+    } else ConAddLine("  (done)");
+    // the returned string was allocated by the game's GMalloc - give it back
+    void* gm = *(void**)0x16E8030;
+    if (out.data && gm) ((void (__thiscall*)(void*, void*))((*(void***)gm)[3]))(gm, out.data);
+}
+static void InstallConsole()
+{
+    InitializeCriticalSection(&g_conCs);
+    if (!cfg.console) { Log("console: off (Console=0)"); return; }
+    // ConsoleCommand thunk: vtable +0x110 call, and GMalloc->Free at +0xC
+    if (!CodeIs(0x4DB7E7, "\x8B\x17\x8B\x92\x10\x01\x00\x00", 8) || !CodeIs(0x4DB821, "\x8B\x0D\x30\x80\x6E\x01", 6) ||
+        !CodeIs(0x4DB838, "\x8B\x01\x8B\x50\x0C", 5)) {
+        Log("console: ConsoleCommand not found (different exe build) - console unavailable");
+        return;
+    }
+    static const BYTE thunk[8] = { 0x8B, 0x44, 0x24, 0x04, 0x83, 0x40, 0x0C, 0x01 };   // mov eax,[esp+4]; add [eax+0Ch],1
+    static const BYTE ai[5] = { 0x51, 0x0F, 0x57, 0xC0, 0x56 };                        // push ecx; xorps xmm0,xmm0; push esi
+    int n = 0;
+    // AAPPlayerController-only thunks (InPDAMenu is shared with the AI controller - not usable):
+    // ShouldAllowPauseMenu, ShouldAllowPDAMenu, IsPlayerPastTitleScreen, UpdateAIData
+    for (DWORD a : { 0xA50230u, 0xA50270u, 0xA50490u })
+        if (MidHook((BYTE*)a, 8, thunk, Con_CapturePC)) n++;
+    if (MidHook((BYTE*)0xA50970, 5, ai, Con_CapturePC)) n++;
+    g_conOk = n > 0;
+    Log("console: %d/4 player-controller probes installed%s", n, g_conOk ? "" : " - console unavailable");
+}
+
+// --------------------------------------------------------------------------
 // Shader compile hook (D3DXCompileShader from d3dx9_42.dll)
 // --------------------------------------------------------------------------
 struct D3DXMACRO_ { LPCSTR Name; LPCSTR Definition; };
@@ -666,8 +802,10 @@ static void WaitWhileUnfocused()
     inWait = false;
 }
 
+static void ConRunQueued();
 static BOOL WINAPI hk_PeekMessageW(LPMSG msg, HWND wnd, UINT fmin, UINT fmax, UINT remove)
 {
+    if (g_conQueued && GetCurrentThreadId() == g_mainThread) ConRunQueued();
     if (cfg.pauseOnFocusLoss && g_hwnd && !g_exiting && GetCurrentThreadId() == g_mainThread &&
         IsWindowVisible(g_hwnd) && !GameHasFocus())
         WaitWhileUnfocused();
@@ -1566,6 +1704,7 @@ static void BeforeHudOnSetRT(IDirect3DDevice9* dev, IDirect3DSurface9* next)
     // bloom chain once the base pass has happened; some scenes render small targets before it.
     if (g_curRT && g_curRTDraws > 0 && g_curRTIsHDR) {
         if (!g_sawHDR) {
+            if (!g_worldEverSeen) { g_worldEverSeen = true; Log("movie: first 3D scene rendered - movies play normally from now on"); }
             CaptureDepth(dev, g_curRT);                  // first full-res HDR pass of the scene = base pass
             g_hdrSceneSurf = g_curRT;                    // the scene's HDR colour (HDR output reads it)
             g_fx.intz = nullptr;
@@ -2285,8 +2424,108 @@ static void SetSegSurf(IDirect3DSurface9* s)
     if (g_segSurf) g_segSurf->AddRef();
 }
 
+// Shadow resolution: the game's shadow depth buffer is a square R32F render target (2048 on the
+// user's PC, MaxShadowResolution in the ini doesn't raise it). With [Shadows] Scale it and its depth
+// buffer are created Scale x larger and every viewport / scissor / clear rect set while it is bound
+// is scaled to match. The game's shadow UVs are normalised, so sampling needs no change.
+static UINT g_shadowSize = 0, g_shadowBig = 0;   // the game's size and ours
+static int  g_rt0Scale = 1;                      // RT0 is the enlarged shadow map
+static bool IsDepthFmt(D3DFORMAT f)
+{
+    return f == D3DFMT_D24S8 || f == D3DFMT_D24X8 || f == D3DFMT_D16 || f == D3DFMT_D32 || f == D3DFMT_D24FS8 ||
+           f == (D3DFORMAT)MAKEFOURCC('I','N','T','Z') || f == (D3DFORMAT)MAKEFOURCC('D','F','2','4') ||
+           f == (D3DFORMAT)MAKEFOURCC('D','F','1','6');
+}
+// a square shadow-sized resource we should enlarge
+static bool ShadowCandidate(UINT w, UINT h, D3DFORMAT f, bool rt, bool ds)
+{
+    if (cfg.shadowScale <= 1 || g_inPostFX || w != h || w < 512 || w > 4096) return false;
+    if (rt && f == D3DFMT_R32F) {
+        if (!g_shadowSize) g_shadowSize = w;
+        return w == g_shadowSize;
+    }
+    // depth buffers: the shadow one may be created before the colour target - any square one >= 1024
+    return ds && IsDepthFmt(f) && (g_shadowSize ? w == g_shadowSize : w >= 1024);
+}
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateTexture)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL,
+                                                       IDirect3DTexture9**, HANDLE*);
+static PFN_CreateTexture o_CreateTexture = nullptr;
+static HRESULT STDMETHODCALLTYPE hk_CreateTexture(IDirect3DDevice9* d, UINT w, UINT h, UINT lv, DWORD usage, D3DFORMAT f,
+                                                  D3DPOOL pool, IDirect3DTexture9** out, HANDLE* sh)
+{
+    if (!sh && pool == D3DPOOL_DEFAULT &&
+        ShadowCandidate(w, h, f, (usage & D3DUSAGE_RENDERTARGET) != 0, (usage & D3DUSAGE_DEPTHSTENCIL) != 0)) {
+        const UINT k = (UINT)cfg.shadowScale;
+        HRESULT hr = o_CreateTexture(d, w * k, h * k, lv, usage, f, pool, out, sh);
+        if (SUCCEEDED(hr)) {
+            if (f == D3DFMT_R32F) g_shadowBig = w * k;
+            Log("shadow: %s texture %ux%u (fmt %d) created at %ux%u", f == D3DFMT_R32F ? "shadow map" : "depth", w, h, f, w * k, h * k);
+            return hr;
+        }
+        Log("shadow: %ux%u at %ux scale failed (0x%08lx) - normal size", w, h, k, hr);
+        if (f == D3DFMT_R32F) cfg.shadowScale = 1;
+    }
+    return o_CreateTexture(d, w, h, lv, usage, f, pool, out, sh);
+}
+static bool IsBigShadow(IDirect3DSurface9* s)
+{
+    if (!s || !g_shadowBig) return false;
+    D3DSURFACE_DESC dd;
+    return SUCCEEDED(s->GetDesc(&dd)) && dd.Format == D3DFMT_R32F && dd.Width == g_shadowBig && dd.Height == g_shadowBig;
+}
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetViewport)(IDirect3DDevice9*, const D3DVIEWPORT9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_GetViewport)(IDirect3DDevice9*, D3DVIEWPORT9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetScissor)(IDirect3DDevice9*, const RECT*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_GetScissor)(IDirect3DDevice9*, RECT*);
+static PFN_SetViewport o_SetViewport = nullptr;
+static PFN_GetViewport o_GetViewport = nullptr;
+static PFN_SetScissor  o_SetScissor = nullptr;
+static PFN_GetScissor  o_GetScissor = nullptr;
+static HRESULT STDMETHODCALLTYPE hk_SetViewport(IDirect3DDevice9* d, const D3DVIEWPORT9* vp)
+{
+    if (g_rt0Scale > 1 && vp && !g_inPostFX) {
+        D3DVIEWPORT9 v = *vp; const DWORD k = g_rt0Scale;
+        v.X *= k; v.Y *= k; v.Width *= k; v.Height *= k;
+        return o_SetViewport(d, &v);
+    }
+    return o_SetViewport(d, vp);
+}
+static HRESULT STDMETHODCALLTYPE hk_GetViewport(IDirect3DDevice9* d, D3DVIEWPORT9* vp)
+{
+    HRESULT hr = o_GetViewport(d, vp);
+    if (SUCCEEDED(hr) && vp && g_rt0Scale > 1 && !g_inPostFX) {
+        const DWORD k = g_rt0Scale;
+        vp->X /= k; vp->Y /= k; vp->Width /= k; vp->Height /= k;
+    }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hk_SetScissor(IDirect3DDevice9* d, const RECT* r)
+{
+    if (g_rt0Scale > 1 && r && !g_inPostFX) {
+        const LONG k = g_rt0Scale;
+        RECT x = { r->left * k, r->top * k, r->right * k, r->bottom * k };
+        return o_SetScissor(d, &x);
+    }
+    return o_SetScissor(d, r);
+}
+static HRESULT STDMETHODCALLTYPE hk_GetScissor(IDirect3DDevice9* d, RECT* r)
+{
+    HRESULT hr = o_GetScissor(d, r);
+    if (SUCCEEDED(hr) && r && g_rt0Scale > 1 && !g_inPostFX) {
+        const LONG k = g_rt0Scale;
+        r->left /= k; r->top /= k; r->right /= k; r->bottom /= k;
+    }
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE hk_SetRT(IDirect3DDevice9* d, DWORD idx, IDirect3DSurface9* s)
 {
+    if (idx == 0) {
+        const int was = g_rt0Scale;
+        g_rt0Scale = IsBigShadow(s) ? cfg.shadowScale : 1;
+        static bool logged = false;
+        if (g_rt0Scale > 1 && was == 1 && !logged) { logged = true; Log("shadow: rendering into the %ux%u shadow map", g_shadowBig, g_shadowBig); }
+    }
     if (idx == 0 && !g_inPostFX) BeforeHudOnSetRT(d, s);
     if (g_tracing && !g_inPostFX) {
         if (idx == 0) {
@@ -2304,6 +2543,11 @@ static HRESULT STDMETHODCALLTYPE hk_SetRT(IDirect3DDevice9* d, DWORD idx, IDirec
 }
 static HRESULT STDMETHODCALLTYPE hk_Clear(IDirect3DDevice9* d, DWORD n, const D3DRECT* r, DWORD f, D3DCOLOR c, float z, DWORD st)
 {
+    if (g_rt0Scale > 1 && n && r && !g_inPostFX) {
+        std::vector<D3DRECT> x(r, r + n);
+        for (auto& q : x) { q.x1 *= g_rt0Scale; q.y1 *= g_rt0Scale; q.x2 *= g_rt0Scale; q.y2 *= g_rt0Scale; }
+        return o_Clear(d, n, x.data(), f, c, z, st);
+    }
     if (g_tracing && !g_inPostFX)
         Log("  clear flags=0x%lx color=%08lx (seg %d, after %d draws)", f, (unsigned long)c, g_seg, g_segDraws);
     return o_Clear(d, n, r, f, c, z, st);
@@ -2364,6 +2608,14 @@ static void HookTraceVtbl(IDirect3DDevice9* dev)
     if ((p = PatchVtbl(dev, 34, (void*)hk_StretchRect))) o_StretchRect = (PFN_StretchRect)p;
     if ((p = PatchVtbl(dev, 37, (void*)hk_SetRT)))       o_SetRT = (PFN_SetRT)p;
     if ((p = PatchVtbl(dev, 43, (void*)hk_Clear)))       o_Clear = (PFN_Clear)p;
+    if (cfg.shadowScale > 1) {
+        if ((p = PatchVtbl(dev, 23, (void*)hk_CreateTexture))) o_CreateTexture = (PFN_CreateTexture)p;
+        if ((p = PatchVtbl(dev, 47, (void*)hk_SetViewport)))   o_SetViewport = (PFN_SetViewport)p;
+        if ((p = PatchVtbl(dev, 48, (void*)hk_GetViewport)))   o_GetViewport = (PFN_GetViewport)p;
+        if ((p = PatchVtbl(dev, 75, (void*)hk_SetScissor)))    o_SetScissor = (PFN_SetScissor)p;
+        if ((p = PatchVtbl(dev, 76, (void*)hk_GetScissor)))    o_GetScissor = (PFN_GetScissor)p;
+        Log("shadow: shadow maps at %dx resolution", cfg.shadowScale);
+    }
     if ((p = PatchVtbl(dev, 81, (void*)hk_DP)))          o_DP = (PFN_DP)p;
     if ((p = PatchVtbl(dev, 82, (void*)hk_DIP)))         o_DIP = (PFN_DIP)p;
     if ((p = PatchVtbl(dev, 83, (void*)hk_DPUP)))        o_DPUP = (PFN_DPUP)p;
@@ -2437,6 +2689,11 @@ static HRESULT STDMETHODCALLTYPE hk_CreateDS(IDirect3DDevice9* dev, UINT w, UINT
                                              DWORD msq, BOOL discard, IDirect3DSurface9** out, HANDLE* shared)
 {
     const D3DFORMAT INTZ = (D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z');
+    if (out && !shared && ms == D3DMULTISAMPLE_NONE && ShadowCandidate(w, h, fmt, false, true)) {
+        const UINT k = (UINT)cfg.shadowScale;
+        HRESULT hr = o_CreateDS(dev, w * k, h * k, fmt, ms, msq, discard, out, shared);
+        if (SUCCEEDED(hr)) { Log("shadow: depth buffer %ux%u (fmt %d) created at %ux%u", w, h, fmt, w * k, h * k); return hr; }
+    }
     if (cfg.aoPrecise && out && !shared && ms == D3DMULTISAMPLE_NONE && w == g_ppW && h == g_ppH &&
         (fmt == D3DFMT_D24S8 || fmt == D3DFMT_D24X8)) {
         if (g_intzSupport < 0) {
@@ -2905,6 +3162,8 @@ static bool SaveConfig()
     cfg.fxEnabled = g_fx.enabled ? 1 : 0;
     cfg.aoMode = g_fx.aoMode;
     WriteIniInt("Display", "Borderless", cfg.borderless);
+    WriteIniInt("Game", "SkipIntros", cfg.skipIntros);
+    WriteIniInt("Shadows", "Scale", cfg.shadowScale);
     WriteIniInt("Display", "VSync", cfg.vsync);
     WriteIniInt("Display", "FPSLimit", cfg.fpsLimit);
     WriteIniInt("Focus", "PauseOnFocusLoss", cfg.pauseOnFocusLoss);
@@ -3023,7 +3282,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.9.8", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.10.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -3149,6 +3408,43 @@ static void DrawMenu()
             static const char* vs[] = { "Game decides", "Force off", "Force on" };
             int vi = cfg.vsync + 1;
             if (ImGui::Combo("VSync", &vi, vs, 3)) cfg.vsync = vi - 1;
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Game")) {
+            CheckboxInt("Skip the intro logo movies", &cfg.skipIntros);
+            ImGui::TextDisabled("Only movies before the first 3D scene; story movies still play.");
+            static const char* sh[] = { "1x (game default)", "2x", "4x" };
+            int si = cfg.shadowScale == 4 ? 2 : cfg.shadowScale == 2 ? 1 : 0;
+            if (ImGui::Combo("Shadow resolution", &si, sh, 3)) cfg.shadowScale = si == 2 ? 4 : si == 1 ? 2 : 1;
+            if (g_shadowBig) ImGui::TextDisabled("Now: shadow map %ux%u (game asked for %ux%u). Applies at next launch.", g_shadowBig, g_shadowBig, g_shadowSize, g_shadowSize);
+            else ImGui::TextDisabled("Applies at next launch.");
+            ImGui::Separator();
+            ImGui::Text("Developer console");
+            if (!g_conOk) ImGui::TextDisabled("Unavailable (see the log: console:).");
+            else {
+                const bool live = g_pc && GetTickCount() - g_pcTick < 3000;
+                ImGui::TextDisabled(live ? "Ready. Unreal Engine 3 commands, e.g. slomo 0.5 / stat fps / show fog. Some are stripped from the release build."
+                                         : "Waiting for a player (load a save or start a game).");
+                ImGui::BeginChild("conhist", ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 8), ImGuiChildFlags_Borders);
+                EnterCriticalSection(&g_conCs);
+                for (auto& l : g_conHistory) ImGui::TextUnformatted(l.c_str());
+                static size_t lastN = 0;
+                if (g_conHistory.size() != lastN) { lastN = g_conHistory.size(); ImGui::SetScrollHereY(1.0f); }
+                LeaveCriticalSection(&g_conCs);
+                ImGui::EndChild();
+                static char buf[256] = "";
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##con", buf, sizeof buf, ImGuiInputTextFlags_EnterReturnsTrue) && buf[0]) {
+                    ConAddLine(std::string("> ") + buf);
+                    EnterCriticalSection(&g_conCs);
+                    snprintf(g_conPending, sizeof g_conPending, "%s", buf);
+                    g_conQueued = true;
+                    LeaveCriticalSection(&g_conCs);
+                    buf[0] = 0;
+                    ImGui::SetKeyboardFocusHere(-1);
+                }
+                ImGui::TextDisabled("Commands run when the game next pumps messages (close the menu if one seems stuck).");
+            }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Window & input")) {
@@ -3402,6 +3698,7 @@ static HRESULT STDMETHODCALLTYPE hk_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARA
     ExtrasRelease();
     MenuOnReset();
     IntzForget(); g_fx.intz = nullptr;
+    g_rt0Scale = 1;
     g_bbPtr = nullptr; g_curRT = nullptr; g_worldRT = nullptr; g_bbW = g_bbH = 0;
     DumpPP("Reset (game)", pp);
     ApplyPresentParams(pp, nullptr);
@@ -3563,7 +3860,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.9.8 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.10.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();
@@ -3572,6 +3869,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         InstallSupersampling(); // must run before the game reads its command line
         InstallAudioHook();
         InstallViewHooks();
+        InstallMovieHook();
+        InstallConsole();
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_cursorClipped) ClipCursor(nullptr);
         Log("shutdown. total D3DXCompileShader calls: %ld", g_compileCount);

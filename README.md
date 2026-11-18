@@ -1,4 +1,4 @@
-# APRenewal 0.9.8 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.10.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,19 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.10.0
+New **Game** tab in the menu (Insert):
+- **Skip intro logos** (`[Game] SkipIntros=1`, on by default). Movies that start before the first
+  3D scene are refused, so the game goes straight to the main menu. In-game movies (news reports)
+  still play. Each movie shows in the log as `movie: '<name>' skipped/playing`.
+- **Shadow resolution** (`[Shadows] Scale=2`, applies at next launch). The game's shadow map is 2048²
+  no matter what MaxShadowResolution says. APRenewal creates it 2x (4096²) or 4x (8192²) larger and
+  scales every draw into it, so shadow edges get sharper. Log: `shadow:`. If shadows break
+  (missing, shifted, striped), set Scale=1 and send the log.
+- **Developer console** (`[Game] Console=1`). Type Unreal Engine 3 commands into the Game tab once a
+  save is loaded (`slomo 0.5`, `stat fps`, `show fog`…). The release build stripped some commands; the
+  reply (or "(done)") shows under the input. Log: `console:`.
 
 ## New in 0.9.8
 - HDR is off on native Windows. The 0.9.7 highlight test showed the output never gets brighter than
