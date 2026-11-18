@@ -1,4 +1,4 @@
-# APRenewal 0.11.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.12.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,22 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.12.0
+**New menu layout:** Video (Image, Colour, Effects, Shadows & AO, View, HDR), Audio, Game,
+Diagnostics, Miscellaneous.
+
+**The game's own effects, tuned in its shaders** (Video → Effects, `[Effects]`; 100 % = the game):
+- **Bloom**: intensity, threshold, and *smooth bloom* — the quarter-res glow is now tent-filtered
+  instead of a single bilinear tap, so no blocky, shimmering halos.
+- **Depth of field**: strength (0 = off) and the same smoothing for its quarter-res blur.
+- **Fog**: density (0 = off).
+- **Motion blur**: strength (0 = off). The same pass holds the game's own edge anti-aliasing
+  (a blur along edges) and its unsharp-mask sharpening — both now have sliders.
+- **Gamma** (Video → Colour, `[Tonemap] Gamma`): the game encodes with a plain square root;
+  sRGB or 2.2 can be chosen. Default stays the game's.
+Bloom/DOF/gamma live in APRenewal's version of the final pass (`ReplaceFinalPass=1`).
+Diagnostics lists every recognised game shader and whether it's in use.
 
 ## New in 0.11.0 — game shader patching
 APRenewal now recognises the game's own shaders as they load (by the constant names compiled into

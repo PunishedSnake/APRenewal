@@ -125,7 +125,19 @@ struct Config {
     int  tmEnable      = 1;
     int  tmKnee        = 60;  // % of white where compression starts (linear, before the game's gamma)
     int  tmWhite       = 400; // scene value that maps to white, x100 (game's max scene colour is 4)
-    int  tmHue         = 60;  // % hue preservation (0 = per channel, highlights go to white)   // HDR on native Windows (never got above SDR white there)
+    int  tmHue         = 60;  // % hue preservation (0 = per channel, highlights go to white)
+    int  fxBlend       = 1;   // use our version of the final pass at all (master switch)
+    int  gammaMode     = 0;   // 0 game (square root), 1 sRGB, 2 gamma 2.2
+    // the game's own effects, tuned through its shaders (100 = the game's look)
+    int  bloomIntensity = 100;
+    int  bloomThreshold = 0;  // offset x100 on the game's threshold (its range is 0..4)
+    int  bloomSmooth   = 1;   // tent-filtered bloom upsample instead of one bilinear tap
+    int  dofStrength   = 100;
+    int  dofSmooth     = 1;
+    int  fogDensity    = 100;
+    int  motionBlur    = 100;
+    int  edgeAA        = 100; // the game's directional edge blur (inside its motion blur pass)
+    int  gameSharpen   = 100; // the game's unsharp mask (same pass)   // HDR on native Windows (never got above SDR white there)
     int  hdrPaper      = 200;   // nits for UI / SDR white
     int  hdrPeak       = 0;     // nits, 0 = what the display reports
     int  hdrHighlights = 100;   // percent highlight expansion
@@ -214,6 +226,18 @@ static void LoadConfig()
     cfg.tmKnee        = GetPrivateProfileIntA("Tonemap", "Knee", 60, g_ini);
     cfg.tmWhite       = GetPrivateProfileIntA("Tonemap", "White", 400, g_ini);
     cfg.tmHue         = GetPrivateProfileIntA("Tonemap", "HuePreserve", 60, g_ini);
+    cfg.fxBlend       = GetPrivateProfileIntA("Tonemap", "ReplaceFinalPass", 1, g_ini) ? 1 : 0;
+    cfg.gammaMode     = GetPrivateProfileIntA("Tonemap", "Gamma", 0, g_ini);
+    if (cfg.gammaMode < 0 || cfg.gammaMode > 2) cfg.gammaMode = 0;
+    cfg.bloomIntensity = GetPrivateProfileIntA("Effects", "BloomIntensity", 100, g_ini);
+    cfg.bloomThreshold = GetPrivateProfileIntA("Effects", "BloomThreshold", 0, g_ini);
+    cfg.bloomSmooth   = GetPrivateProfileIntA("Effects", "BloomSmooth", 1, g_ini) ? 1 : 0;
+    cfg.dofStrength   = GetPrivateProfileIntA("Effects", "DepthOfField", 100, g_ini);
+    cfg.dofSmooth     = GetPrivateProfileIntA("Effects", "DepthOfFieldSmooth", 1, g_ini) ? 1 : 0;
+    cfg.fogDensity    = GetPrivateProfileIntA("Effects", "FogDensity", 100, g_ini);
+    cfg.motionBlur    = GetPrivateProfileIntA("Effects", "MotionBlur", 100, g_ini);
+    cfg.edgeAA        = GetPrivateProfileIntA("Effects", "GameEdgeAA", 100, g_ini);
+    cfg.gameSharpen   = GetPrivateProfileIntA("Effects", "GameSharpen", 100, g_ini);
     cfg.hdrPaper      = GetPrivateProfileIntA("HDR", "PaperWhite", 0, g_ini);   // 0 = Windows' SDR content brightness
     cfg.hdrCurve      = GetPrivateProfileIntA("HDR", "Curve", 0, g_ini) ? 1 : 0;
     cfg.hdrCompensate = GetPrivateProfileIntA("HDR", "CompensateSRGB", 0, g_ini) ? 1 : 0;
@@ -2649,25 +2673,33 @@ static const CtabConst* CtabFind(const std::vector<CtabConst>& v, const char* na
     return nullptr;
 }
 
-enum { SK_BLEND_BLOOM = 1, SK_BLEND_DOF = 2, SK_SHADOW = 3 };
+enum { SK_BLEND_BLOOM = 1, SK_BLEND_DOF = 2, SK_SHADOW = 3, SK_FOG = 4, SK_MBLUR = 5, SK_BLOOMGATHER = 6, SK_COUNT = 7 };
 struct GameShader {
     int kind = 0;
     IDirect3DPixelShader9* repl = nullptr;   // our replacement (blend shaders)
     int paramReg = -1;                       // our extra constant (blend shaders)
     int offReg[3] = { -1, -1, -1 }, offCnt[3] = {};   // shadow sample offsets (UV units of the 2048 map)
     int sizeReg = -1;                        // ShadowBufferSize
+    // effects: registers of the constants we scale (-1 = absent)
+    int fogScaleReg = -1;
+    int velStaticReg = -1, velDynReg = -1, edgeTableReg = -1, unsharpReg = -1;
+    int bloomThrReg = -1;
     int uses = 0;
 };
 static std::unordered_map<IDirect3DPixelShader9*, GameShader> g_gameShaders;
 static GameShader* g_curGS = nullptr;            // info for the game shader bound right now
 static bool  g_ownShaderCreate = false;
 static float g_psc[256][4];                      // mirror of the pixel shader float constants
-static int   g_shCount[4] = {};                  // recognised shaders per kind
+static int   g_shCount[SK_COUNT] = {};           // recognised shaders per kind
+static int   g_shUsed[SK_COUNT] = {};            // ... and seen drawing
 static int   g_shReplFail = 0;
 
 // Final HDR -> LDR pass. Same maths as the game's AP_BloomBlend / DOFAndBloomBlend shaders, except
 // that the hard clip (saturate) before the game's gamma becomes a smooth highlight roll-off.
 static const char* kBlendCommonHLSL = R"HLSL(
+// apTM:  x roll-off on, y knee, z white, w hue preservation
+// apTM2: x sRGB weight, y gamma-2.2 weight (rest = the game's square root), z bloom intensity, w DOF strength
+// apTM3: xy texel size of the quarter-res bloom/DOF buffers, z bloom smoothing, w DOF smoothing
 float3 apRolloffCurve(float3 x, float k, float s, float w)
 {
     float3 u = max(x - k, 0) / s;
@@ -2693,7 +2725,9 @@ float3 apFinish(float3 c)
 {
     float3 lin = (GammaOverlayColor.rgb + c) * GammaColorScaleAndInverse.rgb;
     float3 o = lerp(saturate(lin), apRolloff(lin), apTM.x);
-    o = lerp(o, sqrt(o), GammaColorScaleAndInverse.a);
+    float3 srgb = o <= 0.0031308 ? o * 12.92 : 1.055 * pow(max(o, 1e-6), 1.0 / 2.4) - 0.055;
+    float3 enc = sqrt(o) * (1 - apTM2.x - apTM2.y) + srgb * apTM2.x + pow(max(o, 1e-6), 1.0 / 2.2) * apTM2.y;
+    o = lerp(o, enc, GammaColorScaleAndInverse.a);
     // brightness, Photoshop-style contrast, cheap contrast, colour filter (the game's order)
     o = o * HSBContrast.x;
     o = (o - HSBContrast.y) * HSBContrast.z;
@@ -2707,10 +2741,28 @@ float3 apFinish(float3 c)
     n = n * (oldY / newY);
     return lerp(n, float3(1, 1, 1), smoothstep(0.95, 1.0, oldY));
 }
-float3 apBloom(float2 uv)
+float3 apBloomTap(float2 uv)
 {
     float4 p = tex2D(LensFilterImage, uv);
-    return p.rgb * (p.a * p.a) * 4.0;
+    return p.rgb * (p.a * p.a) * 4.0;          // the game's RGBE-ish bloom packing
+}
+float3 apBloom(float2 uv)
+{
+    float2 t = apTM3.xy;
+    float3 one = apBloomTap(uv);
+    // 3x3 tent over the quarter-res buffer: no more blocky, shimmering bloom edges
+    float3 tent = 4 * one
+        + 2 * (apBloomTap(uv + float2(t.x, 0)) + apBloomTap(uv - float2(t.x, 0)) + apBloomTap(uv + float2(0, t.y)) + apBloomTap(uv - float2(0, t.y)))
+        + apBloomTap(uv + t) + apBloomTap(uv - t) + apBloomTap(uv + float2(t.x, -t.y)) + apBloomTap(uv + float2(-t.x, t.y));
+    return lerp(one, tent / 16, apTM3.z) * apTM2.z;
+}
+float4 apTent(sampler2D s, float2 uv)
+{
+    float2 t = apTM3.xy;
+    float4 c = 4 * tex2D(s, uv)
+        + 2 * (tex2D(s, uv + float2(t.x, 0)) + tex2D(s, uv - float2(t.x, 0)) + tex2D(s, uv + float2(0, t.y)) + tex2D(s, uv - float2(0, t.y)))
+        + tex2D(s, uv + t) + tex2D(s, uv - t) + tex2D(s, uv + float2(t.x, -t.y)) + tex2D(s, uv + float2(-t.x, t.y));
+    return lerp(tex2D(s, uv), c / 16, apTM3.w);
 }
 )HLSL";
 static const char* kBlendBloomHLSL = R"HLSL(
@@ -2731,9 +2783,9 @@ void main(float2 UV : TEXCOORD0, float2 SceneUV : TEXCOORD1, out float4 OutColor
 {
     float4 f = tex2D(SceneColorTexture, SceneUV);           // colour + depth in alpha
     f.w = min(f.w, 65000);
-    float coc = saturate(apUnfocused(f.w));
-    float4 back = tex2D(NewDOF_noBleedBlurMap, SceneUV);
-    float4 fore = tex2D(NewDOF_bleedBlurMap, SceneUV);
+    float coc = saturate(apUnfocused(f.w) * apTM2.w);
+    float4 back = apTent(NewDOF_noBleedBlurMap, SceneUV);
+    float4 fore = apTent(NewDOF_bleedBlurMap, SceneUV);
     float3 cLarge = f.a < PackedParameters.r ? f.rgb : back.rgb;
     float2 px = c_finalColorScaleLow.xy;
     float3 cSmall = 0.25 * (tex2D(SceneColorTexture, SceneUV + px * float2( 0.5, -1.5)).rgb +
@@ -2742,7 +2794,7 @@ void main(float2 UV : TEXCOORD0, float2 SceneUV : TEXCOORD1, out float4 OutColor
                            tex2D(SceneColorTexture, SceneUV + px * float2( 1.5,  0.5)).rgb);
     float3 dof = lerp(f.rgb, cSmall, saturate(coc / 0.33));
     dof = lerp(dof, cLarge, saturate((coc - 0.33) / (1.0 - 0.33)));
-    dof = lerp(dof, fore.rgb, saturate(smoothstep(0.0, 0.5, fore.a)));
+    dof = lerp(dof, fore.rgb, saturate(smoothstep(0.0, 0.5, fore.a)) * saturate(apTM2.w));
     float3 c = apApplySat(dof + apBloom(UV));
     float2 v = SceneUV - 0.5;
     c *= 1 - saturate((2 * dot(v, v) - apVignetteMaskParameters.x) * apVignetteMaskParameters.y);
@@ -2766,7 +2818,8 @@ static IDirect3DPixelShader9* BuildReplacement(IDirect3DDevice9* dev, const std:
         src += line;
     }
     paramReg = maxC + 1;
-    snprintf(line, sizeof line, "float4 apTM : register(c%d);   // on, knee, white, hue\n", paramReg);
+    snprintf(line, sizeof line, "float4 apTM : register(c%d);\nfloat4 apTM2 : register(c%d);\nfloat4 apTM3 : register(c%d);\n",
+             paramReg, paramReg + 1, paramReg + 2);
     src += line;
     src += kBlendCommonHLSL;
     src += body;
@@ -2776,7 +2829,11 @@ static IDirect3DPixelShader9* BuildReplacement(IDirect3DDevice9* dev, const std:
     std::vector<CtabConst> mine;
     ParseCtab((const DWORD*)BufPtr(code), mine);
     for (auto& k : mine) {
-        if (k.name == "apTM") { if (k.reg != paramReg) { BufRelease(code); return nullptr; } continue; }
+        if (k.name == "apTM" || k.name == "apTM2" || k.name == "apTM3") {
+            const int want = paramReg + (k.name == "apTM" ? 0 : k.name == "apTM2" ? 1 : 2);
+            if (k.reg != want) { Log("shaders: %s parameter register moved - keeping the game's shader", name); BufRelease(code); return nullptr; }
+            continue;
+        }
         const CtabConst* o = CtabFind(ct, k.name.c_str());
         if (!o || o->set != k.set || o->reg != k.reg) {
             Log("shaders: %s register mismatch on %s - keeping the game's shader", name, k.name.c_str());
@@ -2812,6 +2869,18 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
         if (!gs.repl) g_shReplFail++;
         Log("shaders: game final blend%s recognised (%p) - %s", dof ? " with DOF" : "", (void*)*out,
             gs.repl ? "highlight roll-off version ready" : "replacement FAILED, game shader kept");
+    } else if (CtabFind(ct, "FogDistanceScale") && CtabFind(ct, "FogInScattering") && CtabFind(ct, "FogStartDistance")) {
+        gs.kind = SK_FOG;
+        gs.fogScaleReg = CtabFind(ct, "FogDistanceScale")->reg;
+    } else if (CtabFind(ct, "VelocityBuffer") && CtabFind(ct, "PrevViewProjMatrix")) {
+        gs.kind = SK_MBLUR;
+        if (auto k = CtabFind(ct, "StaticVelocityParameters"))  gs.velStaticReg = k->reg;
+        if (auto k = CtabFind(ct, "DynamicVelocityParameters")) gs.velDynReg = k->reg;
+        if (auto k = CtabFind(ct, "apOffsetAndWeightTable"))    gs.edgeTableReg = k->reg;
+        if (auto k = CtabFind(ct, "apUnsharpMaskAmount"))       gs.unsharpReg = k->reg;
+    } else if (CtabFind(ct, "BloomThreshold") && CtabFind(ct, "SceneColorTexture") && ct.size() == 2) {
+        gs.kind = SK_BLOOMGATHER;
+        gs.bloomThrReg = CtabFind(ct, "BloomThreshold")->reg;
     } else if (CtabFind(ct, "ScreenToShadowMatrix") && CtabFind(ct, "ShadowDepthTexture")) {
         gs.kind = SK_SHADOW;
         const char* names[3] = { "SampleOffsets", "RefiningSampleOffsets", "EdgeSampleOffsets" };
@@ -2823,6 +2892,8 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
     (*out)->AddRef();   // keep the game's shader alive so its pointer is never reused for another one
     g_gameShaders[*out] = gs;
     g_shCount[gs.kind]++;
+    static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather" };
+    if (gs.kind >= SK_FOG) Log("shaders: %s recognised (%p)", kn[gs.kind], (void*)*out);
     return hr;
 }
 
@@ -2836,37 +2907,90 @@ static HRESULT STDMETHODCALLTYPE hk_SetPSConstF(IDirect3DDevice9* d, UINT reg, c
 
 // Before a draw with a recognised game shader: feed our values. After: put the game's back.
 static int g_preDrawLo = -1, g_preDrawHi = -1;
+static IDirect3DDevice9* g_preDrawDev = nullptr;
+// write one changed register of the game's (restored after the draw)
+static void PdSet(int reg, const float* v, int n = 1)
+{
+    if (reg < 0 || reg + n > 256) return;
+    o_SetPSConstF(g_preDrawDev, reg, v, n);
+    g_preDrawLo = g_preDrawLo < 0 ? reg : std::min(g_preDrawLo, reg);
+    g_preDrawHi = std::max(g_preDrawHi, reg + n - 1);
+}
+static bool BlendReplaced() { return cfg.fxBlend != 0; }
 static void PreDraw(IDirect3DDevice9* d)
 {
     g_preDrawLo = g_preDrawHi = -1;
     GameShader* gs = g_curGS;
     if (!gs || g_inPostFX || !o_SetPSConstF) return;
-    if (gs->kind == SK_BLEND_BLOOM || gs->kind == SK_BLEND_DOF) {
-        if (!gs->repl || !cfg.tmEnable || gs->paramReg < 0 || gs->paramReg > 255) return;
-        const float p[4] = { 1.0f, cfg.tmKnee / 100.0f, cfg.tmWhite / 100.0f, cfg.tmHue / 100.0f };
-        o_SetPSConstF(d, gs->paramReg, p, 1);   // our own register - nothing of the game's to restore
-        if (!gs->uses++) Log("shaders: final blend%s in use - highlight roll-off active", gs->kind == SK_BLEND_DOF ? " (DOF)" : "");
+    g_preDrawDev = d;
+    if (!gs->uses++) {
+        static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather" };
+        Log("shaders: %s %p in use", kn[gs->kind], (void*)gs);
+        g_shUsed[gs->kind]++;
+    }
+    auto clamp01 = [](int v) { return std::min(std::max(v, 0), 100) / 100.0f; };
+    switch (gs->kind) {
+    case SK_BLEND_BLOOM: case SK_BLEND_DOF: {
+        if (!gs->repl || !BlendReplaced() || gs->paramReg < 0 || gs->paramReg > 253) return;
+        const float bw = g_ppW ? 1.0f / (g_ppW / 4 + 2) : 1.0f / 642, bh = g_ppH ? 1.0f / (g_ppH / 4 + 2) : 1.0f / 362;
+        const float p[3][4] = {
+            { cfg.tmEnable ? 1.0f : 0.0f, cfg.tmKnee / 100.0f, cfg.tmWhite / 100.0f, cfg.tmHue / 100.0f },
+            { cfg.gammaMode == 1 ? 1.0f : 0.0f, cfg.gammaMode == 2 ? 1.0f : 0.0f, std::max(cfg.bloomIntensity, 0) / 100.0f, std::max(cfg.dofStrength, 0) / 100.0f },
+            { bw, bh, cfg.bloomSmooth ? 1.0f : 0.0f, cfg.dofSmooth ? 1.0f : 0.0f } };
+        o_SetPSConstF(d, gs->paramReg, &p[0][0], 3);   // our own registers - nothing of the game's to restore
         return;
     }
-    if (gs->kind == SK_SHADOW && g_shadowBig && g_shadowSize && cfg.shadowScale > 1) {
+    case SK_SHADOW: {
+        if (!g_shadowBig || !g_shadowSize || cfg.shadowScale <= 1) return;
         const float k = (float)cfg.shadowScale;
-        const float f = (1.0f / k) + (1.0f - 1.0f / k) * (std::min(std::max(cfg.shadowSoft, 0), 100) / 100.0f);
+        const float f = (1.0f / k) + (1.0f - 1.0f / k) * clamp01(cfg.shadowSoft);
         float tmp[64][4];
         for (int i = 0; i < 3; i++) {
             const int r = gs->offReg[i], n = gs->offCnt[i];
             if (r < 0 || n <= 0 || r + n > 256 || n > 64) continue;
             for (int j = 0; j < n; j++) for (int c = 0; c < 4; c++) tmp[j][c] = g_psc[r + j][c] * f;
-            o_SetPSConstF(d, r, &tmp[0][0], n);
-            g_preDrawLo = g_preDrawLo < 0 ? r : std::min(g_preDrawLo, r);
-            g_preDrawHi = std::max(g_preDrawHi, r + n - 1);
+            PdSet(r, &tmp[0][0], n);
         }
         if (gs->sizeReg >= 0 && gs->sizeReg < 256) {
             const float sz[4] = { g_psc[gs->sizeReg][0] * k, g_psc[gs->sizeReg][1] * k, g_psc[gs->sizeReg][2], g_psc[gs->sizeReg][3] };
-            o_SetPSConstF(d, gs->sizeReg, sz, 1);
-            g_preDrawLo = g_preDrawLo < 0 ? gs->sizeReg : std::min(g_preDrawLo, gs->sizeReg);
-            g_preDrawHi = std::max(g_preDrawHi, gs->sizeReg);
+            PdSet(gs->sizeReg, sz);
         }
-        if (!gs->uses++) Log("shaders: shadow projection %p in use - filter offsets x%.3f, buffer size x%d", (void*)gs, f, cfg.shadowScale);
+        return;
+    }
+    case SK_FOG: {
+        if (cfg.fogDensity == 100 || gs->fogScaleReg < 0) return;
+        const float m = std::max(cfg.fogDensity, 0) / 100.0f;   // exp2(scale * distance): scale 0 = no fog
+        const float* o = g_psc[gs->fogScaleReg];
+        const float v[4] = { o[0] * m, o[1] * m, o[2] * m, o[3] * m };
+        PdSet(gs->fogScaleReg, v);
+        return;
+    }
+    case SK_MBLUR: {
+        if (cfg.motionBlur != 100) {
+            const float m = std::max(cfg.motionBlur, 0) / 100.0f;   // velocity scale; the clamp (zw) stays
+            if (gs->velStaticReg >= 0) { const float* o = g_psc[gs->velStaticReg]; const float v[4] = { o[0] * m, o[1] * m, o[2], o[3] }; PdSet(gs->velStaticReg, v); }
+            if (gs->velDynReg >= 0)    { const float* o = g_psc[gs->velDynReg];    const float v[4] = { o[0] * m, o[1] * m, o[2], o[3] }; PdSet(gs->velDynReg, v); }
+        }
+        if (cfg.edgeAA != 100 && gs->edgeTableReg >= 0) {      // table[0].w = weight of the edge blur
+            const float* o = g_psc[gs->edgeTableReg];
+            const float v[4] = { o[0], o[1], o[2], o[3] * std::max(cfg.edgeAA, 0) / 100.0f };
+            PdSet(gs->edgeTableReg, v);
+        }
+        if (cfg.gameSharpen != 100 && gs->unsharpReg >= 0) {
+            const float* o = g_psc[gs->unsharpReg];
+            const float v[4] = { o[0] * std::max(cfg.gameSharpen, 0) / 100.0f, o[1], o[2], o[3] };
+            PdSet(gs->unsharpReg, v);
+        }
+        return;
+    }
+    case SK_BLOOMGATHER: {
+        if (cfg.bloomThreshold == 0 || gs->bloomThrReg < 0) return;
+        const float* o = g_psc[gs->bloomThrReg];
+        const float t = std::min(std::max(o[0] + cfg.bloomThreshold / 100.0f, 0.0f), 3.9f);
+        const float v[4] = { t, 1.0f / (4.0f - t), o[2], o[3] };   // (threshold, 1 / (4 - threshold))
+        PdSet(gs->bloomThrReg, v);
+        return;
+    }
     }
 }
 static void PostDrawRestore(IDirect3DDevice9* d)
@@ -2897,7 +3021,7 @@ static HRESULT STDMETHODCALLTYPE hk_SetPS(IDirect3DDevice9* d, IDirect3DPixelSha
         auto it = g_gameShaders.find(ps);
         if (it != g_gameShaders.end()) {
             g_curGS = &it->second;
-            if (g_curGS->repl && cfg.tmEnable) return o_SetPS(d, g_curGS->repl);
+            if (g_curGS->repl && BlendReplaced()) return o_SetPS(d, g_curGS->repl);
         }
     }
     return o_SetPS(d, ps);
@@ -3472,6 +3596,17 @@ static bool SaveConfig()
     WriteIniInt("Tonemap", "Knee", cfg.tmKnee);
     WriteIniInt("Tonemap", "White", cfg.tmWhite);
     WriteIniInt("Tonemap", "HuePreserve", cfg.tmHue);
+    WriteIniInt("Tonemap", "ReplaceFinalPass", cfg.fxBlend);
+    WriteIniInt("Tonemap", "Gamma", cfg.gammaMode);
+    WriteIniInt("Effects", "BloomIntensity", cfg.bloomIntensity);
+    WriteIniInt("Effects", "BloomThreshold", cfg.bloomThreshold);
+    WriteIniInt("Effects", "BloomSmooth", cfg.bloomSmooth);
+    WriteIniInt("Effects", "DepthOfField", cfg.dofStrength);
+    WriteIniInt("Effects", "DepthOfFieldSmooth", cfg.dofSmooth);
+    WriteIniInt("Effects", "FogDensity", cfg.fogDensity);
+    WriteIniInt("Effects", "MotionBlur", cfg.motionBlur);
+    WriteIniInt("Effects", "GameEdgeAA", cfg.edgeAA);
+    WriteIniInt("Effects", "GameSharpen", cfg.gameSharpen);
     WriteIniInt("Display", "VSync", cfg.vsync);
     WriteIniInt("Display", "FPSLimit", cfg.fpsLimit);
     WriteIniInt("Focus", "PauseOnFocusLoss", cfg.pauseOnFocusLoss);
@@ -3590,89 +3725,169 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.11.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.12.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
-        if (ImGui::BeginTabItem("Image")) {
-            bool en = g_fx.enabled;
-            if (ImGui::Checkbox("Post-processing (F11)", &en)) g_fx.enabled = en;
-            CheckboxInt("Apply before the UI (keeps HUD and menus sharp)", &cfg.beforeHud);
-            CheckboxInt("FXAA anti-aliasing", &cfg.fxaa);
-            ImGui::SliderInt("Sharpening", &cfg.sharpen, 0, 100, cfg.sharpen ? "%d %%" : "off");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Colour")) {
-            CheckboxInt("Colour grading", &cfg.gradeEnable);
-            ImGui::SliderInt("Exposure", &cfg.gradeExposure, -150, 150, "%d (1/100 stop)");
-            ImGui::SliderInt("Contrast", &cfg.gradeContrast, 70, 160, "%d %%");
-            ImGui::SliderInt("Vibrance", &cfg.gradeVibrance, -50, 150, "%d %%");
-            ImGui::SliderInt("Saturation", &cfg.gradeSaturation, 0, 200, "%d %%");
-            ImGui::SliderInt("Black level", &cfg.gradeBlack, -10, 30, "%d");
-            ImGui::SliderInt("Temperature", &cfg.gradeTemp, -100, 100, cfg.gradeTemp ? (cfg.gradeTemp > 0 ? "%d warm" : "%d cool") : "neutral");
-            if (ImGui::Button("Defaults (vivid)")) { cfg.gradeExposure = 10; cfg.gradeContrast = 106; cfg.gradeVibrance = 45; cfg.gradeSaturation = 100; cfg.gradeBlack = 1; cfg.gradeTemp = 0; }
-            ImGui::SameLine();
-            if (ImGui::Button("Neutral")) { cfg.gradeExposure = 0; cfg.gradeContrast = 100; cfg.gradeVibrance = 0; cfg.gradeSaturation = 100; cfg.gradeBlack = 0; cfg.gradeTemp = 0; }
-            ImGui::TextDisabled("Runs on the 3D image only, before the HUD. Part of post-processing (F11).");
-            ImGui::Separator();
-            CheckboxInt("Highlight roll-off (instead of the game's hard clip)", &cfg.tmEnable);
-            ImGui::SliderInt("Roll-off starts at", &cfg.tmKnee, 30, 95, "%d %% of white");
-            ImGui::SliderInt("White point", &cfg.tmWhite, 150, 1000, "%d %%");
-            ImGui::SliderInt("Keep highlight colour", &cfg.tmHue, 0, 100, "%d %%");
-            if (ImGui::Button("Roll-off defaults")) { cfg.tmKnee = 60; cfg.tmWhite = 400; cfg.tmHue = 60; }
-            ImGui::TextDisabled("Game's final pass: %d plain + %d DOF variant(s) recognised%s.", g_shCount[SK_BLEND_BLOOM], g_shCount[SK_BLEND_DOF],
-                                g_shReplFail ? ", some replacements FAILED (see log)" : "");
-            ImGui::TextDisabled("Lamps, windows and sky keep detail instead of clipping to flat white. Toggle to compare.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("HDR")) { if (!HdrAllowed()) {
-            ImGui::TextWrapped("HDR is off on Windows: on the tested setup the output never got brighter than SDR white, "
-                               "so it only cost performance. For HDR on Windows use NVIDIA RTX HDR (NVIDIA app) with this off.");
-            ImGui::TextWrapped("Under Proton with gamescope HDR (Steam Deck OLED, Linux desktops) it is available. "
-                               "To try it on Windows anyway: [HDR] AllowWindows=1 in APRenewal.ini.");
-            ImGui::EndTabItem();
-        } else {
-            CheckboxInt("HDR output (applies at next launch)", &cfg.hdrEnable);
-            CheckboxInt("Reference: plain SDR exactly as Windows shows it (A/B)", &cfg.hdrReference);
-            ImGui::Checkbox("Test pattern (compare with hdr_testpattern.png in an SDR viewer)", &g_hdrPattern);
-            CheckboxInt("Compensate: output gets decoded as sRGB twice (fixes washed-to-neon look)", &cfg.hdrCompensate);
-            if (g_hdrPattern) ImGui::Checkbox("Highlight test: bottom row = 1x, 1.25x, 1.5x, 2x, 3x, 4x paper white", &g_hdrPatternHi);
-            if (g_hdrPattern)
-                ImGui::TextWrapped("If the grey ramp turns flat white after about half way and the 75%% bars look like pure primaries, "
-                                   "Windows is treating the game's HDR picture as SDR. On NVIDIA: Control Panel > Manage 3D settings > "
-                                   "Vulkan/OpenGL present method > Prefer layered on DXGI Swapchain.");
-            ImGui::SliderInt("Paper white", &cfg.hdrPaper, 0, 400, cfg.hdrPaper ? "%d nits" : "Windows setting");
-            static const char* curves[] = { "sRGB (like Windows)", "Gamma 2.2 (deeper shadows)" };
-            ImGui::Combo("SDR curve", &cfg.hdrCurve, curves, 2);
-            ImGui::SliderInt("Peak brightness", &cfg.hdrPeak, 0, 4000, cfg.hdrPeak ? "%d nits" : "display's own");
-            ImGui::SliderInt("Saturation", &cfg.hdrSaturation, 50, 130, "%d %%");
-            if (g_hdrActive && HdrPaperNits() > HdrPeakNits() * 0.75f)
-                ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Paper white is close to the display peak: whites will look blown out.");
-            ImGui::SliderInt("Highlights", &cfg.hdrHighlights, 0, 150, cfg.hdrHighlights ? "%d %%" : "off (SDR in HDR)");
-            if (g_hdrActive)
-                ImGui::TextDisabled("Active: %s - %s", g_hdrPQ ? "HDR10 (PQ)" : "scRGB", g_hdrDiag);
-            if (g_hdrActive)
-                ImGui::TextDisabled("Paper white %.0f nits (Windows: %.0f), peak %.0f (display reports %.0f), exposure fit %.3g",
-                                    HdrPaperNits(), g_winSdrWhite, HdrPeakNits(), g_hdrMaxNits, g_hdrK);
-            else if (cfg.hdrEnable && g_vkHdrExt == 0)
-                ImGui::TextWrapped("Not active: Vulkan offers no HDR colour spaces here (%s). An old vulkan-1.dll in the game folder can cause this.", g_vkPath);
-            else if (cfg.hdrEnable && !g_hdrUnlocked)
-                ImGui::TextDisabled("Not active: needs DXVK (set RealD3D9 in APRenewal.ini). See the README.");
-            else if (cfg.hdrEnable && g_hdrForced)
-                ImGui::TextDisabled("Not active: no HDR colour space - turn on HDR in Windows display settings.");
-            else ImGui::TextDisabled("Off.");
-            ImGui::TextDisabled("Highlights come from the game's own HDR scene buffer; the HUD stays at paper white.");
-            ImGui::EndTabItem();
-        } }
-        if (ImGui::BeginTabItem("View")) {
-            CheckboxInt("FOV and HUD fixes (replaces AlphaFixer)", &cfg.viewEnable);
-            ImGui::SliderInt("Field of view", &cfg.fovDeg, 40, 130, "%d deg");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Game default")) cfg.fovDeg = 60;
-            CheckboxInt("Keep HUD and menus 16:9 on wider screens", &cfg.hudLimit);
-            if (!g_viewHooks) ImGui::TextDisabled("Not active - see the log (AlphaFixer's winmm.dll still installed?)");
-            else {
-                ImGui::TextDisabled("Rendering %ux%u (aspect %.3f). Game FOV now: %.1f deg", g_ppW, g_ppH, ViewAspect(), g_gameFov);
-                ImGui::TextDisabled("The normal camera at 16:9 (game default 60, AlphaFixer at 1.20 = 85). Aim/zoom scale along. Live.");
+        if (ImGui::BeginTabItem("Video")) {
+            if (ImGui::BeginTabBar("video")) {
+            if (ImGui::BeginTabItem("Image")) {
+                bool en = g_fx.enabled;
+                if (ImGui::Checkbox("Post-processing (F11)", &en)) g_fx.enabled = en;
+                CheckboxInt("Apply before the UI (keeps HUD and menus sharp)", &cfg.beforeHud);
+                CheckboxInt("FXAA anti-aliasing", &cfg.fxaa);
+                ImGui::SliderInt("Sharpening", &cfg.sharpen, 0, 100, cfg.sharpen ? "%d %%" : "off");
+                ImGui::SeparatorText("Display");
+                ImGui::SliderInt("Frame cap", &cfg.fpsLimit, 0, 240, cfg.fpsLimit ? "%d fps" : "off");
+                static const int caps[] = { 30, 60, 120, 144, 165 };
+                for (int i = 0; i < 5; i++) {
+                    if (i) ImGui::SameLine();
+                    char b[8]; snprintf(b, sizeof b, "%d", caps[i]);
+                    if (ImGui::Button(b)) cfg.fpsLimit = caps[i];
+                }
+                ImGui::TextDisabled("Above ~62 fps also needs MulderConfig's \"Uncap FPS\".");
+                ImGui::Separator();
+                ImGui::TextDisabled("Applied at next launch:");
+                CheckboxInt("Borderless window", &cfg.borderless);
+                ImGui::SliderInt("Render scale (supersampling)", &cfg.renderScale, 100, 200, cfg.renderScale > 100 ? "%d %%" : "off");
+                if (g_ssaa) ImGui::TextDisabled("Now: rendering %ux%u, shown at %ux%u", g_ppW, g_ppH, g_outW, g_outH);
+                else if (cfg.renderScale > 100 && !cfg.borderless) ImGui::TextDisabled("Supersampling needs the borderless window.");
+                static const char* vs[] = { "Game decides", "Force off", "Force on" };
+                int vi = cfg.vsync + 1;
+                if (ImGui::Combo("VSync", &vi, vs, 3)) cfg.vsync = vi - 1;
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Colour")) {
+                CheckboxInt("Colour grading", &cfg.gradeEnable);
+                ImGui::SliderInt("Exposure", &cfg.gradeExposure, -150, 150, "%d (1/100 stop)");
+                ImGui::SliderInt("Contrast", &cfg.gradeContrast, 70, 160, "%d %%");
+                ImGui::SliderInt("Vibrance", &cfg.gradeVibrance, -50, 150, "%d %%");
+                ImGui::SliderInt("Saturation", &cfg.gradeSaturation, 0, 200, "%d %%");
+                ImGui::SliderInt("Black level", &cfg.gradeBlack, -10, 30, "%d");
+                ImGui::SliderInt("Temperature", &cfg.gradeTemp, -100, 100, cfg.gradeTemp ? (cfg.gradeTemp > 0 ? "%d warm" : "%d cool") : "neutral");
+                if (ImGui::Button("Defaults (vivid)")) { cfg.gradeExposure = 10; cfg.gradeContrast = 106; cfg.gradeVibrance = 45; cfg.gradeSaturation = 100; cfg.gradeBlack = 1; cfg.gradeTemp = 0; }
+                ImGui::SameLine();
+                if (ImGui::Button("Neutral")) { cfg.gradeExposure = 0; cfg.gradeContrast = 100; cfg.gradeVibrance = 0; cfg.gradeSaturation = 100; cfg.gradeBlack = 0; cfg.gradeTemp = 0; }
+                ImGui::TextDisabled("Runs on the 3D image only, before the HUD. Part of post-processing (F11).");
+                ImGui::SeparatorText("Highlights and gamma");
+                CheckboxInt("Highlight roll-off (instead of the game's hard clip)", &cfg.tmEnable);
+                ImGui::SliderInt("Roll-off starts at", &cfg.tmKnee, 30, 95, "%d %% of white");
+                ImGui::SliderInt("White point", &cfg.tmWhite, 150, 1000, "%d %%");
+                ImGui::SliderInt("Keep highlight colour", &cfg.tmHue, 0, 100, "%d %%");
+                if (ImGui::Button("Roll-off defaults")) { cfg.tmKnee = 60; cfg.tmWhite = 400; cfg.tmHue = 60; }
+                CheckboxInt("Use APRenewal's final pass (roll-off, gamma, bloom, DOF)", &cfg.fxBlend);
+                static const char* gm[] = { "Game's (square root, as shipped)", "sRGB (like modern games)", "Gamma 2.2" };
+                ImGui::Combo("Gamma curve", &cfg.gammaMode, gm, 3);
+                ImGui::TextDisabled("The game uses a cheap square root; sRGB / 2.2 lift the midtones a little.");
+                ImGui::TextDisabled("Game's final pass: %d plain + %d DOF variant(s) recognised%s.", g_shCount[SK_BLEND_BLOOM], g_shCount[SK_BLEND_DOF],
+                                    g_shReplFail ? ", some replacements FAILED (see log)" : "");
+                ImGui::TextDisabled("Lamps, windows and sky keep detail instead of clipping to flat white. Toggle to compare.");
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Effects")) {
+                ImGui::TextDisabled("The game's own effects, tuned inside its shaders. 100 %% = the game's look.");
+                ImGui::SeparatorText("Bloom");
+                ImGui::SliderInt("Bloom intensity", &cfg.bloomIntensity, 0, 300, cfg.bloomIntensity ? "%d %%" : "off");
+                ImGui::SliderInt("Bloom threshold", &cfg.bloomThreshold, -50, 150, cfg.bloomThreshold ? "%+d" : "game's");
+                CheckboxInt("Smooth bloom (no blocky, shimmering glow)", &cfg.bloomSmooth);
+                ImGui::SeparatorText("Depth of field");
+                ImGui::SliderInt("Depth of field strength", &cfg.dofStrength, 0, 150, cfg.dofStrength ? "%d %%" : "off");
+                CheckboxInt("Smooth depth of field blur", &cfg.dofSmooth);
+                ImGui::TextDisabled("Mostly visible in dialogue close-ups.");
+                ImGui::SeparatorText("Fog");
+                ImGui::SliderInt("Fog density", &cfg.fogDensity, 0, 300, cfg.fogDensity ? "%d %%" : "off");
+                ImGui::SeparatorText("Motion blur pass");
+                ImGui::SliderInt("Motion blur", &cfg.motionBlur, 0, 200, cfg.motionBlur ? "%d %%" : "off");
+                ImGui::SliderInt("Game's edge anti-aliasing", &cfg.edgeAA, 0, 100, cfg.edgeAA ? "%d %%" : "off");
+                ImGui::SliderInt("Game's sharpening", &cfg.gameSharpen, 0, 300, cfg.gameSharpen ? "%d %%" : "off");
+                ImGui::TextDisabled("The game's edge AA blurs along edges; with FXAA on you may prefer it lower.");
+                if (ImGui::Button("Game defaults")) { cfg.bloomIntensity = 100; cfg.bloomThreshold = 0; cfg.dofStrength = 100; cfg.fogDensity = 100;
+                                                       cfg.motionBlur = 100; cfg.edgeAA = 100; cfg.gameSharpen = 100; }
+                if (!cfg.fxBlend) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Bloom and DOF tuning need \"Use APRenewal's final pass\" (Colour tab).");
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Shadows & AO")) {
+                ImGui::SeparatorText("Shadows");
+                static const char* sh[] = { "1x (game default)", "2x", "4x" };
+                int si = cfg.shadowScale == 4 ? 2 : cfg.shadowScale == 2 ? 1 : 0;
+                if (ImGui::Combo("Shadow resolution", &si, sh, 3)) cfg.shadowScale = si == 2 ? 4 : si == 1 ? 2 : 1;
+                if (cfg.shadowScale > 1) {
+                    ImGui::SliderInt("Shadow edge softness", &cfg.shadowSoft, 0, 100, cfg.shadowSoft ? "%d %%" : "sharp (matches the map)");
+                    ImGui::TextDisabled("0 = filter sized for the bigger map, 100 = the game's original soft edges. %d shadow shaders adjusted.", g_shCount[SK_SHADOW]);
+                }
+                if (g_shadowBig) ImGui::TextDisabled("Now: shadow map %ux%u (game asked for %ux%u). Applies at next launch.", g_shadowBig, g_shadowBig, g_shadowSize, g_shadowSize);
+                else ImGui::TextDisabled("Applies at next launch.");
+                ImGui::SeparatorText("Ambient occlusion");
+                CheckboxInt("SSAO enabled", &cfg.aoEnable);
+                static const char* modes[] = { "Off", "On", "Debug view (AO only)" };
+                ImGui::Combo("Mode (F10)", &g_fx.aoMode, modes, 3);
+                ImGui::SliderInt("Intensity", &cfg.aoIntensity, 0, 200, "%d %%");
+                ImGui::SliderInt("Radius", &cfg.aoRadius, 5, 150, "%d units");
+                CheckboxInt("Follow the game's field of view", &cfg.aoFovAuto);
+                if (!cfg.aoFovAuto || !(g_viewSites & 2)) ImGui::SliderInt("Field of view", &cfg.aoFov, 50, 120, "%d deg");
+                else ImGui::TextDisabled("Live FOV: %.1f deg", g_gameFov);
+                ImGui::SliderInt("Max distance", &cfg.aoMaxDist, 500, 20000, "%d units");
+                ImGui::SliderInt("Near fade", &cfg.aoNear, 0, 200, "%d units");
+                ImGui::SliderInt("Protect highlights", &cfg.aoProtect, 0, 100, "%d %%");
+                CheckboxInt("Precise depth (24-bit INTZ, applies at next launch)", &cfg.aoPrecise);
+                ImGui::TextDisabled("Method: %s", g_fx.aoIsGtao ? "GTAO" : "fallback (GTAO shader failed - see log)");
+                ImGui::TextDisabled("Depth source: %s", (g_fx.aoIsGtao && cfg.aoPrecise && g_fx.zcopy && g_fx.fitValid) ? "24-bit depth buffer (calibrated)"
+                                    : g_fx.intz ? "24-bit depth buffer (calibrating...)" : "16-bit HDR alpha");
+                ImGui::TextDisabled("Tip: debug view + FOV slider. Flat walls should stay white.");
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("View")) {
+                CheckboxInt("FOV and HUD fixes (replaces AlphaFixer)", &cfg.viewEnable);
+                ImGui::SliderInt("Field of view", &cfg.fovDeg, 40, 130, "%d deg");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Game default")) cfg.fovDeg = 60;
+                CheckboxInt("Keep HUD and menus 16:9 on wider screens", &cfg.hudLimit);
+                if (!g_viewHooks) ImGui::TextDisabled("Not active - see the log (AlphaFixer's winmm.dll still installed?)");
+                else {
+                    ImGui::TextDisabled("Rendering %ux%u (aspect %.3f). Game FOV now: %.1f deg", g_ppW, g_ppH, ViewAspect(), g_gameFov);
+                    ImGui::TextDisabled("The normal camera at 16:9 (game default 60, AlphaFixer at 1.20 = 85). Aim/zoom scale along. Live.");
+                }
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("HDR")) { if (!HdrAllowed()) {
+                ImGui::TextWrapped("HDR is off on Windows: on the tested setup the output never got brighter than SDR white, "
+                                   "so it only cost performance. For HDR on Windows use NVIDIA RTX HDR (NVIDIA app) with this off.");
+                ImGui::TextWrapped("Under Proton with gamescope HDR (Steam Deck OLED, Linux desktops) it is available. "
+                                   "To try it on Windows anyway: [HDR] AllowWindows=1 in APRenewal.ini.");
+                ImGui::EndTabItem();
+            } else {
+                CheckboxInt("HDR output (applies at next launch)", &cfg.hdrEnable);
+                CheckboxInt("Reference: plain SDR exactly as Windows shows it (A/B)", &cfg.hdrReference);
+                ImGui::Checkbox("Test pattern (compare with hdr_testpattern.png in an SDR viewer)", &g_hdrPattern);
+                CheckboxInt("Compensate: output gets decoded as sRGB twice (fixes washed-to-neon look)", &cfg.hdrCompensate);
+                if (g_hdrPattern) ImGui::Checkbox("Highlight test: bottom row = 1x, 1.25x, 1.5x, 2x, 3x, 4x paper white", &g_hdrPatternHi);
+                if (g_hdrPattern)
+                    ImGui::TextWrapped("If the grey ramp turns flat white after about half way and the 75%% bars look like pure primaries, "
+                                       "Windows is treating the game's HDR picture as SDR. On NVIDIA: Control Panel > Manage 3D settings > "
+                                       "Vulkan/OpenGL present method > Prefer layered on DXGI Swapchain.");
+                ImGui::SliderInt("Paper white", &cfg.hdrPaper, 0, 400, cfg.hdrPaper ? "%d nits" : "Windows setting");
+                static const char* curves[] = { "sRGB (like Windows)", "Gamma 2.2 (deeper shadows)" };
+                ImGui::Combo("SDR curve", &cfg.hdrCurve, curves, 2);
+                ImGui::SliderInt("Peak brightness", &cfg.hdrPeak, 0, 4000, cfg.hdrPeak ? "%d nits" : "display's own");
+                ImGui::SliderInt("Saturation", &cfg.hdrSaturation, 50, 130, "%d %%");
+                if (g_hdrActive && HdrPaperNits() > HdrPeakNits() * 0.75f)
+                    ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Paper white is close to the display peak: whites will look blown out.");
+                ImGui::SliderInt("Highlights", &cfg.hdrHighlights, 0, 150, cfg.hdrHighlights ? "%d %%" : "off (SDR in HDR)");
+                if (g_hdrActive)
+                    ImGui::TextDisabled("Active: %s - %s", g_hdrPQ ? "HDR10 (PQ)" : "scRGB", g_hdrDiag);
+                if (g_hdrActive)
+                    ImGui::TextDisabled("Paper white %.0f nits (Windows: %.0f), peak %.0f (display reports %.0f), exposure fit %.3g",
+                                        HdrPaperNits(), g_winSdrWhite, HdrPeakNits(), g_hdrMaxNits, g_hdrK);
+                else if (cfg.hdrEnable && g_vkHdrExt == 0)
+                    ImGui::TextWrapped("Not active: Vulkan offers no HDR colour spaces here (%s). An old vulkan-1.dll in the game folder can cause this.", g_vkPath);
+                else if (cfg.hdrEnable && !g_hdrUnlocked)
+                    ImGui::TextDisabled("Not active: needs DXVK (set RealD3D9 in APRenewal.ini). See the README.");
+                else if (cfg.hdrEnable && g_hdrForced)
+                    ImGui::TextDisabled("Not active: no HDR colour space - turn on HDR in Windows display settings.");
+                else ImGui::TextDisabled("Off.");
+                ImGui::TextDisabled("Highlights come from the game's own HDR scene buffer; the HUD stays at paper white.");
+                ImGui::EndTabItem();
+            } }
+                ImGui::EndTabBar();
             }
             ImGui::EndTabItem();
         }
@@ -3688,59 +3903,10 @@ static void DrawMenu()
             }
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Ambient occlusion")) {
-            CheckboxInt("SSAO enabled", &cfg.aoEnable);
-            static const char* modes[] = { "Off", "On", "Debug view (AO only)" };
-            ImGui::Combo("Mode (F10)", &g_fx.aoMode, modes, 3);
-            ImGui::SliderInt("Intensity", &cfg.aoIntensity, 0, 200, "%d %%");
-            ImGui::SliderInt("Radius", &cfg.aoRadius, 5, 150, "%d units");
-            CheckboxInt("Follow the game's field of view", &cfg.aoFovAuto);
-            if (!cfg.aoFovAuto || !(g_viewSites & 2)) ImGui::SliderInt("Field of view", &cfg.aoFov, 50, 120, "%d deg");
-            else ImGui::TextDisabled("Live FOV: %.1f deg", g_gameFov);
-            ImGui::SliderInt("Max distance", &cfg.aoMaxDist, 500, 20000, "%d units");
-            ImGui::SliderInt("Near fade", &cfg.aoNear, 0, 200, "%d units");
-            ImGui::SliderInt("Protect highlights", &cfg.aoProtect, 0, 100, "%d %%");
-            CheckboxInt("Precise depth (24-bit INTZ, applies at next launch)", &cfg.aoPrecise);
-            ImGui::TextDisabled("Method: %s", g_fx.aoIsGtao ? "GTAO" : "fallback (GTAO shader failed - see log)");
-            ImGui::TextDisabled("Depth source: %s", (g_fx.aoIsGtao && cfg.aoPrecise && g_fx.zcopy && g_fx.fitValid) ? "24-bit depth buffer (calibrated)"
-                                : g_fx.intz ? "24-bit depth buffer (calibrating...)" : "16-bit HDR alpha");
-            ImGui::TextDisabled("Tip: debug view + FOV slider. Flat walls should stay white.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Display")) {
-            ImGui::SliderInt("Frame cap", &cfg.fpsLimit, 0, 240, cfg.fpsLimit ? "%d fps" : "off");
-            static const int caps[] = { 30, 60, 120, 144, 165 };
-            for (int i = 0; i < 5; i++) {
-                if (i) ImGui::SameLine();
-                char b[8]; snprintf(b, sizeof b, "%d", caps[i]);
-                if (ImGui::Button(b)) cfg.fpsLimit = caps[i];
-            }
-            ImGui::TextDisabled("Above ~62 fps also needs MulderConfig's \"Uncap FPS\".");
-            ImGui::Separator();
-            ImGui::TextDisabled("Applied at next launch:");
-            CheckboxInt("Borderless window", &cfg.borderless);
-            ImGui::SliderInt("Render scale (supersampling)", &cfg.renderScale, 100, 200, cfg.renderScale > 100 ? "%d %%" : "off");
-            if (g_ssaa) ImGui::TextDisabled("Now: rendering %ux%u, shown at %ux%u", g_ppW, g_ppH, g_outW, g_outH);
-            else if (cfg.renderScale > 100 && !cfg.borderless) ImGui::TextDisabled("Supersampling needs the borderless window.");
-            static const char* vs[] = { "Game decides", "Force off", "Force on" };
-            int vi = cfg.vsync + 1;
-            if (ImGui::Combo("VSync", &vi, vs, 3)) cfg.vsync = vi - 1;
-            ImGui::EndTabItem();
-        }
         if (ImGui::BeginTabItem("Game")) {
             CheckboxInt("Skip the intro logo movies", &cfg.skipIntros);
             ImGui::TextDisabled("Only movies before the first 3D scene; story movies still play.");
-            static const char* sh[] = { "1x (game default)", "2x", "4x" };
-            int si = cfg.shadowScale == 4 ? 2 : cfg.shadowScale == 2 ? 1 : 0;
-            if (ImGui::Combo("Shadow resolution", &si, sh, 3)) cfg.shadowScale = si == 2 ? 4 : si == 1 ? 2 : 1;
-            if (cfg.shadowScale > 1) {
-                ImGui::SliderInt("Shadow edge softness", &cfg.shadowSoft, 0, 100, cfg.shadowSoft ? "%d %%" : "sharp (matches the map)");
-                ImGui::TextDisabled("0 = filter sized for the bigger map, 100 = the game's original soft edges. %d shadow shaders adjusted.", g_shCount[SK_SHADOW]);
-            }
-            if (g_shadowBig) ImGui::TextDisabled("Now: shadow map %ux%u (game asked for %ux%u). Applies at next launch.", g_shadowBig, g_shadowBig, g_shadowSize, g_shadowSize);
-            else ImGui::TextDisabled("Applies at next launch.");
-            ImGui::Separator();
-            ImGui::Text("Developer console");
+            ImGui::SeparatorText("Developer console");
             if (!g_conOk) ImGui::TextDisabled("Unavailable (see the log: console:).");
             else {
                 const bool live = g_pc && GetTickCount() - g_pcTick < 3000;
@@ -3768,13 +3934,6 @@ static void DrawMenu()
             }
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Window & input")) {
-            CheckboxInt("Pause the game when it loses focus", &cfg.pauseOnFocusLoss);
-            CheckboxInt("Keep the cursor inside the game window", &cfg.confineCursor);
-            ImGui::SliderInt("Menu cursor speed", &cfg.menuMouse, 25, 400, "%d %%");
-            ImGui::TextDisabled("While this menu is open the game gets no keyboard, mouse or gamepad input.");
-            ImGui::EndTabItem();
-        }
         if (ImGui::BeginTabItem("Diagnostics")) {
             ImGui::Text("%.0f fps", io.Framerate);
             if (g_lastStatFrames) {
@@ -3789,6 +3948,20 @@ static void DrawMenu()
             ImGui::SameLine();
             if (ImGui::Button("Capture one frame (images)")) { g_traceArmed = true; g_wantCapture = true; MenuNote("Capturing: see Binaries\\APRenewal\\capture_*"); }
             ImGui::TextDisabled("Log: Binaries\\APRenewal\\APRenewal.log");
+            ImGui::SeparatorText("Game shaders recognised (used)");
+            ImGui::Text("Final pass %d+%d (%d)  shadows %d (%d)  fog %d (%d)  motion blur %d (%d)  bloom %d (%d)",
+                        g_shCount[SK_BLEND_BLOOM], g_shCount[SK_BLEND_DOF], g_shUsed[SK_BLEND_BLOOM] + g_shUsed[SK_BLEND_DOF],
+                        g_shCount[SK_SHADOW], g_shUsed[SK_SHADOW], g_shCount[SK_FOG], g_shUsed[SK_FOG],
+                        g_shCount[SK_MBLUR], g_shUsed[SK_MBLUR], g_shCount[SK_BLOOMGATHER], g_shUsed[SK_BLOOMGATHER]);
+            if (g_shReplFail) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%d final-pass replacement(s) failed to build - see the log.", g_shReplFail);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Miscellaneous")) {
+            ImGui::SeparatorText("Window and input");
+            CheckboxInt("Pause the game when it loses focus", &cfg.pauseOnFocusLoss);
+            CheckboxInt("Keep the cursor inside the game window", &cfg.confineCursor);
+            ImGui::SliderInt("Menu cursor speed", &cfg.menuMouse, 25, 400, "%d %%");
+            ImGui::TextDisabled("While this menu is open the game gets no keyboard, mouse or gamepad input.");
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -4181,7 +4354,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.11.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.12.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

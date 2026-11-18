@@ -149,6 +149,16 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   EdgeSampleOffsets × f, ShadowBufferSize × Scale; f = 1/Scale … 1 by [Shadows] Softness.
 - No offline HLSL compiler works here (Wine segfaults, apt's vkd3d 1.2 has no HLSL): replacement
   compile errors only show in the user's log (`postfx: final blend compile failed`).
+- 0.12.0 effects: final pass params apTM (roll-off), apTM2 (sRGB / 2.2 weights, bloom intensity, DOF
+  strength), apTM3 (quarter-res texel size = 1/(pp/4+2), bloom / DOF tent smoothing) at paramReg..+2.
+  Constant overrides in PreDraw (PdSet = write + restore after draw): fog FogDistanceScale × density;
+  motion blur (AP MainPixelShader_DirectionalEDAA: VelocityBuffer + PrevViewProjMatrix) Static/Dynamic
+  VelocityParameters.xy × strength, apOffsetAndWeightTable[0].w = edge-AA weight, apUnsharpMaskAmount;
+  bloom gather (BloomThreshold + SceneColorTexture only) threshold += offset, .y = 1/(4−t).
+  The AP "motion blur" pass is also the game's EDAA (directional edge blur) + unsharp mask.
+- Menu: Video (sub-tabs Image/Colour/Effects/Shadows & AO/View/HDR), Audio, Game, Diagnostics, Miscellaneous.
+- User (0.11.0 log): both final blends + shadows recognised and used; logged shadow offsets ×1.000
+  (Softness at 100) → "difference not noticeable".
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 
