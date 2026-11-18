@@ -1,4 +1,4 @@
-# APRenewal 0.9.3 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.9.4 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -12,6 +12,11 @@ A research-and-fix base layer. It sits alongside the mods you already have:
 ## Install
 Copy `d3d9.dll` + `APRenewal.ini` into `Alpha Protocol\Binaries\`. Uninstall = delete both.
 The log goes to `Binaries\APRenewal\APRenewal.log`.
+
+## New in 0.9.4
+- HDR diagnostics: the log and HDR tab now say which GPU the game's monitor is plugged into and
+  whether Windows HDR is really on for it (DXGI output colour space). A monitor on the iGPU while
+  the RTX renders, or HDR off, both turn HDR output into clipped, neon SDR.
 
 ## New in 0.9.3
 - HDR test pattern (HDR tab): replaces the frame with colour bars, a grey ramp, primaries and skin

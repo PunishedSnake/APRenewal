@@ -14,6 +14,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#include <dxgi1_6.h>
 #include <cstdio>
 #include <cstdint>
 #include <cstdarg>
@@ -1745,6 +1746,45 @@ static void QueryWindowsSdrWhite()
     free(paths); free(modes);
     Log("hdr: Windows SDR content brightness %.0f nits%s", g_winSdrWhite, g_winSdrWhite ? "" : " (unknown - using 200)");
 }
+// Which GPU drives the game's monitor, and is Windows HDR really on there? A monitor plugged into
+// the iGPU while the dGPU renders goes through a cross-adapter copy, which can drop the HDR colour
+// space - HDR values then get clipped at SDR white (neon, clipped look).
+static char g_hdrDiag[256] = "";
+static void DiagnoseHdrOutput()
+{
+    HMODULE dx = LoadLibraryA("dxgi.dll");
+    if (!dx || !g_hwnd) return;
+    typedef HRESULT (WINAPI *PFN_CF1)(REFIID, void**);
+    PFN_CF1 cf = (PFN_CF1)GetProcAddress(dx, "CreateDXGIFactory1");
+    IDXGIFactory1* f = nullptr;
+    if (!cf || FAILED(cf(__uuidof(IDXGIFactory1), (void**)&f)) || !f) return;
+    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY);
+    IDXGIAdapter1* a = nullptr;
+    for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 ad; a->GetDesc1(&ad);
+        IDXGIOutput* o = nullptr;
+        for (UINT j = 0; a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; j++) {
+            DXGI_OUTPUT_DESC od; o->GetDesc(&od);
+            if (od.Monitor == mon) {
+                IDXGIOutput6* o6 = nullptr;
+                DXGI_OUTPUT_DESC1 d1 = {};
+                const bool have6 = SUCCEEDED(o->QueryInterface(__uuidof(IDXGIOutput6), (void**)&o6)) && o6 &&
+                                   SUCCEEDED(o6->GetDesc1(&d1));
+                const bool hdrOn = have6 && d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                char gpu[128]; WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, gpu, sizeof gpu, nullptr, nullptr);
+                snprintf(g_hdrDiag, sizeof g_hdrDiag, "monitor on %s, Windows HDR %s", gpu,
+                         !have6 ? "unknown" : hdrOn ? "ON" : "OFF");
+                Log("hdr: %s (colour space %d, %.0f nits peak)", g_hdrDiag, have6 ? (int)d1.ColorSpace : -1, have6 ? d1.MaxLuminance : 0.0f);
+                if (have6 && !hdrOn) Log("hdr: Windows HDR is off for this monitor - HDR output will be clipped to SDR");
+                if (o6) o6->Release();
+            }
+            o->Release();
+        }
+        a->Release();
+    }
+    f->Release();
+}
+
 static float HdrPaperNits()
 {
     if (cfg.hdrReference || cfg.hdrPaper == 0) return g_winSdrWhite > 0 ? g_winSdrWhite : 200.0f;
@@ -1910,6 +1950,7 @@ static void HdrSetupSwapchain(IDirect3DDevice9* dev)
             g_hdrActive = true;
             g_hdrPQ = cs == VK_COLOR_SPACE_HDR10_ST2084_EXT_;
             QueryWindowsSdrWhite();
+            DiagnoseHdrOutput();
             break;
         }
         if (g_hdrActive) {
@@ -2945,7 +2986,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.9.3", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.9.4", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -2983,7 +3024,7 @@ static void DrawMenu()
                 ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Paper white is close to the display peak: whites will look blown out.");
             ImGui::SliderInt("Highlights", &cfg.hdrHighlights, 0, 150, cfg.hdrHighlights ? "%d %%" : "off (SDR in HDR)");
             if (g_hdrActive)
-                ImGui::TextDisabled("Active: %s", g_hdrPQ ? "HDR10 (PQ)" : "scRGB");
+                ImGui::TextDisabled("Active: %s - %s", g_hdrPQ ? "HDR10 (PQ)" : "scRGB", g_hdrDiag);
             if (g_hdrActive)
                 ImGui::TextDisabled("Paper white %.0f nits (Windows: %.0f), peak %.0f (display reports %.0f), exposure fit %.3g",
                                     HdrPaperNits(), g_winSdrWhite, HdrPeakNits(), g_hdrMaxNits, g_hdrK);
@@ -3455,7 +3496,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.9.3 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.9.4 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         ApplySavedToggles();
