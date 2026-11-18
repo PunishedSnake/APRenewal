@@ -1,0 +1,9 @@
+LIBRARY xinput1_3.dll
+EXPORTS
+    XInputGetState = d3d9.APR_XInputGetState @2
+    XInputSetState = d3d9.APR_XInputSetState @3
+    XInputGetCapabilities = d3d9.APR_XInputGetCapabilities @4
+    XInputEnable = d3d9.APR_XInputEnable @5
+    XInputGetDSoundAudioDeviceGuids = d3d9.APR_XInputGetDSoundAudioDeviceGuids @6
+    XInputGetBatteryInformation = d3d9.APR_XInputGetBatteryInformation @7
+    XInputGetKeystroke = d3d9.APR_XInputGetKeystroke @8

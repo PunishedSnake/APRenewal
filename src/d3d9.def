@@ -9,3 +9,10 @@ EXPORTS
     D3DPERF_QueryRepeatFrame@0
     D3DPERF_SetOptions@4
     D3DPERF_GetStatus@0
+    APR_XInputGetState@8
+    APR_XInputSetState@8
+    APR_XInputGetCapabilities@12
+    APR_XInputEnable@4
+    APR_XInputGetDSoundAudioDeviceGuids@12
+    APR_XInputGetBatteryInformation@12
+    APR_XInputGetKeystroke@12
