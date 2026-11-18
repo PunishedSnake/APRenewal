@@ -335,6 +335,17 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
     seeded 0xA2 at [74]), DirectInput pads polled every 4 ms in the pad thread with maps (kDiKnown, generic
     D-mode if Rz exists else Xbox-style, ini Map_VVVVPPPP). XInput-capable DI devices ("IG_") and Sony (not
     DS3) are skipped in DI. Untested on hardware (Wine is broken in this sandbox).
+- 0.20.1:
+  - Auto gamepad/KBM switch (pad.h PadAutoSwitchTick, from hk_PeekMessageW on the main thread): the game's
+    "Enable gamepad" option = bit 0 of [0x16F9A00 (UAPProfileManager singleton, cf. execGetProfileManager
+    0xAB3E40)] + 0x13C. Tick functions 0xAC7B00 / 0xAC8DC0 re-read it every frame: input object +0x2AC,
+    +0xF0 == 2 && pad connected (0xA274F0) && bit → clear flag 0x800 at +0x1FC (gamepad), else set it (KBM);
+    a change notifies the UI. Bytes verified at 0xAC7B48/51 and 0xAC902F/38. Pad activity = button,
+    trigger > 40, stick > 8000 (g_padTick in APR_XInputGetState, also polled by us when the game stops);
+    KBM = WM_KEYDOWN (no repeat) / mouse buttons / wheel, DI mouse motion > 6, or cursor motion when the
+    game hasn't read the DI mouse for 250 ms.
+  - Shafts: user saw stripes next to lamps (radial blur comb). kShaftFillPS: 8 taps across one coarse tap
+    spacing along each light's ray, lights weighted by z / dist². Dither in the radial pass only without it.
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 

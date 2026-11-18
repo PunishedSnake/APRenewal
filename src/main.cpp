@@ -1015,9 +1015,15 @@ static void WaitWhileUnfocused()
 }
 
 static void ConRunQueued();
+// last keyboard / mouse and last gamepad activity, for the automatic gamepad <-> keyboard switch (pad.h)
+static volatile DWORD g_kbmTick = 0, g_padTick = 0;
+static volatile LONG g_mouseMoved = 0;
+static volatile DWORD g_diMouseTick = 0;   // last time the game read the DirectInput mouse
+static void PadAutoSwitchTick();
 static BOOL WINAPI hk_PeekMessageW(LPMSG msg, HWND wnd, UINT fmin, UINT fmax, UINT remove)
 {
     if (g_conQueued && GetCurrentThreadId() == g_mainThread) ConRunQueued();
+    if (GetCurrentThreadId() == g_mainThread) PadAutoSwitchTick();
     if (cfg.pauseOnFocusLoss && g_hwnd && !g_exiting && GetCurrentThreadId() == g_mainThread &&
         IsWindowVisible(g_hwnd) && !GameHasFocus())
         WaitWhileUnfocused();
@@ -1709,30 +1715,66 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 static const char* kShaftRadialPS = R"HLSL(
 sampler2D sSrc : register(s0);
 float4 L0 : register(c2); float4 L1 : register(c3); float4 L2 : register(c4); float4 L3 : register(c5);   // xy uv, z strength, w aspect
-float4 sp : register(c6);   // x length (fraction of the way to the light), y decay
-float3 Shaft(float2 uv, float4 L)
+float4 sp : register(c6);   // x length (fraction of the way to the light), y decay per tap, z frame (dither)
+// 64 taps; a fixed tap pattern alone leaves copies of the bright source along each ray (the striped
+// "gaps" around lamps) - the fill pass below smears each pixel over one tap spacing to close them
+float3 Shaft(float2 uv, float4 L, float j)
 {
-    float2 delta = (uv - L.xy) * sp.x / 32.0;
-    float2 tc = uv;
+    float2 delta = (uv - L.xy) * sp.x / 64.0;
+    float2 tc = uv - delta * j;
     float illum = 1;
     float3 acc = 0;
-    [unroll] for (int i = 0; i < 32; i++) {
-        tc -= delta;
+    [unroll] for (int i = 0; i < 64; i++) {
         acc += tex2Dlod(sSrc, float4(saturate(tc), 0, 0)).rgb * illum;
+        tc -= delta;
         illum *= sp.y;
     }
     // weaker the further the pixel is from the light
     float2 dd = (uv - L.xy) * float2(L.w, 1);
-    return acc / 32.0 * L.z * saturate(1 - length(dd) * 0.8);
+    return acc / 64.0 * L.z * saturate(1 - length(dd) * 0.8);
+}
+float4 main(float2 uv : TEXCOORD0, float2 vp : VPOS) : COLOR0
+{
+    float j = sp.z > 0 ? frac(52.9829189 * frac(dot(vp + sp.z * 5.588238, float2(0.06711056, 0.00583715)))) : 0;
+    float3 c = 0;
+    if (L0.z > 0) c += Shaft(uv, L0, j);
+    if (L1.z > 0) c += Shaft(uv, L1, j);
+    if (L2.z > 0) c += Shaft(uv, L2, j);
+    if (L3.z > 0) c += Shaft(uv, L3, j);
+    return float4(c, 1);
+}
+)HLSL";
+// Fill pass: the radial blur's taps are one "step" (length/64 of the way to the light) apart, so its output
+// has a copy of the light every step. Averaging 8 samples across one step, along each light's ray, turns
+// the comb into a continuous streak (comb x box = box). Lights are weighted by their share at the pixel.
+static const char* kShaftFillPS = R"HLSL(
+sampler2D sSrc : register(s0);
+float4 L0 : register(c2); float4 L1 : register(c3); float4 L2 : register(c4); float4 L3 : register(c5);
+float4 sp : register(c6);   // x length
+float3 Fill(float2 uv, float4 L)
+{
+    float2 step = (uv - L.xy) * sp.x / 64.0;
+    float3 acc = 0;
+    [unroll] for (int m = 0; m < 8; m++)
+        acc += tex2Dlod(sSrc, float4(saturate(uv + step * ((m + 0.5) / 8.0 - 0.5)), 0, 0)).rgb;
+    return acc / 8.0;
+}
+float Share(float2 uv, float4 L)
+{
+    float2 d = (uv - L.xy) * float2(L.w, 1);
+    return L.z > 0 ? L.z / (dot(d, d) + 0.01) : 0;
 }
 float4 main(float2 uv : TEXCOORD0) : COLOR0
 {
+    float w0 = Share(uv, L0), w1 = Share(uv, L1), w2 = Share(uv, L2), w3 = Share(uv, L3);
+    float ws = w0 + w1 + w2 + w3;
+    if (ws <= 0) return tex2Dlod(sSrc, float4(uv, 0, 0));
     float3 c = 0;
-    if (L0.z > 0) c += Shaft(uv, L0);
-    if (L1.z > 0) c += Shaft(uv, L1);
-    if (L2.z > 0) c += Shaft(uv, L2);
-    if (L3.z > 0) c += Shaft(uv, L3);
-    return float4(c, 1);
+    if (w0 > 0) c += Fill(uv, L0) * w0;
+    if (w1 > 0) c += Fill(uv, L1) * w1;
+    if (w2 > 0) c += Fill(uv, L2) * w2;
+    if (w3 > 0) c += Fill(uv, L3) * w3;
+    return float4(c / ws, 1);
 }
 )HLSL";
 static const char* kShaftCompPS = R"HLSL(
@@ -1971,7 +2013,7 @@ struct PostFX {
     IDirect3DPixelShader9* psSSR = nullptr;
     IDirect3DPixelShader9* psSSS = nullptr;
     IDirect3DPixelShader9 *psSmaaE = nullptr, *psSmaaW = nullptr, *psSmaaN = nullptr, *psTaa = nullptr;
-    IDirect3DPixelShader9 *psShB = nullptr, *psShM = nullptr, *psShR = nullptr, *psShC = nullptr;
+    IDirect3DPixelShader9 *psShB = nullptr, *psShM = nullptr, *psShR = nullptr, *psShC = nullptr, *psShF = nullptr;
     IDirect3DTexture9 *smaaEdge = nullptr, *smaaWeight = nullptr, *taaHist = nullptr;      // default pool
     IDirect3DTexture9 *shA = nullptr, *shB = nullptr, *shTiny[2] = {};                     // default pool
     IDirect3DSurface9* shSys = nullptr;                                                     // system memory
@@ -2145,6 +2187,7 @@ static bool PostFXReady(IDirect3DDevice9* dev)
         if (g_fx.vs) g_fx.psShM   = CompilePS(dev, kShaftMaxPS, "light shafts (light finder)");
         if (g_fx.vs) g_fx.psShR   = CompilePS(dev, kShaftRadialPS, "light shafts (radial blur)");
         if (g_fx.vs) g_fx.psShC   = CompilePS(dev, kShaftCompPS, "light shafts (composite)");
+        if (g_fx.vs) g_fx.psShF   = CompilePS(dev, kShaftFillPS, "light shafts (fill)");
         if (g_fx.vs) g_fx.psSharp = CompilePS(dev, kSharpenPS, "Sharpen");
         if (g_fx.vs) g_fx.psGrade = CompilePS(dev, kGradePS, "Colour grade");
         if (g_fx.vs) {
@@ -2666,18 +2709,22 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
                     const float vis = std::min(std::max(edge / 0.2f, 0.0f), 1.0f);
                     L[i][0] = u; L[i][1] = v; L[i][2] = g_shaft[i].s * vis;
                 }
-                const float r6[4] = { 0.85f, 0.96f, 0, 0 };
+                // no dither when the fill pass runs (it closes the gaps without noise); dither as the fallback
+                static unsigned shFrame = 0;
+                const float r6[4] = { 0.85f, 0.9798f, g_fx.psShF ? 0.0f : (float)(shFrame++ % 63 + 1), 0 };   // 0.9798^64 = 0.96^32
                 dev->SetPixelShaderConstantF(2, &L[0][0], 4);
                 dev->SetPixelShaderConstantF(6, r6, 1);
                 dev->SetVertexShaderConstantF(0, hpq, 1);
                 SamplerSet(dev, 0, D3DTEXF_LINEAR);
                 DrawFullscreen(dev, g_fx.shA, sB, g_fx.psShR);                        // radial blur toward the lights
+                IDirect3DTexture9* shOut = g_fx.shB;
+                if (g_fx.psShF) { DrawFullscreen(dev, g_fx.shB, sA, g_fx.psShF); shOut = g_fx.shA; }   // close the gaps between taps
                 const float hp2[4] = { -1.0f / bd.Width, 1.0f / bd.Height, 0, 0 };
                 dev->SetVertexShaderConstantF(0, hp2, 1);
                 const float c1[4] = { std::max(cfg.shafts, 0) / 100.0f * 1.5f, 0, 0, 0 };
                 dev->SetPixelShaderConstantF(1, c1, 1);
                 SamplerSet(dev, 1, D3DTEXF_LINEAR);
-                dev->SetTexture(1, g_fx.shB);
+                dev->SetTexture(1, shOut);
                 IDirect3DSurface9* o = nextOut(&outTex);
                 DrawFullscreen(dev, cur, o, g_fx.psShC);
                 dev->SetTexture(1, nullptr);
@@ -4289,7 +4336,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.20.0") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.20.1") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4298,7 +4345,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.20.0", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.20.1", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -5392,6 +5439,12 @@ static LRESULT CALLBACK hk_WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         else if (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST && m != WM_MOUSEWHEEL && m != WM_MOUSEHWHEEL)
             l = MAKELPARAM(MulDiv((short)LOWORD(l), g_ppW, g_outW), MulDiv((short)HIWORD(l), g_ppH, g_outH));
     }
+    switch (m) {
+    case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN: case WM_MOUSEWHEEL:
+        if (!(m == WM_KEYDOWN && (l & 0x40000000))) g_kbmTick = GetTickCount();   // not key auto-repeat
+        break;
+    }
     if (g_menuOpen) {
         switch (m) {
         case WM_SYSKEYDOWN:
@@ -5465,6 +5518,8 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetState(void* self, DWORD cb, void* data)
             const LONG* st = (const LONG*)data;
             InterlockedExchangeAdd(&g_miceX, st[0]);
             InterlockedExchangeAdd(&g_miceY, st[1]);
+            InterlockedExchangeAdd(&g_mouseMoved, labs(st[0]) + labs(st[1]));
+            g_diMouseTick = GetTickCount();
             InterlockedExchangeAdd(&g_miceZ, st[2]);
             g_haveDIMouse = true;
         }
@@ -5481,6 +5536,7 @@ static void AccumulateMouseData(const void* rgdod, DWORD cbObj, DWORD n)
         LONG  val = (LONG)((const DWORD*)p)[1];
         if (ofs == 0) InterlockedExchangeAdd(&g_miceX, val);
         else if (ofs == 4) InterlockedExchangeAdd(&g_miceY, val);
+        if (ofs == 0 || ofs == 4) { InterlockedExchangeAdd(&g_mouseMoved, labs(val)); g_diMouseTick = GetTickCount(); }
         else if (ofs == 8) InterlockedExchangeAdd(&g_miceZ, val);
     }
     g_haveDIMouse = true;
@@ -5821,7 +5877,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.20.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.20.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -6079,6 +6135,8 @@ static void DrawMenu()
                 ImGui::TextDisabled("One merged pad for player 1: Xbox (XInput), DualSense / DualShock 4 (USB or Bluetooth),");
                 ImGui::TextDisabled("and other DirectInput pads. Source changes apply after a restart.");
                 CheckboxInt("Built-in controller support", &g_padCfg.enable);
+                CheckboxInt("Switch the game between gamepad and keyboard + mouse automatically", &g_padCfg.autoSwitch);
+                ImGui::TextDisabled("Flips the game's own \"Enable gamepad\" option to whatever you touched last.");
                 CheckboxInt("Xbox / XInput pads", &g_padCfg.xinput);
                 CheckboxInt("DualSense / DualShock 4 (direct, with rumble)", &g_padCfg.sony);
                 CheckboxInt("Other DirectInput gamepads", &g_padCfg.dinput);
@@ -6630,7 +6688,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.20.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.20.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

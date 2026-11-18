@@ -33,6 +33,7 @@ struct PadCfg {
     int touchpadBack = 1;   // Sony touchpad click = Back
     int light    = -1;   // Sony light bar 0xRRGGBB, -1 = leave alone
     char remap[256] = "";   // "A=B B=A" ... on the final Xbox buttons
+    int autoSwitch = 1;  // flip the game's own "Enable gamepad" option to whatever was used last
 };
 static PadCfg g_padCfg;
 
@@ -76,12 +77,13 @@ static void PadLoadConfig()
     GetPrivateProfileStringA("Controller", "LightBar", "", v, sizeof v, g_ini);
     c.light = v[0] ? (int)(strtoul(v[0] == '#' ? v + 1 : v, nullptr, 16) & 0xFFFFFF) : -1;
     GetPrivateProfileStringA("Controller", "Remap", "", c.remap, sizeof c.remap, g_ini);
+    c.autoSwitch = GetPrivateProfileIntA("Controller", "AutoSwitch", 1, g_ini) ? 1 : 0;
 }
 static void PadSaveConfig()
 {
     auto W = [](const char* k, int v) { char b[32]; snprintf(b, sizeof b, "%d", v); WritePrivateProfileStringA("Controller", k, b, g_ini); };
     W("Enable", g_padCfg.enable); W("XInput", g_padCfg.xinput); W("Sony", g_padCfg.sony); W("DirectInput", g_padCfg.dinput);
-    W("Rumble", g_padCfg.rumble); W("Deadzone", g_padCfg.deadzone); W("TouchpadIsBack", g_padCfg.touchpadBack);
+    W("AutoSwitch", g_padCfg.autoSwitch); W("Rumble", g_padCfg.rumble); W("Deadzone", g_padCfg.deadzone); W("TouchpadIsBack", g_padCfg.touchpadBack);
     char b[16] = "";
     if (g_padCfg.light >= 0) snprintf(b, sizeof b, "%06X", g_padCfg.light);
     WritePrivateProfileStringA("Controller", "LightBar", b, g_ini);
@@ -535,6 +537,7 @@ static DWORD WINAPI PadThread(LPVOID)
 // ---------------------------------------------------------------- the virtual pad
 static volatile LONG g_xiEnabled = 1;
 static DWORD g_padPacket = 0;
+static volatile DWORD g_padPolled = 0;  // last time the game asked for the pad
 static XIGamepad g_padLast = {};
 static WORD g_remapFrom[16], g_remapTo[16]; static int g_remapN = -1; static char g_remapSrc[256];
 
@@ -633,8 +636,13 @@ extern "C" DWORD WINAPI APR_XInputGetState(DWORD idx, XIState* st)
     if (!g_padStarted) PadStart();
     if (!st) return ERROR_BAD_ARGUMENTS;
     if (idx != 0) return ERROR_DEVICE_NOT_CONNECTED;       // one merged pad, player 1
+    g_padPolled = GetTickCount();
     XIGamepad g;
     if (!PadRead(g)) return ERROR_DEVICE_NOT_CONNECTED;
+    // real use, not stick drift: a button, a trigger, or a stick pushed a quarter of the way
+    if (g.wButtons || g.bLeftTrigger > 40 || g.bRightTrigger > 40 ||
+        abs(g.sThumbLX) > 8000 || abs(g.sThumbLY) > 8000 || abs(g.sThumbRX) > 8000 || abs(g.sThumbRY) > 8000)
+        g_padTick = GetTickCount();
     if (!g_xiEnabled || g_menuOpen) g = {};
     if (memcmp(&g, &g_padLast, sizeof g)) { g_padLast = g; g_padPacket++; }
     st->dwPacketNumber = g_padPacket;
@@ -709,4 +717,49 @@ static void PadDescribe()
         add("%s over %s%s", d.kind == 1 ? "DualShock 4" : "DualSense", d.bt ? "Bluetooth" : "USB", d.tick && now - d.tick < 1500 ? "" : " (no reports yet)");
     for (int i = 0; i < g_diN; i++) add("%s (DirectInput %04lX:%04lX)", g_diDev[i].name, g_diDev[i].vidpid >> 16, g_diDev[i].vidpid & 0xFFFF);
     ReleaseSRWLockShared(&g_padLock);
+}
+
+// ---------------------------------------------------------------- automatic gamepad <-> keyboard/mouse
+// The game's "Enable gamepad" option (APProfileManager.ProfileSettings.bUsingXboxController, bit 0 at
+// +0x13C of the profile manager, global pointer 0x16F9A00 in the Steam/GOG exe) turns keyboard and mouse
+// off. The game re-reads it every tick (0xAC7B48 / 0xAC9038: "using gamepad" = pad connected && bit),
+// so flipping the bit to whatever was touched last switches modes on the fly, prompts included.
+static int g_autoSwOk = -1;           // -1 unchecked, 0 exe doesn't match, 1 ok
+static void PadAutoSwitchTick()
+{
+    if (!g_padCfg.autoSwitch || g_menuOpen || !g_padStarted) return;
+    if (g_autoSwOk < 0) {
+        static const BYTE a[] = { 0xA1, 0x00, 0x9A, 0x6F, 0x01 };                 // mov eax, [0x16F9A00]
+        static const BYTE b[] = { 0xF6, 0x80, 0x3C, 0x01, 0x00, 0x00, 0x01 };     // test byte [eax+0x13C], 1
+        MEMORY_BASIC_INFORMATION mbi = {};
+        const bool mapped = VirtualQuery((const void*)0xAC7B48, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
+                            (BYTE*)mbi.AllocationBase == (BYTE*)GetModuleHandleA(nullptr);
+        g_autoSwOk = mapped && !memcmp((const void*)0xAC7B48, a, 5) && !memcmp((const void*)0xAC7B51, b, 7) &&
+                     !memcmp((const void*)0xAC902F, a, 5) && !memcmp((const void*)0xAC9038, b, 7);
+        Log(g_autoSwOk ? "pad: automatic gamepad / keyboard switching ready" :
+                         "pad: unknown APGame.exe - automatic gamepad / keyboard switching off");
+    }
+    if (!g_autoSwOk) return;
+    // in keyboard mode the game may stop polling the pad: look ourselves so a button press switches back
+    if (GetTickCount() - g_padPolled > 250) { XIState tmp; APR_XInputGetState(0, &tmp); }
+    // mouse movement counts once it's more than a nudge within ~a frame
+    LONG mv = InterlockedExchange(&g_mouseMoved, 0);
+    // in gamepad mode the game may stop reading the mouse: then watch the cursor ourselves
+    static POINT lastCur = {}; static bool haveCur = false;
+    POINT cur;
+    if (GetTickCount() - g_diMouseTick > 250 && GameHasFocus() && GetCursorPos(&cur)) {
+        if (haveCur) mv += labs(cur.x - lastCur.x) + labs(cur.y - lastCur.y);
+        lastCur = cur; haveCur = true;
+    } else haveCur = false;
+    if (mv > 6) g_kbmTick = GetTickCount();
+    const DWORD pad = g_padTick, kbm = g_kbmTick;
+    if (!pad && !kbm) return;
+    const bool wantPad = (LONG)(pad - kbm) > 0;
+    BYTE* pm = *(BYTE**)0x16F9A00;
+    if (!pm) return;
+    BYTE& bits = pm[0x13C];
+    const bool isPad = bits & 1;
+    if (wantPad == isPad) return;
+    if (wantPad) bits |= 1; else bits &= ~1;
+    Log("pad: switched the game to %s", wantPad ? "gamepad" : "keyboard + mouse");
 }

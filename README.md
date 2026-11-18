@@ -1,4 +1,4 @@
-# APRenewal 0.20.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.20.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -27,6 +27,15 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.20.1
+- **Gamepad and keyboard + mouse switch automatically.** The game's own "Enable gamepad" option turns
+  keyboard and mouse off completely. APRenewal now flips that option to whatever you touched last -
+  press a pad button or push a stick and the game is in gamepad mode, press a key, click or move the
+  mouse and it's back to keyboard + mouse. Controller tab / `[Controller] AutoSwitch`.
+- **Light shafts without stripes.** The shaft blur takes 64 samples toward the light, so it drew a
+  faint copy of the lamp every sample - the regular gaps and bands next to some lights. A second pass
+  now smooths each shaft across one sample spacing, which turns the copies into a continuous streak.
 
 ## New in 0.20.0
 - **Controller support built in - dixi is retired.** One merged pad for player 1, from whatever is
