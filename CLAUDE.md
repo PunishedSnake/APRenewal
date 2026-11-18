@@ -271,6 +271,12 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
     hit depth (c18 = floor, metal roughness × 0.25); floor weight × lerp(0.08, 1, F5), metal × lerp(0.4, 1, F5).
   - Glass SSR: 16 steps, branch-free 4-step refinement (lastMiss → hit), jitter = IGN of the glass
     pixel's screen position (apX[10].zw = screen size), SSR mix × lerp(0.4, 1, 4F).
+- 0.17.1: user's 0.17.0 log: d3dcompiler_47 works (no rejects), no crash. Captures show the game's
+  final blend maps HDR < ~0.006 to exactly 0 (same in 0.16 — not a compiler change): apApplySat's
+  (c − SceneShadowsAndDesaturation.rgb) clip. apTM4.y = [Colour] ShadowDetail blends a toe c²/4s below 2s.
+  Glass SSR: tMin = 8 + 2 % of the glass distance, 16 steps, thickness + 1.5 × step length, hits within
+  4 px of the glass pixel ignored, conf × saturate(|N·V|·6), gain × apTM.y. HLSL: `near`/`far` are
+  reserved words.
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 

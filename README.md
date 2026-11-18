@@ -1,4 +1,4 @@
-# APRenewal 0.17.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.17.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,16 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.17.1
+- **Shadow detail** (`[Colour] ShadowDetail`, Colour tab): the game's own colour grading subtracts a
+  shadow level and clips everything below it to pure black (measured from your captures: the darkest
+  ~0.5 % of scene brightness all becomes 0). APRenewal's final pass now uses a soft toe there instead,
+  so dark areas keep their detail. 0 = the game's clipped look.
+- **Glass reflections**: thickness grows with each ray step (thin things like Mike were stepped over,
+  leaving banded silhouettes), rays start a little off the pane (the window frame no longer reflects
+  itself as white bands at steep angles), and reflections fade out at grazing angles. They now also
+  follow the *Glass reflections* slider like the cubemap does.
 
 ## New in 0.17.0
 - **Newer shader compiler** (`[Shaders] Compiler`, Diagnostics tab): APRenewal's own shaders are now

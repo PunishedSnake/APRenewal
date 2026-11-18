@@ -155,6 +155,7 @@ struct Config {
     int  metalRough  = 50;    // % blur of metal reflections
     int  glassSsr    = 100;   // % screen-space reflections on glass (from the previous frame)
     int  bloomModern = 35;    // % of APRenewal's wide HDR bloom added in the final pass
+    int  shadowDetail = 70;   // % soft toe instead of the game's hard black clip in the final pass
     int  bloomModernThr = 100;// threshold x100 (HDR scene value)
     int  aoNear      = 30;    // AO fades in from this camera distance (world units)
     int  aoPrecise   = 1;     // read the game's depth buffer via INTZ (24-bit) instead of HDR alpha
@@ -292,6 +293,7 @@ static void LoadConfig()
     cfg.ssrRough    = GetPrivateProfileIntA("Reflections", "Roughness", 40, g_ini);
     cfg.glassSsr    = GetPrivateProfileIntA("Glass", "ScreenReflections", 100, g_ini);
     cfg.bloomModern = GetPrivateProfileIntA("Effects", "ModernBloom", 35, g_ini);
+    cfg.shadowDetail = GetPrivateProfileIntA("Colour", "ShadowDetail", 70, g_ini);
     cfg.bloomModernThr = GetPrivateProfileIntA("Effects", "ModernBloomThreshold", 100, g_ini);
     cfg.aoNear      = GetPrivateProfileIntA("AO", "NearFade", 30, g_ini);
     cfg.aoPrecise   = GetPrivateProfileIntA("AO", "PreciseDepth", 1, g_ini);
@@ -3329,7 +3331,12 @@ float3 apApplySat(float3 c)
 {
     float l = dot(c, SceneScaledLuminanceWeights.rgb);
     c = c * SceneShadowsAndDesaturation.a + l;
-    return (c - SceneShadowsAndDesaturation.rgb) * SceneInverseHighLights.rgb;
+    // the game subtracts a shadow level and clips: everything darker turns pitch black. apTM4.y blends in
+    // a soft toe instead (c^2 / 4s below 2s: same slope and value above, darker detail kept below)
+    float3 s = max(SceneShadowsAndDesaturation.rgb, 1e-5);
+    float3 hard = c - SceneShadowsAndDesaturation.rgb;
+    float3 toe = c < 2 * s ? max(c, 0) * max(c, 0) / (4 * s) : c - s;
+    return lerp(hard, toe, apTM4.y) * SceneInverseHighLights.rgb;
 }
 float3 apFinish(float3 c)
 {
@@ -3609,10 +3616,14 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
         float4 gc = gwp.x * apX[0] + gwp.y * apX[1] + gwp.z * apX[2] + apX[3];
         float2 gpx = float2(gc.x / max(gc.w, 1) * 0.5 + 0.5, 0.5 - gc.y / max(gc.w, 1) * 0.5) * apX[10].zw;
         float jit = frac(52.9829189 * frac(dot(floor(gpx), float2(0.06711056, 0.00583715))));
-        float alive = 1, found = 0, hitT = 0, lastMiss = 4;
+        // start a little off the glass (more for distant glass): at grazing angles the ray otherwise
+        // touches the window frame / wall right next to the pane
+        float tMin = 8 + 0.02 * length(wcv);
+        float alive = 1, found = 0, hitT = 0, lastMiss = tMin;
         [unroll] for (int si = 1; si <= 16; si++) {
-            float st = (si - 1 + jit) / 16.0;
-            st = st * st * apX[9].z + 4;
+            float sf = (si - 1 + jit) / 16.0;
+            float st = tMin + sf * sf * apX[9].z;
+            float ds = 2.0 * sf / 16.0 * apX[9].z + 1;           // length of this step
             float3 rp = gwp + Rw * st;
             float4 rc4 = rp.x * apX[0] + rp.y * apX[1] + rp.z * apX[2] + apX[3];
             float rw = max(rc4.w, 1);
@@ -3620,7 +3631,9 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
             alive *= step(0, suv.x) * step(suv.x, 1) * step(0, suv.y) * step(suv.y, 1) * step(1, rc4.w);
             float zd = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(saturate(suv), 0, 0)).r, 1e-6);
             float dz = rc4.w - zd;
-            float hit = (1 - found) * alive * step(0, dz) * step(dz, apX[10].x * (1 + rc4.w * 0.002));
+            // thickness grows with the step, so thin objects (Mike) are not stepped over
+            float away = step(4, length(suv * apX[10].zw - gpx));   // ignore hits on the glass pixel itself
+            float hit = (1 - found) * alive * away * step(0, dz) * step(dz, apX[10].x * (1 + rc4.w * 0.002) + 1.5 * ds);
             hitT += hit * st;
             found += hit;
             lastMiss = lerp(lastMiss, st, (1 - found) * alive);
@@ -3644,10 +3657,12 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
         float pw = max(pc.w, 1);
         float2 puv = float2(pc.x / pw * 0.5 + 0.5, 0.5 - pc.y / pw * 0.5);
         float2 pe = saturate(min(puv, 1 - puv) * 10);
-        float conf = found * step(1, pc.w) * min(pe.x, pe.y) * saturate(1 - hitT / (apX[9].z + 4)) * step(0.001, apX[8].w);
+        float conf = found * step(1, pc.w) * min(pe.x, pe.y) * saturate(1 - (hitT - tMin) / apX[9].z) * step(0.001, apX[8].w);
+        // fade out at grazing angles, where the reconstructed position is least reliable
+        conf *= saturate(abs(ndv) * 6);
         float3 srgb = tex2Dlod(apPrevTex, float4(saturate(puv), 0, 0)).rgb;
         float fre = 0.04 + 0.96 * pow(saturate(1 - abs(ndv)), 5);
-        refl = lerp(refl, srgb * apX[8].w * lerp(0.6, 2.5, fre), conf * lerp(0.4, 1.0, saturate(fre * 4)));
+        refl = lerp(refl, srgb * apTM.y * apX[8].w * lerp(0.5, 2.0, fre), conf * lerp(0.4, 1.0, saturate(fre * 4)));
     }
 #endif
     float mask = m.x;
@@ -3692,7 +3707,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.17.0") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.17.1") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -3701,7 +3716,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.17.0", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.17.1", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -4126,7 +4141,7 @@ static void PreDraw(IDirect3DDevice9* d)
             { cfg.tmEnable ? 1.0f : 0.0f, cfg.tmKnee / 100.0f, cfg.tmWhite / 100.0f, cfg.tmHue / 100.0f },
             { cfg.gammaMode == 1 ? 1.0f : 0.0f, cfg.gammaMode == 2 ? 1.0f : 0.0f, std::max(cfg.bloomIntensity, 0) / 100.0f, std::max(cfg.dofStrength, 0) / 100.0f },
             { bw, bh, cfg.bloomSmooth ? 1.0f : 0.0f, cfg.dofSmooth ? 1.0f : 0.0f },
-            { g_bloomBound ? std::max(cfg.bloomModern, 0) / 100.0f * 0.3f : 0.0f, 0, 0, 0 } };
+            { g_bloomBound ? std::max(cfg.bloomModern, 0) / 100.0f * 0.3f : 0.0f, std::min(std::max(cfg.shadowDetail, 0), 100) / 100.0f, 0, 0 } };
         o_SetPSConstF(d, gs->paramReg, &p[0][0], 4);   // our own registers - nothing of the game's to restore
         return;
     }
@@ -4963,6 +4978,7 @@ static bool SaveConfig()
     WriteIniInt("Reflections", "Roughness", cfg.ssrRough);
     WriteIniInt("Glass", "ScreenReflections", cfg.glassSsr);
     WriteIniInt("Effects", "ModernBloom", cfg.bloomModern);
+    WriteIniInt("Colour", "ShadowDetail", cfg.shadowDetail);
     WriteIniInt("Effects", "ModernBloomThreshold", cfg.bloomModernThr);
     WriteIniInt("AO", "PreciseDepth", cfg.aoPrecise);
     WriteIniInt("Menu", "MouseSpeed", cfg.menuMouse);
@@ -5066,7 +5082,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.17.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.17.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -5102,6 +5118,8 @@ static void DrawMenu()
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Colour")) {
+                ImGui::SliderInt("Shadow detail", &cfg.shadowDetail, 0, 100, cfg.shadowDetail ? "%d %%" : "game's (clipped)");
+                ImGui::TextDisabled("The game's grading clips everything darker than its shadow level to black; this keeps a soft toe.");
                 CheckboxInt("Colour grading", &cfg.gradeEnable);
                 ImGui::SliderInt("Exposure", &cfg.gradeExposure, -150, 150, "%d (1/100 stop)");
                 ImGui::SliderInt("Contrast", &cfg.gradeContrast, 70, 160, "%d %%");
@@ -5816,7 +5834,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.17.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.17.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();
