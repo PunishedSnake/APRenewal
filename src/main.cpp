@@ -87,8 +87,16 @@ static IDirect3DSurface9* g_prevHdrSurf = nullptr;
 static unsigned g_prevHdrFrame = ~0u;
 static float g_vpPrev[4][4];
 static bool g_glassSsrBound = false;
+// this frame's HDR scene as it stands when the first glass pane is drawn (opaque world, no glass yet):
+// the glass reflections read it with this frame's matrix - no lag, no glass reflecting its own reflection
+static IDirect3DTexture9* g_glassSrc = nullptr;
+static IDirect3DSurface9* g_glassSrcSurf = nullptr;
+static unsigned g_glassSrcKey = ~0u;
 static void GlassMaskRelease()
 {
+    if (g_glassSrcSurf) { g_glassSrcSurf->Release(); g_glassSrcSurf = nullptr; }
+    if (g_glassSrc) { g_glassSrc->Release(); g_glassSrc = nullptr; }
+    g_glassSrcKey = ~0u;
     if (g_matMaskSurf) { g_matMaskSurf->Release(); g_matMaskSurf = nullptr; }
     if (g_matMask) { g_matMask->Release(); g_matMask = nullptr; }
     g_matMaskFrame = ~0u;
@@ -4214,9 +4222,10 @@ static IDirect3DPixelShader9* BuildSoftShadow(IDirect3DDevice9* dev, GameShader&
 // apTM: x opacity scale, y reflection strength, z our Fresnel amount, w game's luminance weighting
 // apTM2: x normal-map strength
 static const char* kGlassBodyHLSL = R"HLSL(
-// GLASSSSR: screen-space reflections from the previous frame. apX[0..3] this frame's view-projection
-// rows, apX[4..7] the previous frame's, apX[8] camera xyz + strength, apX[9] (depth fit A, B, max
-// distance), apX[10] x thickness. s12 = this frame's 24-bit depth snapshot, s13 = last frame's HDR scene.
+// GLASSSSR: screen-space reflections. apX[0..3] this frame's view-projection rows, apX[4..7] the
+// matrix the colour source was rendered with (this frame's when s13 is the same-frame copy), apX[8]
+// camera xyz + strength, apX[9] (depth fit A, B, max distance), apX[10] x thickness, y frame (jitter),
+// zw screen size. s12 = this frame's 24-bit depth snapshot, s13 = the HDR scene to reflect.
 // Written without flow control or helper functions (fixed unrolled steps, masks instead of breaks):
 // 0.16.0's version with loops/breaks/early returns crashed the game's D3DX compiler.
 #if GLASSSSR
@@ -4268,7 +4277,8 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
         // per-pixel jitter from the glass pixel's screen position (apX[10].zw = screen size)
         float4 gc = gwp.x * apX[0] + gwp.y * apX[1] + gwp.z * apX[2] + apX[3];
         float2 gpx = float2(gc.x / max(gc.w, 1) * 0.5 + 0.5, 0.5 - gc.y / max(gc.w, 1) * 0.5) * apX[10].zw;
-        float jit = frac(52.9829189 * frac(dot(floor(gpx), float2(0.06711056, 0.00583715))));
+        // changes every frame, so the temporal AA averages the step pattern away instead of freezing it as dots
+        float jit = frac(52.9829189 * frac(dot(floor(gpx) + apX[10].y * 5.588238, float2(0.06711056, 0.00583715))));
         // start a little off the glass (more for distant glass): at grazing angles the ray otherwise
         // touches the window frame / wall right next to the pane
         float tMin = 8 + 0.02 * length(wcv);
@@ -4313,7 +4323,17 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
         float conf = found * step(1, pc.w) * min(pe.x, pe.y) * saturate(1 - (hitT - tMin) / apX[9].z) * step(0.001, apX[8].w);
         // fade out at grazing angles, where the reconstructed position is least reliable
         conf *= saturate(abs(ndv) * 6);
-        float3 srgb = tex2Dlod(apPrevTex, float4(saturate(puv), 0, 0)).rgb;
+        // rays that turn back toward the camera can only hit the backs of things (Mike seen from behind
+        // instead of his front) - that is the dark "ghost"; leave those to the cubemap
+        float facing = dot(Rw, -wcv / max(length(wcv), 1e-3));
+        conf *= saturate(0.6 + 1.6 * facing);
+        // small cross filter: half-res source, softens the hit edges
+        float2 ht = 0.75 / apX[10].zw * 2;
+        float3 srgb = (tex2Dlod(apPrevTex, float4(saturate(puv), 0, 0)).rgb * 2 +
+                       tex2Dlod(apPrevTex, float4(saturate(puv + float2(ht.x, 0)), 0, 0)).rgb +
+                       tex2Dlod(apPrevTex, float4(saturate(puv - float2(ht.x, 0)), 0, 0)).rgb +
+                       tex2Dlod(apPrevTex, float4(saturate(puv + float2(0, ht.y)), 0, 0)).rgb +
+                       tex2Dlod(apPrevTex, float4(saturate(puv - float2(0, ht.y)), 0, 0)).rgb) / 6;
         float fre = 0.04 + 0.96 * pow(saturate(1 - abs(ndv)), 5);
         refl = lerp(refl, srgb * apTM.y * apX[8].w * lerp(0.5, 2.0, fre), conf * lerp(0.4, 1.0, saturate(fre * 4)));
     }
@@ -4360,7 +4380,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.20.3") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.21.0") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4369,7 +4389,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.20.3", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.21.0", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -4970,16 +4990,42 @@ static void PreDraw(IDirect3DDevice9* d)
         if (gs->paramReg + 16 <= 224) {
             float x[12][4] = {};
             float M[3][3], A[3][3], t[3], cam[3];
-            const bool ok = cfg.glassSsr > 0 && g_prevHdr && g_prevHdrFrame + 1 == g_frameNo && g_vpKey / 64u == g_frameNo &&
-                            g_fx.zcopy && g_fx.zValid && g_fx.fitValid && VpInverse(g_vp, M, A, t, cam);
+            const bool base = cfg.glassSsr > 0 && g_vpKey / 64u == g_frameNo &&
+                              g_fx.zcopy && g_fx.zValid && g_fx.fitValid && VpInverse(g_vp, M, A, t, cam);
+            // colour source: this frame's scene copied just before the first glass draw (preferred), else
+            // the previous frame's finished scene reprojected with its own matrix
+            bool cur = false;
+            if (base && g_curRT && g_curRT == g_hdrSceneSurf) {
+                if (g_glassSrcKey != g_vpKey) {
+                    D3DSURFACE_DESC hd; g_curRT->GetDesc(&hd);
+                    D3DSURFACE_DESC sd = {};
+                    if (g_glassSrcSurf) g_glassSrcSurf->GetDesc(&sd);
+                    const UINT w = std::max(hd.Width / 2, 1u), h = std::max(hd.Height / 2, 1u);
+                    if (!g_glassSrc || sd.Width != w || sd.Height != h || sd.Format != hd.Format) {
+                        if (g_glassSrcSurf) { g_glassSrcSurf->Release(); g_glassSrcSurf = nullptr; }
+                        if (g_glassSrc) { g_glassSrc->Release(); g_glassSrc = nullptr; }
+                        if (SUCCEEDED(d->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, hd.Format, D3DPOOL_DEFAULT, &g_glassSrc, nullptr)))
+                            g_glassSrc->GetSurfaceLevel(0, &g_glassSrcSurf);
+                        else g_glassSrc = nullptr;
+                        Log("glass: same-frame reflection source %ux%u %s", w, h, g_glassSrc ? "created" : "could not be created - previous frame used");
+                    }
+                    g_glassSrcKey = g_vpKey;
+                    if (!g_glassSrcSurf || FAILED(d->StretchRect(g_curRT, nullptr, g_glassSrcSurf, nullptr, D3DTEXF_LINEAR)))
+                        g_glassSrcKey = ~0u - 1;   // failed this frame: fall back
+                }
+                cur = g_glassSrcKey == g_vpKey;
+            }
+            const bool prev = !cur && g_prevHdr && g_prevHdrFrame + 1 == g_frameNo;
+            const bool ok = base && (cur || prev);
             if (ok) {
                 memcpy(x[0], g_vp, sizeof g_vp);
-                memcpy(x[4], g_vpPrev, sizeof g_vpPrev);
+                if (cur) memcpy(x[4], g_vp, sizeof g_vp); else memcpy(x[4], g_vpPrev, sizeof g_vpPrev);
                 x[8][0] = cam[0]; x[8][1] = cam[1]; x[8][2] = cam[2]; x[8][3] = cfg.glassSsr / 100.0f;
                 x[9][0] = g_fx.fitA; x[9][1] = g_fx.fitB; x[9][2] = 2000.0f;
-                x[10][0] = 30.0f; x[10][2] = (float)(g_ppW ? g_ppW : g_bbW); x[10][3] = (float)(g_ppH ? g_ppH : g_bbH);
+                static unsigned jf = 0;
+                x[10][0] = 30.0f; x[10][1] = (float)(jf++ % 64); x[10][2] = (float)(g_ppW ? g_ppW : g_bbW); x[10][3] = (float)(g_ppH ? g_ppH : g_bbH);
                 d->SetTexture(12, g_fx.zcopy);
-                d->SetTexture(13, g_prevHdr);
+                d->SetTexture(13, cur ? g_glassSrc : g_prevHdr);
                 for (DWORD sm = 12; sm <= 13; sm++) {
                     d->SetSamplerState(sm, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
                     d->SetSamplerState(sm, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
@@ -4990,7 +5036,9 @@ static void PreDraw(IDirect3DDevice9* d)
                 }
                 g_glassSsrBound = true;
                 static bool logged = false;
-                if (!logged) { logged = true; Log("glass: screen-space reflections from the previous frame running"); }
+                static int lastSrc = -1;
+                if (lastSrc != (int)cur) { lastSrc = (int)cur; Log("glass: screen-space reflections running (%s)", cur ? "this frame's scene" : "previous frame, reprojected"); }
+                (void)logged;
             }
             o_SetPSConstF(d, gs->paramReg + 4, &x[0][0], 12);
         }
@@ -5942,7 +5990,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.20.3", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.21.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -6054,7 +6102,7 @@ static void DrawMenu()
             ImGui::SliderInt("Glass bumpiness", &cfg.glassBump, 0, 300, "%d %%");
             ImGui::SliderInt("Glass refraction", &cfg.glassRefract, 0, 300, "%d %%");
             ImGui::SliderInt("Screen-space glass reflections", &cfg.glassSsr, 0, 200, cfg.glassSsr ? "%d %%" : "off (cubemap only)");
-            ImGui::TextDisabled("Windows reflect the room from the previous frame; the cubemap fills in where it can't.");
+            ImGui::TextDisabled("Windows reflect what is on screen this frame; the cubemap fills in where the screen has nothing (e.g. what is behind you).");
             if (ImGui::Button("Game's glass")) { cfg.glassClarity = 100; cfg.glassRefl = 100; cfg.glassFresnel = 0; cfg.glassReflContrast = 100; cfg.glassBump = 100; cfg.glassRefract = 100; }
             ImGui::SameLine();
             if (ImGui::Button("APRenewal defaults")) { cfg.glassClarity = 65; cfg.glassRefl = 160; cfg.glassFresnel = 70; cfg.glassReflContrast = 30; cfg.glassBump = 100; cfg.glassRefract = 100; }
@@ -6761,7 +6809,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.20.3 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.21.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

@@ -93,6 +93,10 @@ res, world into full-res LDR target, one draw to the backbuffer, then UI.
   _1 mask (.x reflection, .w opacity), _2 diffuse, cube env. Writes COLOR1 = 1 into a glass mask (AO
   behind glass), glass SSR variant (`#if GLASSSSR`, unrolled, built after the plain one, skipped if
   `APRenewal_glass_compile.lock` survives a crash).
+  Glass SSR colour source = this frame's HDR scene StretchRect'd (half res, `g_glassSrc`) at the first glass
+  draw of each scene key (RT0 == g_hdrSceneSurf), apX[4..7] = current VP; fallback g_prevHdr + g_vpPrev.
+  Rays turning back toward the camera faded (saturate(0.6 + 1.6·dot(R, camera→glass))) — they only hit
+  backs of things (the "dark Mike ghost"). Jitter IGN(pixel + frame) so TAA averages it; 5-tap cross on the hit.
 - Fog OneLayerMain rebuilt to write transmittance to RT1 (AO fades with fog).
 - Material mask: `BuildTaggedShader` patches base-pass bytecode (`def cK`, `mov oC1, cK`) for skin / metal /
   rough hashes (src/matclass.h from tools/re/matclass.py over RefShaderCache); RT1 = g_matMask (r skin,

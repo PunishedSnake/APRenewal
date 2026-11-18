@@ -45,8 +45,8 @@ Steam Input handles the controller.
   carpet, concrete…) never reflect.
 - **Skin:** subsurface scattering and tighter, glossier highlights.
 - **Weapons and metal:** glossier highlights and metal reflections.
-- **Window glass:** clearer, angle-dependent (Fresnel) reflections, screen-space reflections from the
-  previous frame, refraction control.
+- **Window glass:** clearer, angle-dependent (Fresnel) reflections, screen-space reflections of the
+  current frame's scene (falling back to cubemaps where the screen has nothing to show), refraction control.
 - **Character lighting:** fill and evenness controls for the game's light probes.
 
 ### Post-processing
