@@ -222,6 +222,31 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   User's Materials folder (MasterMATS, Material_Skin, Material_Cloth, Material_VehicleAndWeapon,
   PhysicalMATS, GenericMATS = Glass_0001/0002) has the material graphs (expressions) — the source
   for mapping Texture2D_N / UniformScalar_N of material shaders.
+- 0.16.0:
+  - VS CTABs were never parsed (ParseCtab demanded a ps version token 0xFFFF....; vs is 0xFFFE....),
+    so ViewProjectionMatrix was never found and SSR never ran. Accept both.
+  - RefShaderCache-PC-D3D-SM3.upk (uncompressed): shader records = [type FName 8][Id GUID 16][skip 4]
+    [u8 platform][u8 freq][u32 size][bytecode]; shader maps end with [FName][MaterialId GUID][FString
+    friendly name] and reference shaders as [type FName][GUID][type FName]. tools/re/shadercache.py:
+    material_maps() → (material name, [(shader type, FNV hash)]) for 1972 maps / 1510 materials.
+    tools/re/matclass.py → src/matclass.h (TBasePassPixelShader* hashes owned only by skin / metal
+    materials; ~420 skin, ~480 metal). Census hash 9e6fdc78 = Mike's skin (Standard_Skin_MST_THOR).
+  - Material mask: BuildTaggedShader patches the game's bytecode (def cK = tag after the header,
+    mov oC1, cK before the end; K above CTAB + defs; skipped if the shader writes oC1 or uses relative
+    constant addressing). hk_SetPS binds the tagged copy; PreDraw binds g_matMask (fp16, r skin, g metal)
+    as RT1 when RT0 is the full-res HDR scene. Skin materials are MLM_Custom with their own layered
+    scattering in the light passes - the mask comes from the base pass only.
+  - Skin SSS (kSSSPS): separable 13-tap blur, per-channel sigma (1, .45, .25), radius = width x focal /
+    depth (focal from |VP column y| x H/2), depth + mask continuity, approx linear (x²). After AO.
+  - SSR (kSSRPS): c17 = (metal strength, mask valid), s2 = material mask; metal pixels reflect at any
+    angle, tinted by their colour. Runs when floors or metal need it.
+  - Glass SSR: BuildReplacement header adds apX[12] at paramReg+4 (if ≤ c223). PostFXRun copies the
+    finished HDR scene to g_prevHdr (half res) + g_vpPrev; the glass PreDraw binds s12 = zcopy (24-bit z,
+    1/d = A + B·z), s13 = g_prevHdr. Glass world position = camera − (TEXCOORD6 through the tangent basis
+    and LocalToWorld): the VS writes camera−position projected on the (unnormalised) tangent basis.
+  - Draw distance: "set PlayerController LODDistanceFactor 100/pct" queued whenever a new player
+    controller is seen (UE3 scales cull/LOD distance by the view's LODDistanceFactor). Unverified that
+    SET works in this shipping build — the console logs the reply.
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 

@@ -1,4 +1,4 @@
-# APRenewal 0.15.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.16.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,25 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.16.0
+- **Floor reflections actually run now.** 0.15.1 compiled the shader, but the camera matrix was never
+  found: the shader reader only accepted pixel shaders, so the game's vertex shaders (where the
+  matrix lives) were skipped. Look for `ssr: view-projection found` in the log.
+- **Glass reflects the room** (`[Glass] ScreenReflections`): window glass traces its reflection
+  through this frame's depth and takes the colour from the previous frame, reprojected. Where the
+  ray leaves the screen, the old cubemap is used.
+- **Skin and metal**: APRenewal now knows which shaders belong to skin and metal materials. The
+  game's shader cache lists every material's shaders by name; the skin materials (Mike's
+  `Standard_Skin_MST_THOR`, the NPC skins...) and the metal ones (weapons, `Metal*`, pipes, chains)
+  are marked while the scene is drawn.
+  - **Skin subsurface scattering** (`[Materials] SkinScatter`): light bleeds softly through skin,
+    with red travelling furthest - faces lose the plastic look.
+  - **Metal reflections** (`[Materials] MetalReflections`): weapons and metal props reflect the
+    scene on screen, tinted by their own colour.
+- **Draw distance** (`[Game] DrawDistance`, Game tab): objects stay visible and keep their detailed
+  models further away (150 % by default). Set through the game's own LODDistanceFactor at every
+  level load.
 
 ## New in 0.15.1
 - **Screen-space reflections fixed**: the reflection shader failed to compile in 0.15.0 (a variable
