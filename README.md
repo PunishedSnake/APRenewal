@@ -1,4 +1,4 @@
-# APRenewal 0.14.2 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.15.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,25 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.15.0
+- **AO fades with fog** (`[AO] FadeWithFog`). The game's height fog is rebuilt so it also writes
+  how much fog each pixel has; the AO pass fades out by that amount, so fogged distance no longer
+  has dark AO outlines.
+- **Door glass**: the third glass material (two normal maps, doors with small panes) and its
+  refraction shader are improved like the windows.
+- **Distant objects popping in** (`[Game] NoOcclusionCulling`): the trees behind the wall were hidden
+  by the game's occlusion culling. Occlusion queries now always report "visible".
+- **Screen-space reflections** (`[Reflections]`, Lighting & shadows tab): floors and other
+  upward-facing surfaces reflect what's on screen. World positions come from the game's own
+  view-projection matrix (read from its vertex shaders) and the 24-bit depth.
+- **Wide HDR bloom** (`[Effects] ModernBloom`): a soft, wide modern glow built from the HDR scene
+  (6-level downsample/upsample chain) and added in the final pass, next to the game's bloom.
+- **Better AA**: FXAA 3.11 quality (edge search along the whole edge) next to the fast version.
+- **Console shortcuts** (Game tab): buttons for commands found in the game's own exec handler —
+  HUD toggle, screenshots, hi-res screenshots, FPS / timing, slow motion, occlusion, Obsidian's
+  high-quality character lighting and rim light, door lighting fix, view modes, show flags — plus a
+  list of the value commands (MINAMBIENT, IRRADIANCESCALE, SHARPNESS, DESATURATE...).
 
 ## New in 0.14.2
 - Fixed the light trapezoid without AO at some angles: some frames first render a second view

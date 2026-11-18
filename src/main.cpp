@@ -61,8 +61,21 @@ static int  g_scenesThisFrame = 0;               // scenes rendered so far this 
 static unsigned g_frameNo = 0, g_glassMaskFrame = ~0u;   // g_glassMaskFrame = frame * 64 + scene of the mask's content
 static unsigned GlassMaskKey() { return g_frameNo * 64u + (unsigned)(g_scenesThisFrame & 63); }
 static bool g_glassMaskBound = false;
+static IDirect3DTexture9* g_fogMask = nullptr;    // fog transmittance this frame (MRT 1 of our fog shader)
+static IDirect3DSurface9* g_fogMaskSurf = nullptr;
+static unsigned g_fogMaskFrame = ~0u;
+static bool g_fogMaskBound = false;
+// view-projection of the main view, from the game's vertex shaders (screen <-> world for reflections)
+static float g_vp[4][4];
+static unsigned g_vpKey = ~0u;
+static float g_vsc[256][4];                        // mirror of the vertex shader float constants
+static int   g_curVSvp = -1;                       // ViewProjectionMatrix register of the bound game VS
+static bool  g_bloomBound = false;                 // our bloom texture is on s10 for this draw
 static void GlassMaskRelease()
 {
+    if (g_fogMaskSurf) { g_fogMaskSurf->Release(); g_fogMaskSurf = nullptr; }
+    if (g_fogMask) { g_fogMask->Release(); g_fogMask = nullptr; }
+    g_fogMaskFrame = ~0u;
     if (g_glassMaskSurf) { g_glassMaskSurf->Release(); g_glassMaskSurf = nullptr; }
     if (g_glassMask) { g_glassMask->Release(); g_glassMask = nullptr; }
     g_glassMaskFrame = ~0u;
@@ -108,6 +121,14 @@ struct Config {
     int  aoKey       = VK_F10;
     int  aoProtect   = 50;    // highlight protection, percent
     int  aoGlass     = 100;   // % of AO removed where window glass covers the pixel
+    int  aoFog       = 100;   // % of AO faded out by the game's fog
+    int  fxaaQuality = 1;     // 0 = fast FXAA (console style), 1 = FXAA 3.11 quality (edge search)
+    int  ssr         = 1;     // screen-space reflections on floors
+    int  ssrStrength = 35;    // %
+    int  ssrLength   = 1500;  // max ray length, world units
+    int  ssrFloor    = 70;    // surfaces whose normal points up at least this much (% of straight up)
+    int  bloomModern = 35;    // % of APRenewal's wide HDR bloom added in the final pass
+    int  bloomModernThr = 100;// threshold x100 (HDR scene value)
     int  aoNear      = 30;    // AO fades in from this camera distance (world units)
     int  aoPrecise   = 1;     // read the game's depth buffer via INTZ (24-bit) instead of HDR alpha
     // in-game menu
@@ -133,6 +154,7 @@ struct Config {
     char skipMovies[256] = "slate_";   // comma-separated name prefixes always skipped
     int  shadowScale   = 1;   // shadow map resolution multiplier (1, 2, 4)
     int  console       = 1;   // developer console in the menu
+    int  noOcclusion   = 1;   // occlusion queries always report visible (fixes late pop-in)
     int  shadowSoft    = 0;   // shadow filter width: 0 = matches the enlarged map, 100 = game's original
     // highlight roll-off in the game's final HDR->LDR pass (replaces its hard clip)
     int  tmEnable      = 1;
@@ -223,6 +245,14 @@ static void LoadConfig()
     cfg.aoKey       = GetPrivateProfileIntA("AO", "ToggleKey", VK_F10, g_ini);
     cfg.aoProtect   = GetPrivateProfileIntA("AO", "ProtectHighlights", 50, g_ini);
     cfg.aoGlass     = GetPrivateProfileIntA("AO", "BehindGlass", 100, g_ini);
+    cfg.aoFog       = GetPrivateProfileIntA("AO", "FadeWithFog", 100, g_ini);
+    cfg.fxaaQuality = GetPrivateProfileIntA("PostFX", "FXAAQuality", 1, g_ini) ? 1 : 0;
+    cfg.ssr         = GetPrivateProfileIntA("Reflections", "Enable", 1, g_ini) ? 1 : 0;
+    cfg.ssrStrength = GetPrivateProfileIntA("Reflections", "Strength", 35, g_ini);
+    cfg.ssrLength   = GetPrivateProfileIntA("Reflections", "Length", 1500, g_ini);
+    cfg.ssrFloor    = GetPrivateProfileIntA("Reflections", "FloorsOnly", 70, g_ini);
+    cfg.bloomModern = GetPrivateProfileIntA("Effects", "ModernBloom", 35, g_ini);
+    cfg.bloomModernThr = GetPrivateProfileIntA("Effects", "ModernBloomThreshold", 100, g_ini);
     cfg.aoNear      = GetPrivateProfileIntA("AO", "NearFade", 30, g_ini);
     cfg.aoPrecise   = GetPrivateProfileIntA("AO", "PreciseDepth", 1, g_ini);
     cfg.menuKey     = GetPrivateProfileIntA("Menu", "Key", VK_INSERT, g_ini);
@@ -245,6 +275,7 @@ static void LoadConfig()
     cfg.skipIntros    = GetPrivateProfileIntA("Game", "SkipIntros", 1, g_ini) ? 1 : 0;
     GetPrivateProfileStringA("Game", "SkipMovies", "slate_", cfg.skipMovies, sizeof cfg.skipMovies, g_ini);
     cfg.console       = GetPrivateProfileIntA("Game", "Console", 1, g_ini) ? 1 : 0;
+    cfg.noOcclusion   = GetPrivateProfileIntA("Game", "NoOcclusionCulling", 1, g_ini) ? 1 : 0;
     cfg.shadowScale   = GetPrivateProfileIntA("Shadows", "Scale", 1, g_ini);
     if (cfg.shadowScale != 2 && cfg.shadowScale != 4) cfg.shadowScale = 1;
     cfg.shadowSoft    = GetPrivateProfileIntA("Shadows", "Softness", 0, g_ini);
@@ -579,7 +610,7 @@ static void* g_pcVtbl = nullptr;
 static volatile DWORD g_pcTick = 0;
 static bool g_conOk = false;
 static CRITICAL_SECTION g_conCs;
-static char g_conPending[512];
+static std::vector<std::string> g_conQueue;      // commands waiting for the main thread
 static volatile bool g_conQueued = false;
 static std::vector<std::string> g_conHistory;
 static void ConAddLine(const std::string& l)
@@ -599,13 +630,26 @@ static void __cdecl Con_CapturePC(HookRegs* r)
     if (g_pc != pc) Log("console: player controller %p (vtable %p)", pc, vt);
     g_pc = pc; g_pcTick = GetTickCount();
 }
+static void ConRunOne(const char* cmd);
 static void ConRunQueued()
 {
     if (!g_conQueued) return;
-    char cmd[512];
+    std::vector<std::string> q;
     EnterCriticalSection(&g_conCs);
-    memcpy(cmd, g_conPending, sizeof cmd); g_conQueued = false;
+    q.swap(g_conQueue); g_conQueued = false;
     LeaveCriticalSection(&g_conCs);
+    for (auto& c : q) ConRunOne(c.c_str());
+}
+static void ConQueue(const char* cmd, bool echo = true)
+{
+    if (echo) ConAddLine(std::string("> ") + cmd);
+    EnterCriticalSection(&g_conCs);
+    g_conQueue.push_back(cmd);
+    g_conQueued = true;
+    LeaveCriticalSection(&g_conCs);
+}
+static void ConRunOne(const char* cmd)
+{
     void* pc = g_pc;
     if (!pc || GetTickCount() - g_pcTick > 3000 || !Readable(pc, 4) || *(void**)pc != g_pcVtbl) {
         ConAddLine("  (no player yet - load a save or start a game first)");
@@ -1170,6 +1214,186 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 }
 )HLSL";
 
+// FXAA 3.11 "quality" (Lottes): finds the whole edge span (up to 12 steps each way) and blends
+// across it, so long near-horizontal edges get smooth instead of the console version's blur.
+static const char* kFxaaQPS = R"HLSL(
+sampler2D s0 : register(s0);
+float4 rcpFrame : register(c0);
+float L(float2 uv) { return dot(tex2Dlod(s0, float4(uv, 0, 0)).rgb, float3(0.299, 0.587, 0.114)); }
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float2 rcp = rcpFrame.xy;
+    float4 rgbM = tex2Dlod(s0, float4(uv, 0, 0));
+    float lumaM = dot(rgbM.rgb, float3(0.299, 0.587, 0.114));
+    float lumaS = L(uv + float2(0, rcp.y)), lumaE = L(uv + float2(rcp.x, 0));
+    float lumaN = L(uv - float2(0, rcp.y)), lumaW = L(uv - float2(rcp.x, 0));
+    float maxL = max(max(max(lumaS, lumaE), max(lumaN, lumaW)), lumaM);
+    float minL = min(min(min(lumaS, lumaE), min(lumaN, lumaW)), lumaM);
+    float range = maxL - minL;
+    if (range < max(0.0312, maxL * 0.125)) return float4(rgbM.rgb, 1);
+    float lumaNW = L(uv - rcp), lumaSE = L(uv + rcp);
+    float lumaNE = L(uv + float2(rcp.x, -rcp.y)), lumaSW = L(uv + float2(-rcp.x, rcp.y));
+    float lumaNS = lumaN + lumaS, lumaWE = lumaW + lumaE;
+    float subpixRcpRange = 1.0 / range;
+    float edgeHorz1 = -2.0 * lumaM + lumaNS, edgeVert1 = -2.0 * lumaM + lumaWE;
+    float lumaNESE = lumaNE + lumaSE, lumaNWNE = lumaNW + lumaNE;
+    float edgeHorz2 = -2.0 * lumaE + lumaNESE, edgeVert2 = -2.0 * lumaN + lumaNWNE;
+    float lumaNWSW = lumaNW + lumaSW, lumaSWSE = lumaSW + lumaSE;
+    float edgeHorz4 = abs(edgeHorz1) * 2.0 + abs(edgeHorz2), edgeVert4 = abs(edgeVert1) * 2.0 + abs(edgeVert2);
+    float edgeHorz3 = -2.0 * lumaW + lumaNWSW, edgeVert3 = -2.0 * lumaS + lumaSWSE;
+    float edgeHorz = abs(edgeHorz3) + edgeHorz4, edgeVert = abs(edgeVert3) + edgeVert4;
+    float subpixA = (lumaNS + lumaWE) * 2.0 + lumaNWSW + lumaNESE;
+    bool horzSpan = edgeHorz >= edgeVert;
+    float lengthSign = horzSpan ? rcp.y : rcp.x;
+    if (!horzSpan) { lumaN = lumaW; lumaS = lumaE; }
+    float subpixB = subpixA * (1.0 / 12.0) - lumaM;
+    float gradientN = lumaN - lumaM, gradientS = lumaS - lumaM;
+    float lumaNN = lumaN + lumaM, lumaSS = lumaS + lumaM;
+    bool pairN = abs(gradientN) >= abs(gradientS);
+    float gradient = max(abs(gradientN), abs(gradientS));
+    if (pairN) lengthSign = -lengthSign;
+    float subpixC = saturate(abs(subpixB) * subpixRcpRange);
+    float2 posB = uv;
+    float2 offNP = horzSpan ? float2(rcp.x, 0) : float2(0, rcp.y);
+    if (!horzSpan) posB.x += lengthSign * 0.5; else posB.y += lengthSign * 0.5;
+    float2 posN = posB - offNP, posP = posB + offNP;
+    float subpixD = -2.0 * subpixC + 3.0;
+    float subpixE = subpixC * subpixC;
+    if (!pairN) lumaNN = lumaSS;
+    float gradientScaled = gradient * 0.25;
+    bool lumaMLTZero = (lumaM - lumaNN * 0.5) < 0.0;
+    float lumaEndN = L(posN) - lumaNN * 0.5, lumaEndP = L(posP) - lumaNN * 0.5;
+    bool doneN = abs(lumaEndN) >= gradientScaled, doneP = abs(lumaEndP) >= gradientScaled;
+    [loop] for (int i = 0; i < 11; i++) {
+        if (doneN && doneP) break;
+        float st = i == 0 ? 1.5 : (i < 5 ? 2.0 : (i == 5 ? 4.0 : 8.0));
+        if (!doneN) { posN -= offNP * st; lumaEndN = L(posN) - lumaNN * 0.5; doneN = abs(lumaEndN) >= gradientScaled; }
+        if (!doneP) { posP += offNP * st; lumaEndP = L(posP) - lumaNN * 0.5; doneP = abs(lumaEndP) >= gradientScaled; }
+    }
+    float dstN = horzSpan ? uv.x - posN.x : uv.y - posN.y;
+    float dstP = horzSpan ? posP.x - uv.x : posP.y - uv.y;
+    bool goodSpanN = (lumaEndN < 0.0) != lumaMLTZero, goodSpanP = (lumaEndP < 0.0) != lumaMLTZero;
+    float spanLength = dstP + dstN;
+    bool directionN = dstN < dstP;
+    float dst = min(dstN, dstP);
+    bool goodSpan = directionN ? goodSpanN : goodSpanP;
+    float subpixF = subpixD * subpixE;
+    float pixelOffset = -dst / max(spanLength, 1e-6) + 0.5;
+    float pixelOffsetSubpix = max(goodSpan ? pixelOffset : 0.0, subpixF * subpixF * 0.75);
+    float2 p = uv;
+    if (!horzSpan) p.x += pixelOffsetSubpix * lengthSign; else p.y += pixelOffsetSubpix * lengthSign;
+    return float4(tex2Dlod(s0, float4(p, 0, 0)).rgb, 1);
+}
+)HLSL";
+
+// Screen-space reflections for floors. World position from depth via the main view's
+// view-projection (taken from the game's vertex shaders); rays marched in world space and projected
+// back to the screen; only surfaces facing up (world Z) reflect.
+static const char* kSSRPS = R"HLSL(
+sampler2D sColor : register(s0);
+sampler2D sDepth : register(s1);
+float4 rcpFrame : register(c0);
+float4 dP  : register(c6);                       // depth source, as in the AO
+float4 sw0 : register(c8);  float4 sw1 : register(c9);  float4 sw2 : register(c10); float4 sw3 : register(c11);
+float4 ws0 : register(c12); float4 ws1 : register(c13); float4 ws2 : register(c14); float4 ws3 : register(c15);
+float4 sp  : register(c16);                      // x strength, y ray length, z thickness, w up threshold
+float LinD(float2 uv)
+{
+    float4 t = tex2Dlod(sDepth, float4(uv, 0, 0));
+    return dP.x > 0.5 ? 1.0 / max(dP.y + dP.z * t.r, 1e-6) : t.a;
+}
+float3 W(float2 uv, float d)
+{
+    float sx = uv.x * 2 - 1, sy = 1 - uv.y * 2;
+    return (sx * d) * sw0.xyz + (sy * d) * sw1.xyz + d * sw2.xyz + sw3.xyz;
+}
+float3 S(float3 wp)
+{
+    float3 c = wp.x * ws0.xyz + wp.y * ws1.xyz + wp.z * ws2.xyz + ws3.xyz;   // (sx*w, sy*w, w)
+    return float3(c.x / c.z * 0.5 + 0.5, 0.5 - c.y / c.z * 0.5, c.z);
+}
+float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR0
+{
+    float3 col = tex2Dlod(sColor, float4(uv, 0, 0)).rgb;
+    float d = LinD(uv);
+    if (d <= 1 || d > 30000) return float4(col, 1);
+    float3 p = W(uv, d);
+    float2 b = rcpFrame.xy;
+    float3 n = normalize(cross(W(uv + float2(b.x, 0), LinD(uv + float2(b.x, 0))) - p,
+                               W(uv + float2(0, b.y), LinD(uv + float2(0, b.y))) - p));
+    float3 cam = sw3.xyz;
+    float3 V = normalize(p - cam);
+    if (dot(n, V) > 0) n = -n;
+    float up = saturate((n.z - sp.w) / max(1 - sp.w, 1e-3));
+    if (up <= 0) return float4(col, 1);
+    float3 Rd = reflect(V, n);
+    float noise = frac(52.9829189 * frac(dot(vpos, float2(0.06711056, 0.00583715))));
+    float tPrev = 0, tHit = -1;
+    [loop] for (int i = 1; i <= 24; i++) {
+        float t = (i - 1 + noise) / 24.0;
+        t = t * t * sp.y;
+        float3 s = S(p + Rd * t);
+        if (s.x < 0 || s.x > 1 || s.y < 0 || s.y > 1 || s.z <= 1) break;
+        float diff = s.z - LinD(s.xy);
+        if (diff > 0 && diff < sp.z * (1 + s.z * 0.002)) { tHit = t; break; }
+        tPrev = t;
+    }
+    if (tHit < 0) return float4(col, 1);
+    // refine between the last miss and the hit
+    float lo = tPrev, hi = tHit;
+    [unroll] for (int k = 0; k < 5; k++) {
+        float mid = 0.5 * (lo + hi);
+        float3 s = S(p + Rd * mid);
+        if (s.z - LinD(s.xy) > 0) hi = mid; else lo = mid;
+    }
+    float3 sh = S(p + Rd * hi);
+    float3 rc = tex2Dlod(sColor, float4(sh.xy, 0, 0)).rgb;
+    float2 e = min(sh.xy, 1 - sh.xy);
+    float edge = saturate(min(e.x, e.y) * 12);
+    float fres = pow(1 - saturate(dot(-V, n)), 3);
+    float k = sp.x * up * edge * lerp(0.35, 1.0, fres) * (1 - hi / sp.y);
+    return float4(lerp(col, rc, saturate(k)), 1);
+}
+)HLSL";
+
+// Wide HDR bloom (Call of Duty: AW style): 13-tap downsamples with a soft threshold, tent upsamples.
+static const char* kBloomDownPS = R"HLSL(
+sampler2D s0 : register(s0);
+float4 p1 : register(c1);   // xy source texel, z threshold (0 = none), w knee
+float3 T(float2 uv) { return tex2D(s0, uv).rgb; }
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float2 t = p1.xy;
+    float3 a = T(uv + t * float2(-2, -2)), b = T(uv + t * float2(0, -2)), c = T(uv + t * float2(2, -2));
+    float3 d = T(uv + t * float2(-1, -1)), e = T(uv + t * float2(1, -1));
+    float3 f = T(uv + t * float2(-2, 0)),  g = T(uv),                     h = T(uv + t * float2(2, 0));
+    float3 i = T(uv + t * float2(-1, 1)),  j = T(uv + t * float2(1, 1));
+    float3 k = T(uv + t * float2(-2, 2)),  l = T(uv + t * float2(0, 2)),  m = T(uv + t * float2(2, 2));
+    float3 o = (d + e + i + j) * 0.125 + (a + b + f + g + b + c + g + h + f + g + k + l + g + h + l + m) * 0.03125;
+    if (p1.z > 0) {
+        float br = max(o.r, max(o.g, o.b));
+        float rq = clamp(br - p1.z + p1.w, 0, 2 * p1.w);
+        rq = rq * rq / (4 * p1.w + 1e-4);
+        o *= max(rq, br - p1.z) / max(br, 1e-4);
+        o = min(o, 32);
+    }
+    return float4(max(o, 0), 1);
+}
+)HLSL";
+static const char* kBloomUpPS = R"HLSL(
+sampler2D s0 : register(s0);   // lower level (upsampled)
+sampler2D s1 : register(s1);   // this level (added)
+float4 p1 : register(c1);      // xy lower-level texel
+float3 T(float2 uv) { return tex2D(s0, uv).rgb; }
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float2 t = p1.xy;
+    float3 s = 4 * T(uv) + 2 * (T(uv + float2(t.x, 0)) + T(uv - float2(t.x, 0)) + T(uv + float2(0, t.y)) + T(uv - float2(0, t.y)))
+             + T(uv + t) + T(uv - t) + T(uv + float2(t.x, -t.y)) + T(uv + float2(-t.x, t.y));
+    return float4(tex2D(s1, uv).rgb + s / 16, 1);
+}
+)HLSL";
+
 // ID3DXBuffer vtable: [2]=Release [3]=GetBufferPointer
 static void* BufPtr(void* b)    { return ((void*(WINAPI*)(void*))(*(void***)b)[3])(b); }
 static void  BufRelease(void* b){ ((ULONG(WINAPI*)(void*))(*(void***)b)[2])(b); }
@@ -1333,7 +1557,8 @@ static const char* kAOCompositePS = R"HLSL(
 sampler2D sColor : register(s0);
 sampler2D sAO    : register(s1);
 sampler2D sGlass : register(s2);  // window glass coverage, written by our glass shader (MRT)
-float4 opt : register(c4);        // x = debug view, y = highlight protection 0..1, z = glass mask strength
+sampler2D sFog   : register(s3);  // fog transmittance (1 = clear), written by our fog shader (MRT)
+float4 opt : register(c4);        // x = debug view, y = highlight protection, z = glass mask, w = fog fade
 float4 main(float2 uv : TEXCOORD0) : COLOR0
 {
     float3 c = tex2D(sColor, uv).rgb;
@@ -1342,6 +1567,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
     float l = dot(c, float3(0.299, 0.587, 0.114));
     ao = lerp(ao, 1, smoothstep(0.65, 1.0, l) * opt.y);   // soft: keeps lamps from greying without popping
     ao = lerp(ao, 1, saturate(tex2D(sGlass, uv).r) * opt.z); // seen through glass: the glass isn't occluded
+    ao = lerp(1, ao, lerp(1, saturate(tex2D(sFog, uv).r), opt.w)); // fogged distance: AO fades with the fog
     return float4(c * ao, 1);
 }
 )HLSL";
@@ -1349,6 +1575,8 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 struct PostFX {
     IDirect3DVertexShader9* vs = nullptr;
     IDirect3DPixelShader9* psFxaa = nullptr;
+    IDirect3DPixelShader9* psFxaaQ = nullptr;
+    IDirect3DPixelShader9* psSSR = nullptr;
     IDirect3DPixelShader9* psSharp = nullptr;
     IDirect3DPixelShader9* psAO = nullptr;
     IDirect3DPixelShader9* psAOBlur = nullptr;
@@ -1466,6 +1694,8 @@ static bool PostFXReady(IDirect3DDevice9* dev)
         g_fx.vs = CompileVS(dev, kQuadVS, "Quad");
         // everything is compiled up front so the in-game menu can switch effects live
         if (g_fx.vs) g_fx.psFxaa  = CompilePS(dev, kFxaaPS, "FXAA");
+        if (g_fx.vs) g_fx.psFxaaQ = CompilePS(dev, kFxaaQPS, "FXAA 3.11 quality");
+        if (g_fx.vs) g_fx.psSSR   = CompilePS(dev, kSSRPS, "screen-space reflections");
         if (g_fx.vs) g_fx.psSharp = CompilePS(dev, kSharpenPS, "Sharpen");
         if (g_fx.vs) g_fx.psGrade = CompilePS(dev, kGradePS, "Colour grade");
         if (g_fx.vs) {
@@ -1613,7 +1843,8 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
     const bool doAO = cfg.aoEnable && g_fx.aoMode != 0 && g_fx.depthValid && g_fx.depth && g_fx.psAO && g_fx.psAOBlur && g_fx.psAOComp;
     const bool doFxaa = cfg.fxaa && g_fx.psFxaa != nullptr, doSharp = cfg.sharpen > 0 && g_fx.psSharp != nullptr;
     const bool doGrade = cfg.gradeEnable && g_fx.psGrade != nullptr;
-    if (!doAO && !doFxaa && !doSharp && !doGrade) return;
+    const bool doSSR = cfg.ssr && cfg.ssrStrength > 0 && g_fx.psSSR && g_fx.depthValid && g_fx.depth && g_vpKey / 64u == g_frameNo;
+    if (!doAO && !doFxaa && !doSharp && !doGrade && !doSSR) return;
     if (!EnsureTargets(dev, bd)) return;
     if (doAO && !g_fx.aoA) return;
 
@@ -1659,7 +1890,7 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
         dev->SetPixelShaderConstantF(0, rcp, 1);
         dev->SetPixelShaderConstantF(1, prm, 1);
 
-        int remaining = (doAO ? 1 : 0) + (doGrade ? 1 : 0) + (doFxaa ? 1 : 0) + (doSharp ? 1 : 0);
+        int remaining = (doAO ? 1 : 0) + (doSSR ? 1 : 0) + (doGrade ? 1 : 0) + (doFxaa ? 1 : 0) + (doSharp ? 1 : 0);
         IDirect3DTexture9* cur = g_fx.L0;
         // next output: the real target for the last pass, otherwise whichever ping-pong buffer isn't `cur`
         auto nextOut = [&](IDirect3DTexture9** asTex) -> IDirect3DSurface9* {
@@ -1675,7 +1906,9 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
             const float c2[4] = { tx, tx * bd.Height / bd.Width, (float)cfg.aoRadius, cfg.aoIntensity / 100.0f };
             const float c3[4] = { 0.2f, (float)cfg.aoMaxDist, cfg.aoMaxDist * 0.6f, (float)bd.Width / bd.Height };
             const bool glassNow = g_glassMask && g_glassMaskFrame == GlassMaskKey();   // only this frame's final scene
-            const float c4[4] = { g_fx.aoMode == 2 ? 1.0f : 0.0f, cfg.aoProtect / 100.0f, glassNow ? cfg.aoGlass / 100.0f : 0.0f, 0 };
+            const bool fogNow = g_fogMask && g_fogMaskFrame == GlassMaskKey();
+            const float c4[4] = { g_fx.aoMode == 2 ? 1.0f : 0.0f, cfg.aoProtect / 100.0f, glassNow ? cfg.aoGlass / 100.0f : 0.0f,
+                                  fogNow ? cfg.aoFog / 100.0f : 0.0f };
             const float c5[4] = { (float)cfg.aoNear, 0, 0, 0 };
             dev->SetPixelShaderConstantF(5, c5, 1);
             const bool precise = g_fx.aoIsGtao && cfg.aoPrecise && g_fx.zcopy && g_fx.zValid && g_fx.fitValid;
@@ -1695,11 +1928,52 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
             dev->SetPixelShaderConstantF(1, prm, 1);
             dev->SetTexture(1, g_fx.aoA);
             dev->SetTexture(2, glassNow ? (IDirect3DBaseTexture9*)g_glassMask : nullptr);
+            dev->SetTexture(3, fogNow ? (IDirect3DBaseTexture9*)g_fogMask : nullptr);
             IDirect3DSurface9* o = nextOut(&outTex);
             DrawFullscreen(dev, cur, o, g_fx.psAOComp);                       // color * AO
             dev->SetTexture(1, nullptr);
             dev->SetTexture(2, nullptr);
+            dev->SetTexture(3, nullptr);
             if (outTex) cur = outTex;
+        }
+        if (doSSR) {
+            // screen <-> world from the main view's view-projection (row-major, world -> clip):
+            // (sx*w, sy*w, w) = wp * M3 + t, so wp = ((sx*w, sy*w, w) - t) * inverse(M3)
+            float M[3][3], t[3], A[3][3];
+            for (int i = 0; i < 3; i++) { M[i][0] = g_vp[i][0]; M[i][1] = g_vp[i][1]; M[i][2] = g_vp[i][3]; }
+            t[0] = g_vp[3][0]; t[1] = g_vp[3][1]; t[2] = g_vp[3][3];
+            const float det = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
+                            + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+            if (fabsf(det) > 1e-20f) {
+                const float id = 1.0f / det;
+                A[0][0] =  (M[1][1] * M[2][2] - M[1][2] * M[2][1]) * id; A[0][1] = -(M[0][1] * M[2][2] - M[0][2] * M[2][1]) * id; A[0][2] =  (M[0][1] * M[1][2] - M[0][2] * M[1][1]) * id;
+                A[1][0] = -(M[1][0] * M[2][2] - M[1][2] * M[2][0]) * id; A[1][1] =  (M[0][0] * M[2][2] - M[0][2] * M[2][0]) * id; A[1][2] = -(M[0][0] * M[1][2] - M[0][2] * M[1][0]) * id;
+                A[2][0] =  (M[1][0] * M[2][1] - M[1][1] * M[2][0]) * id; A[2][1] = -(M[0][0] * M[2][1] - M[0][1] * M[2][0]) * id; A[2][2] =  (M[0][0] * M[1][1] - M[0][1] * M[1][0]) * id;
+                float c[17][4] = {};
+                const bool precise = g_fx.aoIsGtao && cfg.aoPrecise && g_fx.zcopy && g_fx.zValid && g_fx.fitValid;
+                c[6][0] = precise ? 1.0f : 0.0f; c[6][1] = g_fx.fitA; c[6][2] = g_fx.fitB;
+                for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) c[8 + i][j] = A[i][j];
+                for (int j = 0; j < 3; j++) c[11][j] = -(t[0] * A[0][j] + t[1] * A[1][j] + t[2] * A[2][j]);
+                for (int i = 0; i < 3; i++) { c[12 + i][0] = M[i][0]; c[12 + i][1] = M[i][1]; c[12 + i][2] = M[i][2]; }
+                c[15][0] = t[0]; c[15][1] = t[1]; c[15][2] = t[2];
+                c[16][0] = cfg.ssrStrength / 100.0f; c[16][1] = (float)std::max(cfg.ssrLength, 100);
+                c[16][2] = 40.0f; c[16][3] = std::min(std::max(cfg.ssrFloor, 0), 99) / 100.0f;
+                dev->SetPixelShaderConstantF(6, c[6], 1);
+                dev->SetPixelShaderConstantF(8, c[8], 9);
+                dev->SetTexture(1, precise ? (IDirect3DBaseTexture9*)g_fx.zcopy : g_fx.depth);
+                IDirect3DSurface9* o = nextOut(&outTex);
+                DrawFullscreen(dev, cur, o, g_fx.psSSR);
+                dev->SetTexture(1, nullptr);
+                if (outTex) cur = outTex;
+                static bool logged = false;
+                if (!logged) { logged = true; Log("postfx: screen-space reflections running (camera at %.0f %.0f %.0f)", c[11][0], c[11][1], c[11][2]); }
+            } else {
+                const float off[4] = { 0, 1, 1, 1.5f };      // threshold above 1: the shader returns the colour unchanged
+                dev->SetPixelShaderConstantF(16, off, 1);
+                IDirect3DSurface9* o = nextOut(&outTex);   // keep the chain intact
+                DrawFullscreen(dev, cur, o, g_fx.psSSR);
+                if (outTex) cur = outTex;
+            }
         }
         if (doGrade) {
             const float g0[4] = { powf(2.0f, cfg.gradeExposure / 100.0f), cfg.gradeContrast / 100.0f,
@@ -1713,7 +1987,7 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
         }
         if (doFxaa) {
             IDirect3DSurface9* o = nextOut(&outTex);
-            DrawFullscreen(dev, cur, o, g_fx.psFxaa);
+            DrawFullscreen(dev, cur, o, cfg.fxaaQuality && g_fx.psFxaaQ ? g_fx.psFxaaQ : g_fx.psFxaa);
             if (outTex) cur = outTex;
         }
         if (doSharp) {
@@ -2740,6 +3014,7 @@ struct GameShader {
     int shReg[7] = { -1, -1, -1, -1, -1, -1, -1 };   // c_SHCoefficients_Ar Ag Ab Br Bg Bb Cc
     int skyUpReg = -1, skyLoReg = -1, ambReg = -1;
     int distReg = -1;                        // glass refraction: UniformScalar_1 (normal offset scale)
+    int sceneTexReg = -1;                    // final blend: SceneColorTexture sampler (source of our bloom)
     int uses = 0;
 };
 static std::unordered_map<IDirect3DPixelShader9*, GameShader> g_gameShaders;
@@ -2753,6 +3028,8 @@ static int   g_shReplFail = 0;
 // Final HDR -> LDR pass. Same maths as the game's AP_BloomBlend / DOFAndBloomBlend shaders, except
 // that the hard clip (saturate) before the game's gamma becomes a smooth highlight roll-off.
 static const char* kBlendCommonHLSL = R"HLSL(
+sampler2D apBloomTex : register(s10);   // APRenewal's wide bloom (half res of the scene)
+float3 apModernBloom(float2 uv) { return tex2D(apBloomTex, uv).rgb * apTM4.x; }
 // apTM:  x roll-off on, y knee, z white, w hue preservation
 // apTM2: x sRGB weight, y gamma-2.2 weight (rest = the game's square root), z bloom intensity, w DOF strength
 // apTM3: xy texel size of the quarter-res bloom/DOF buffers, z bloom smoothing, w DOF smoothing
@@ -2824,7 +3101,7 @@ float4 apTent(sampler2D s, float2 uv)
 static const char* kBlendBloomHLSL = R"HLSL(
 void main(float2 UV : TEXCOORD0, float2 SceneUV : TEXCOORD1, out float4 OutColor : COLOR0)
 {
-    float3 c = tex2D(SceneColorTexture, SceneUV).rgb + apBloom(UV);
+    float3 c = tex2D(SceneColorTexture, SceneUV).rgb + apBloom(UV) + apModernBloom(SceneUV);
     OutColor = float4(apFinish(apApplySat(c)), 0);
 }
 )HLSL";
@@ -2851,7 +3128,7 @@ void main(float2 UV : TEXCOORD0, float2 SceneUV : TEXCOORD1, out float4 OutColor
     float3 dof = lerp(f.rgb, cSmall, saturate(coc / 0.33));
     dof = lerp(dof, cLarge, saturate((coc - 0.33) / (1.0 - 0.33)));
     dof = lerp(dof, fore.rgb, saturate(smoothstep(0.0, 0.5, fore.a)) * saturate(apTM2.w));
-    float3 c = apApplySat(dof + apBloom(UV));
+    float3 c = apApplySat(dof + apBloom(UV) + apModernBloom(SceneUV));
     float2 v = SceneUV - 0.5;
     c *= 1 - saturate((2 * dot(v, v) - apVignetteMaskParameters.x) * apVignetteMaskParameters.y);
     OutColor = float4(apFinish(c), 0);
@@ -2875,8 +3152,8 @@ static IDirect3DPixelShader9* BuildReplacement(IDirect3DDevice9* dev, const std:
         src += line;
     }
     paramReg = maxC + 1;
-    snprintf(line, sizeof line, "float4 apTM : register(c%d);\nfloat4 apTM2 : register(c%d);\nfloat4 apTM3 : register(c%d);\n",
-             paramReg, paramReg + 1, paramReg + 2);
+    snprintf(line, sizeof line, "float4 apTM : register(c%d);\nfloat4 apTM2 : register(c%d);\nfloat4 apTM3 : register(c%d);\nfloat4 apTM4 : register(c%d);\n",
+             paramReg, paramReg + 1, paramReg + 2, paramReg + 3);
     src += line;
     if (defines) src = std::string(defines) + src;
     src += common ? common : kBlendCommonHLSL;
@@ -2887,10 +3164,11 @@ static IDirect3DPixelShader9* BuildReplacement(IDirect3DDevice9* dev, const std:
     std::vector<CtabConst> mine;
     ParseCtab((const DWORD*)BufPtr(code), mine);
     for (auto& k : mine) {
-        if ((k.name == "apTM" || k.name == "apTM2" || k.name == "apTM3") && !CtabFind(ct, k.name.c_str())) {
-            const int want = paramReg + (k.name == "apTM" ? 0 : k.name == "apTM2" ? 1 : 2);
-            if (k.reg != want) { Log("shaders: %s parameter register moved - keeping the game's shader", name); BufRelease(code); return nullptr; }
-            continue;
+        if (!CtabFind(ct, k.name.c_str()) && k.name.compare(0, 2, "ap") == 0) {
+            // ours: constants above the game's, samplers from s8 up
+            if ((k.set == 2 && k.reg >= paramReg) || (k.set == 3 && k.reg >= 8)) continue;
+            Log("shaders: %s: our %s landed on a game register - keeping the game's shader", name, k.name.c_str());
+            BufRelease(code); return nullptr;
         }
         const CtabConst* o = CtabFind(ct, k.name.c_str());
         if (!o || o->set != k.set || o->reg != k.reg) {
@@ -2998,12 +3276,21 @@ static const char* kGlassBodyHLSL = R"HLSL(
 void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 fog : TEXCOORD4, float3 camv : TEXCOORD6,
           out float4 OutColor : COLOR0, out float4 OutMask : COLOR1)
 {
+#if DUALNORMAL
+    float4 m = tex2D(Texture2D_2, uv);
+#else
     float4 m = tex2D(Texture2D_1, uv);
+#endif
     float3 a = normalize((tx.xyz - 0.5) * 2);
     float3 b = normalize((tz - 0.5) * 2);
     float3 bin = normalize(((tx.w - 0.5) * 2) * cross(a, b));
+#if DUALNORMAL
+    float3 n0 = tex2D(Texture2D_0, uv).xyz * 2 - 1, n1 = tex2D(Texture2D_1, uv).xyz * 2 - 1;
+    float3 n = float3((n0.xy * UniformScalar_1.x + n1.xy * UniformScalar_3.x) * apTM2.x, n0.z + n1.z);
+#else
     float3 n = tex2D(Texture2D_0, uv).xyz * 2 - 1;
     n.xy *= UniformScalar_1.x * apTM2.x;
+#endif
     n = normalize(n);
     float3 V = normalize(camv);
     float ndv = dot(n, V);
@@ -3023,7 +3310,11 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
     float mask = m.x;
     float3 mr = mask * refl;
     float3 emis = mr + UniformVector_0.rgb;
+#if DUALNORMAL
+    float3 dif = (tex2D(Texture2D_3, uv).rgb * (1 - mr) + mr) * (1 - UniformVector_0.rgb);
+#else
     float3 dif = (tex2D(Texture2D_2, uv).rgb * (1 - mr) + mr) * (1 - UniformVector_0.rgb);
+#endif
     float3 col = dif * AmbientColorAndSkyFactor.rgb + emis;
     float alpha = m.w * APTranslucentOpacity.x * apTM.x;
     // a reflection replaces what's seen through the glass: bright reflections add opacity
@@ -3052,8 +3343,29 @@ static bool ReplActive(const GameShader* gs)
 {
     if (!gs || !gs->repl) return false;
     if (gs->kind == SK_GLASS) return cfg.glassEnable != 0;
+    if (gs->kind == SK_FOG) return cfg.aoEnable && cfg.aoFog > 0;
     return cfg.fxBlend != 0;
 }
+
+// The game's one-layer height fog (HeightFogPixelShader OneLayerMain), same maths, plus its
+// transmittance (1 = no fog) on a second target so the AO can fade with the fog. apTM.x picks how
+// the mask is written for the fog pass's blend mode (0: ONE/SRCALPHA style, 1: plain or alpha blend).
+static const char* kFogBodyHLSL = R"HLSL(
+void main(float4 tc : TEXCOORD0, float4 sv : TEXCOORD1, out float4 OutColor : COLOR0, out float4 OutMask : COLOR1)
+{
+    float d = clamp(tex2D(SceneColorTexture, tc.xy).a, 1, 65535);
+    float din = max(d - FogStartDistance.x, 0);
+    float3 wp = sv.xyz * d;
+    float wz = abs(wp.z) <= 0.001 ? 0.001 : wp.z;
+    float2 hp = saturate(tc.zw / wz);
+    float ld = din * abs(hp.y - hp.x);
+    float neg = FogDistanceScale.x * ld;
+    float sc = ld < FogExtinctionDistance.x ? exp2(neg) : 0.0;
+    OutColor = float4((sc - 1) * FogInScattering.rgb, sc);
+    OutMask = apTM.x < 0.5 ? float4(0, 0, 0, sc) : float4(sc, sc, sc, 1);
+    clip(-neg - 0.001);
+}
+)HLSL";
 
 // Shader census: one frame's pixel shaders with draw counts and constant names (Diagnostics).
 static volatile bool g_censusArm = false;
@@ -3091,16 +3403,17 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
     if (!ParseCtab(fn, ct)) return hr;
     GameShader gs;
     const uint32_t hash = ShaderHash(fn);
-    if (hash == 0xcb2f41c2u || hash == 0x23836016u) {
-        const bool fres = hash == 0x23836016u;
+    if (hash == 0xcb2f41c2u || hash == 0x23836016u || hash == 0xcc79d4cdu) {
+        const bool fres = hash == 0x23836016u, dual = hash == 0xcc79d4cdu;
         gs.kind = SK_GLASS;
-        gs.repl = BuildReplacement(d, ct, kGlassBodyHLSL, gs.paramReg, fres ? "window glass (fresnel)" : "window glass", "",
-                                   fres ? "#define GAMEFRESNEL 1\n" : "#define GAMEFRESNEL 0\n");
+        gs.repl = BuildReplacement(d, ct, kGlassBodyHLSL, gs.paramReg, fres ? "window glass (fresnel)" : dual ? "door glass" : "window glass", "",
+                                   fres ? "#define GAMEFRESNEL 1\n#define DUALNORMAL 0\n" : dual ? "#define GAMEFRESNEL 0\n#define DUALNORMAL 1\n"
+                                        : "#define GAMEFRESNEL 0\n#define DUALNORMAL 0\n");
         if (!gs.repl) g_shReplFail++;
         Log("shaders: window glass material %08x recognised - %s", hash, gs.repl ? "improved version ready" : "replacement FAILED, game shader kept");
-    } else if (hash == 0x3e0261ffu || hash == 0x98160836u) {
+    } else if (hash == 0x3e0261ffu || hash == 0x98160836u || hash == 0x855d48c7u) {
         gs.kind = SK_GLASSDIST;
-        if (auto k = CtabFind(ct, "UniformScalar_1")) gs.distReg = k->reg;
+        if (auto k = CtabFind(ct, hash == 0x855d48c7u ? "UniformScalar_5" : "UniformScalar_1")) gs.distReg = k->reg;
     } else if (CtabFind(ct, "HSBContrast") && CtabFind(ct, "GammaColorScaleAndInverse") && CtabFind(ct, "LensFilterImage") &&
         CtabFind(ct, "SceneColorTexture") && CtabFind(ct, "FilterColor")) {
         const bool dof = CtabFind(ct, "NewDOF_noBleedBlurMap") && CtabFind(ct, "NewDOF_bleedBlurMap") &&
@@ -3109,6 +3422,7 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
         const bool plain = !CtabFind(ct, "PackedParameters") && !CtabFind(ct, "NewDOF_noBleedBlurMap");
         if (!dof && !plain) { Log("shaders: unknown final-blend variant (%u constants) - left alone", (unsigned)ct.size()); return hr; }
         gs.kind = dof ? SK_BLEND_DOF : SK_BLEND_BLOOM;
+        gs.sceneTexReg = CtabFind(ct, "SceneColorTexture")->reg;
         gs.repl = BuildReplacement(d, ct, dof ? kBlendDofHLSL : kBlendBloomHLSL, gs.paramReg, dof ? "final blend (DOF)" : "final blend");
         if (!gs.repl) g_shReplFail++;
         Log("shaders: game final blend%s recognised (%p) - %s", dof ? " with DOF" : "", (void*)*out,
@@ -3116,6 +3430,11 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
     } else if (CtabFind(ct, "FogDistanceScale") && CtabFind(ct, "FogInScattering") && CtabFind(ct, "FogStartDistance")) {
         gs.kind = SK_FOG;
         gs.fogScaleReg = CtabFind(ct, "FogDistanceScale")->reg;
+        // one-layer variant (the one the game uses): rebuilt so it can also write fog transmittance
+        if (!CtabFind(ct, "FogMinStartDistance") && CtabFind(ct, "FogInScattering")->count == 1 && CtabFind(ct, "SceneColorTexture")) {
+            gs.repl = BuildReplacement(d, ct, kFogBodyHLSL, gs.paramReg, "height fog", "", nullptr);
+            Log("shaders: height fog (one layer) %s", gs.repl ? "rebuilt - AO can fade with the fog" : "rebuild FAILED - game's kept");
+        }
     } else if (CtabFind(ct, "VelocityBuffer") && CtabFind(ct, "PrevViewProjMatrix")) {
         gs.kind = SK_MBLUR;
         if (auto k = CtabFind(ct, "StaticVelocityParameters"))  gs.velStaticReg = k->reg;
@@ -3159,8 +3478,74 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_SetPSConstF)(IDirect3DDevice9*, UINT, co
 static PFN_SetPSConstF o_SetPSConstF = nullptr;
 static HRESULT STDMETHODCALLTYPE hk_SetPSConstF(IDirect3DDevice9* d, UINT reg, const float* v, UINT n)
 {
-    if (v && reg < 256) memcpy(g_psc[reg], v, std::min<UINT>(n, 256 - reg) * 16);
+    if (v && reg < 256 && !g_inPostFX) memcpy(g_psc[reg], v, std::min<UINT>(n, 256 - reg) * 16);   // the game's values only
     return o_SetPSConstF(d, reg, v, n);
+}
+
+// Vertex shaders: which register holds ViewProjectionMatrix (world -> clip, row-major), for
+// reconstructing world positions from depth (reflections).
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateVS)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetVS)(IDirect3DDevice9*, IDirect3DVertexShader9*);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_SetVSConstF)(IDirect3DDevice9*, UINT, const float*, UINT);
+static PFN_CreateVS o_CreateVS = nullptr;
+static PFN_SetVS o_SetVS = nullptr;
+static PFN_SetVSConstF o_SetVSConstF = nullptr;
+static std::unordered_map<IDirect3DVertexShader9*, int> g_vsVP;
+static HRESULT STDMETHODCALLTYPE hk_CreateVS(IDirect3DDevice9* d, const DWORD* fn, IDirect3DVertexShader9** out)
+{
+    HRESULT hr = o_CreateVS(d, fn, out);
+    if (SUCCEEDED(hr) && out && *out && !g_inPostFX && !g_ownShaderCreate) {
+        std::vector<CtabConst> ct;
+        if (ParseCtab(fn, ct))
+            if (const CtabConst* k = CtabFind(ct, "ViewProjectionMatrix"))
+                if (k->set == 2 && k->count == 4) { (*out)->AddRef(); g_vsVP[*out] = k->reg; }
+    }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hk_SetVS(IDirect3DDevice9* d, IDirect3DVertexShader9* vs)
+{
+    if (!g_inPostFX) {
+        auto it = vs ? g_vsVP.find(vs) : g_vsVP.end();
+        g_curVSvp = it != g_vsVP.end() ? it->second : -1;
+    }
+    return o_SetVS(d, vs);
+}
+static HRESULT STDMETHODCALLTYPE hk_SetVSConstF(IDirect3DDevice9* d, UINT reg, const float* v, UINT n)
+{
+    if (v && reg < 256 && !g_inPostFX) memcpy(g_vsc[reg], v, std::min<UINT>(n, 256 - reg) * 16);
+    return o_SetVSConstF(d, reg, v, n);
+}
+
+// Occlusion culling: UE3 hides objects whose previous-frame occlusion query found no visible
+// pixels. Some objects (distant trees behind walls) have bounds that make that test fail, so they
+// pop in late. With [Game] NoOcclusionCulling every occlusion query reports "visible".
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CreateQuery)(IDirect3DDevice9*, D3DQUERYTYPE, IDirect3DQuery9**);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_QGetData)(IDirect3DQuery9*, void*, DWORD, DWORD);
+static PFN_CreateQuery o_CreateQuery = nullptr;
+static PFN_QGetData o_QGetData = nullptr;
+static long g_occForced = 0;
+static HRESULT STDMETHODCALLTYPE hk_QGetData(IDirect3DQuery9* q, void* data, DWORD size, DWORD flags)
+{
+    HRESULT hr = o_QGetData(q, data, size, flags);
+    if (hr == S_OK && cfg.noOcclusion && data && size >= sizeof(DWORD) && q->GetType() == D3DQUERYTYPE_OCCLUSION && !g_inPostFX) {
+        DWORD* px = (DWORD*)data;
+        if (*px < 64) { *px = 64; g_occForced++; }
+    }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hk_CreateQuery(IDirect3DDevice9* d, D3DQUERYTYPE t, IDirect3DQuery9** out)
+{
+    HRESULT hr = o_CreateQuery(d, t, out);
+    if (SUCCEEDED(hr) && out && *out && t == D3DQUERYTYPE_OCCLUSION && !o_QGetData) {
+        void** vt = *(void***)*out;
+        o_QGetData = (PFN_QGetData)vt[7];
+        DWORD old;
+        VirtualProtect(&vt[7], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
+        vt[7] = (void*)hk_QGetData;
+        VirtualProtect(&vt[7], sizeof(void*), old, &old);
+        Log("game: occlusion query hook installed (%s)", cfg.noOcclusion ? "objects never culled by occlusion" : "inactive");
+    }
+    return hr;
 }
 
 // Before a draw with a recognised game shader: feed our values. After: put the game's back.
@@ -3175,9 +3560,88 @@ static void PdSet(int reg, const float* v, int n = 1)
     g_preDrawHi = std::max(g_preDrawHi, reg + n - 1);
 }
 static bool BlendReplaced() { return cfg.fxBlend != 0; }
+// APRenewal bloom: 6 downsamples of the HDR scene (soft threshold on the first), tent upsamples back.
+static IDirect3DPixelShader9 *g_psBloomDown = nullptr, *g_psBloomUp = nullptr;
+static bool g_bloomTried = false;
+static IDirect3DTexture9* g_blD[7] = {};
+static IDirect3DTexture9* g_blU[7] = {};
+static void BloomRelease()
+{
+    for (int i = 0; i < 7; i++) {
+        if (g_blD[i]) { g_blD[i]->Release(); g_blD[i] = nullptr; }
+        if (g_blU[i]) { g_blU[i]->Release(); g_blU[i] = nullptr; }
+    }
+}
+static IDirect3DTexture9* BuildModernBloom(IDirect3DDevice9* d, IDirect3DBaseTexture9* src)
+{
+    if (!src || src->GetType() != D3DRTYPE_TEXTURE || !ExtrasReady(d)) return nullptr;
+    if (!g_bloomTried) {
+        g_bloomTried = true;
+        g_psBloomDown = CompilePS(d, kBloomDownPS, "bloom downsample");
+        g_psBloomUp   = CompilePS(d, kBloomUpPS, "bloom upsample");
+    }
+    if (!g_psBloomDown || !g_psBloomUp) return nullptr;
+    D3DSURFACE_DESC sd;
+    if (FAILED(((IDirect3DTexture9*)src)->GetLevelDesc(0, &sd))) return nullptr;
+    const int N = 6;
+    UINT w[7], h[7];
+    w[0] = sd.Width; h[0] = sd.Height;
+    for (int i = 1; i <= N; i++) {
+        w[i] = std::max(1u, w[i - 1] / 2); h[i] = std::max(1u, h[i - 1] / 2);
+        if (!EnsureRT(d, &g_blD[i], w[i], h[i], D3DFMT_A16B16G16R16F)) return nullptr;
+        if (i < N && !EnsureRT(d, &g_blU[i], w[i], h[i], D3DFMT_A16B16G16R16F)) return nullptr;
+    }
+    const float thr = cfg.bloomModernThr / 100.0f;
+    IDirect3DBaseTexture9* prev = src;
+    for (int i = 1; i <= N; i++) {
+        IDirect3DSurface9* dst = nullptr; g_blD[i]->GetSurfaceLevel(0, &dst);
+        const float c1[4] = { 1.0f / w[i - 1], 1.0f / h[i - 1], i == 1 ? std::max(thr, 0.01f) : 0.0f, i == 1 ? std::max(thr, 0.01f) * 0.5f : 0.0f };
+        XPass(d, dst, w[i], h[i], prev, true, nullptr, false, g_psBloomDown, c1, nullptr, true);
+        dst->Release();
+        prev = g_blD[i];
+    }
+    IDirect3DTexture9* low = g_blD[N];
+    for (int i = N - 1; i >= 1; i--) {
+        IDirect3DSurface9* dst = nullptr; g_blU[i]->GetSurfaceLevel(0, &dst);
+        const float c1[4] = { 1.0f / w[i + 1], 1.0f / h[i + 1], 0, 0 };
+        XPass(d, dst, w[i], h[i], low, true, g_blD[i], true, g_psBloomUp, c1, nullptr, true);
+        dst->Release();
+        low = g_blU[i];
+    }
+    static bool logged = false;
+    if (!logged) { logged = true; Log("shaders: APRenewal bloom built (%ux%u .. %ux%u)", w[1], h[1], w[N], h[N]); }
+    return g_blU[1];
+}
+// Binds a per-scene mask (same size/format as RT0, cleared once per scene) as render target 1.
+static bool BindMaskRT(IDirect3DDevice9* d, IDirect3DTexture9** tex, IDirect3DSurface9** surf, unsigned* key, D3DCOLOR clear, const char* what)
+{
+    IDirect3DSurface9* rt = nullptr;
+    if (FAILED(d->GetRenderTarget(0, &rt)) || !rt) return false;
+    D3DSURFACE_DESC rd; rt->GetDesc(&rd); rt->Release();
+    if (g_ppW && (rd.Width != g_ppW || rd.Height != g_ppH)) return false;   // scene captures / reflections: not the AO's view
+    D3DSURFACE_DESC md = {};
+    if (*surf) (*surf)->GetDesc(&md);
+    if (!*tex || md.Width != rd.Width || md.Height != rd.Height || md.Format != rd.Format) {
+        if (*surf) { (*surf)->Release(); *surf = nullptr; }
+        if (*tex) { (*tex)->Release(); *tex = nullptr; }
+        if (FAILED(d->CreateTexture(rd.Width, rd.Height, 1, D3DUSAGE_RENDERTARGET, rd.Format, D3DPOOL_DEFAULT, tex, nullptr))) {
+            *tex = nullptr; Log("shaders: %s mask creation failed", what); return false;
+        }
+        (*tex)->GetSurfaceLevel(0, surf);
+        Log("shaders: %s mask %ux%u (fmt %d) for AO", what, rd.Width, rd.Height, rd.Format);
+    }
+    if (*key != GlassMaskKey()) { d->ColorFill(*surf, nullptr, clear); *key = GlassMaskKey(); }
+    o_SetRT(d, 1, *surf);
+    return true;
+}
 static void PreDraw(IDirect3DDevice9* d)
 {
+    if (g_inPostFX) return;                       // our own passes (they may run inside a game draw)
     g_preDrawLo = g_preDrawHi = -1;
+    if (g_curVSvp >= 0 && g_curRTIsHDR && g_curVSvp + 4 <= 256) {   // main-view view-projection (reflections)
+        memcpy(g_vp, g_vsc[g_curVSvp], sizeof g_vp);
+        g_vpKey = GlassMaskKey();
+    }
     if (g_censusOn && !g_inPostFX && g_curGamePS) g_census[g_curGamePS]++;
     GameShader* gs = g_curGS;
     if (!gs || g_inPostFX || !o_SetPSConstF) return;
@@ -3190,13 +3654,33 @@ static void PreDraw(IDirect3DDevice9* d)
     auto clamp01 = [](int v) { return std::min(std::max(v, 0), 100) / 100.0f; };
     switch (gs->kind) {
     case SK_BLEND_BLOOM: case SK_BLEND_DOF: {
-        if (!gs->repl || !BlendReplaced() || gs->paramReg < 0 || gs->paramReg > 253) return;
+        if (!gs->repl || !BlendReplaced() || gs->paramReg < 0 || gs->paramReg > 252) return;
+        if (cfg.bloomModern > 0 && gs->sceneTexReg >= 0) {
+            IDirect3DBaseTexture9* scene = nullptr;
+            if (SUCCEEDED(d->GetTexture(gs->sceneTexReg, &scene)) && scene) {
+                GameShader* keep = g_curGS;
+                IDirect3DTexture9* bl = BuildModernBloom(d, scene);
+                g_curGS = keep;
+                scene->Release();
+                if (bl) {
+                    d->SetTexture(10, bl);
+                    d->SetSamplerState(10, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+                    d->SetSamplerState(10, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                    d->SetSamplerState(10, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                    d->SetSamplerState(10, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+                    d->SetSamplerState(10, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+                    d->SetSamplerState(10, D3DSAMP_SRGBTEXTURE, FALSE);
+                    g_bloomBound = true;
+                }
+            }
+        }
         const float bw = g_ppW ? 1.0f / (g_ppW / 4 + 2) : 1.0f / 642, bh = g_ppH ? 1.0f / (g_ppH / 4 + 2) : 1.0f / 362;
-        const float p[3][4] = {
+        const float p[4][4] = {
             { cfg.tmEnable ? 1.0f : 0.0f, cfg.tmKnee / 100.0f, cfg.tmWhite / 100.0f, cfg.tmHue / 100.0f },
             { cfg.gammaMode == 1 ? 1.0f : 0.0f, cfg.gammaMode == 2 ? 1.0f : 0.0f, std::max(cfg.bloomIntensity, 0) / 100.0f, std::max(cfg.dofStrength, 0) / 100.0f },
-            { bw, bh, cfg.bloomSmooth ? 1.0f : 0.0f, cfg.dofSmooth ? 1.0f : 0.0f } };
-        o_SetPSConstF(d, gs->paramReg, &p[0][0], 3);   // our own registers - nothing of the game's to restore
+            { bw, bh, cfg.bloomSmooth ? 1.0f : 0.0f, cfg.dofSmooth ? 1.0f : 0.0f },
+            { g_bloomBound ? std::max(cfg.bloomModern, 0) / 100.0f * 0.3f : 0.0f, 0, 0, 0 } };
+        o_SetPSConstF(d, gs->paramReg, &p[0][0], 4);   // our own registers - nothing of the game's to restore
         return;
     }
     case SK_SHADOW: {
@@ -3239,6 +3723,16 @@ static void PreDraw(IDirect3DDevice9* d)
         return;
     }
     case SK_FOG: {
+        if (ReplActive(gs) && gs->paramReg >= 0 && gs->paramReg < 254) {
+            // fog transmittance for the AO: how the mask must be written depends on the fog pass's blending
+            DWORD dst = 0; d->GetRenderState(D3DRS_DESTBLEND, &dst);
+            static bool logged = false;
+            if (!logged) { logged = true; DWORD src = 0, en = 0; d->GetRenderState(D3DRS_SRCBLEND, &src); d->GetRenderState(D3DRS_ALPHABLENDENABLE, &en);
+                           Log("shaders: fog pass blend %s src %lu dst %lu", en ? "on" : "off", src, dst); }
+            const float fp[4] = { dst == D3DBLEND_SRCALPHA ? 0.0f : 1.0f, 0, 0, 0 };
+            o_SetPSConstF(d, gs->paramReg, fp, 1);
+            g_fogMaskBound = BindMaskRT(d, &g_fogMask, &g_fogMaskSurf, &g_fogMaskFrame, 0xFFFFFFFF, "fog");
+        }
         if (cfg.fogDensity == 100 || gs->fogScaleReg < 0) return;
         const float m = std::max(cfg.fogDensity, 0) / 100.0f;   // exp2(scale * distance): scale 0 = no fog
         const float* o = g_psc[gs->fogScaleReg];
@@ -3297,27 +3791,8 @@ static void PreDraw(IDirect3DDevice9* d)
             { std::max(cfg.glassClarity, 0) / 100.0f, std::max(cfg.glassRefl, 0) / 100.0f, clamp01(cfg.glassFresnel), clamp01(cfg.glassReflContrast) },
             { std::max(cfg.glassBump, 0) / 100.0f, 0, 0, 0 } };
         o_SetPSConstF(d, gs->paramReg, &p[0][0], 2);
-        if (cfg.aoGlass > 0 && cfg.aoEnable) {
-            IDirect3DSurface9* rt = nullptr;
-            if (SUCCEEDED(d->GetRenderTarget(0, &rt)) && rt) {
-                D3DSURFACE_DESC rd; rt->GetDesc(&rd); rt->Release();
-                if (g_ppW && (rd.Width != g_ppW || rd.Height != g_ppH)) return;   // scene captures / reflections: not the view the AO sees
-                D3DSURFACE_DESC md = {};
-                if (g_glassMaskSurf) g_glassMaskSurf->GetDesc(&md);
-                if (!g_glassMask || md.Width != rd.Width || md.Height != rd.Height || md.Format != rd.Format) {
-                    GlassMaskRelease();
-                    if (SUCCEEDED(d->CreateTexture(rd.Width, rd.Height, 1, D3DUSAGE_RENDERTARGET, rd.Format, D3DPOOL_DEFAULT, &g_glassMask, nullptr))) {
-                        g_glassMask->GetSurfaceLevel(0, &g_glassMaskSurf);
-                        Log("shaders: glass mask %ux%u (fmt %d) for AO", rd.Width, rd.Height, rd.Format);
-                    } else { g_glassMask = nullptr; Log("shaders: glass mask creation failed - AO stays behind glass"); cfg.aoGlass = 0; }
-                }
-                if (g_glassMaskSurf) {
-                    if (g_glassMaskFrame != GlassMaskKey()) { d->ColorFill(g_glassMaskSurf, nullptr, 0); g_glassMaskFrame = GlassMaskKey(); }
-                    o_SetRT(d, 1, g_glassMaskSurf);
-                    g_glassMaskBound = true;
-                }
-            }
-        }
+        if (cfg.aoGlass > 0 && cfg.aoEnable)
+            g_glassMaskBound = BindMaskRT(d, &g_glassMask, &g_glassMaskSurf, &g_glassMaskFrame, 0, "glass");
         return;
     }
     case SK_GLASSDIST: {
@@ -3339,7 +3814,10 @@ static void PreDraw(IDirect3DDevice9* d)
 }
 static void PostDrawRestore(IDirect3DDevice9* d)
 {
+    if (g_inPostFX) return;
     if (g_glassMaskBound) { o_SetRT(d, 1, nullptr); g_glassMaskBound = false; }
+    if (g_fogMaskBound) { o_SetRT(d, 1, nullptr); g_fogMaskBound = false; }
+    if (g_bloomBound) { d->SetTexture(10, nullptr); g_bloomBound = false; }
     if (g_preDrawLo < 0) return;
     o_SetPSConstF(d, g_preDrawLo, g_psc[g_preDrawLo], g_preDrawHi - g_preDrawLo + 1);
     g_preDrawLo = g_preDrawHi = -1;
@@ -3360,7 +3838,8 @@ static HRESULT STDMETHODCALLTYPE hk_DIPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE 
 { TraceDraw(true); PreDraw(d); HRESULT hr = o_DIPUP(d, t, a, b, c, i, fm, v, s); AfterDraw(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hk_SetPS(IDirect3DDevice9* d, IDirect3DPixelShader9* ps)
 {
-    if (g_tracing && !g_inPostFX) g_segPS++;
+    if (g_inPostFX) return o_SetPS(d, ps);       // our own passes: leave the game's bookkeeping alone
+    if (g_tracing) g_segPS++;
     g_curGS = nullptr;
     if (!g_inPostFX) g_curGamePS = ps;
     if (ps && !g_inPostFX && !g_gameShaders.empty()) {
@@ -3395,6 +3874,10 @@ static void HookTraceVtbl(IDirect3DDevice9* dev)
     if ((p = PatchVtbl(dev, 107, (void*)hk_SetPS)))      o_SetPS = (PFN_SetPS)p;
     if ((p = PatchVtbl(dev, 106, (void*)hk_CreatePS)))   o_CreatePS = (PFN_CreatePS)p;
     if ((p = PatchVtbl(dev, 109, (void*)hk_SetPSConstF))) o_SetPSConstF = (PFN_SetPSConstF)p;
+    if ((p = PatchVtbl(dev, 91, (void*)hk_CreateVS)))     o_CreateVS = (PFN_CreateVS)p;
+    if ((p = PatchVtbl(dev, 92, (void*)hk_SetVS)))        o_SetVS = (PFN_SetVS)p;
+    if ((p = PatchVtbl(dev, 94, (void*)hk_SetVSConstF)))  o_SetVSConstF = (PFN_SetVSConstF)p;
+    if ((p = PatchVtbl(dev, 118, (void*)hk_CreateQuery))) o_CreateQuery = (PFN_CreateQuery)p;
 }
 
 // Called at every Present (before PostFX). Ends a running trace, starts an armed one.
@@ -3940,6 +4423,7 @@ static bool SaveConfig()
     cfg.aoMode = g_fx.aoMode;
     WriteIniInt("Display", "Borderless", cfg.borderless);
     WriteIniInt("Game", "SkipIntros", cfg.skipIntros);
+    WriteIniInt("Game", "NoOcclusionCulling", cfg.noOcclusion);
     WriteIniInt("Shadows", "Scale", cfg.shadowScale);
     WriteIniInt("Shadows", "Softness", cfg.shadowSoft);
     WriteIniInt("Tonemap", "Enable", cfg.tmEnable);
@@ -3985,6 +4469,14 @@ static bool SaveConfig()
     WriteIniInt("AO", "NearFade", cfg.aoNear);
     WriteIniInt("AO", "ProtectHighlights", cfg.aoProtect);
     WriteIniInt("AO", "BehindGlass", cfg.aoGlass);
+    WriteIniInt("AO", "FadeWithFog", cfg.aoFog);
+    WriteIniInt("PostFX", "FXAAQuality", cfg.fxaaQuality);
+    WriteIniInt("Reflections", "Enable", cfg.ssr);
+    WriteIniInt("Reflections", "Strength", cfg.ssrStrength);
+    WriteIniInt("Reflections", "Length", cfg.ssrLength);
+    WriteIniInt("Reflections", "FloorsOnly", cfg.ssrFloor);
+    WriteIniInt("Effects", "ModernBloom", cfg.bloomModern);
+    WriteIniInt("Effects", "ModernBloomThreshold", cfg.bloomModernThr);
     WriteIniInt("AO", "PreciseDepth", cfg.aoPrecise);
     WriteIniInt("Menu", "MouseSpeed", cfg.menuMouse);
     WriteIniInt("Grade", "Enable", cfg.gradeEnable);
@@ -4087,7 +4579,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.14.2", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.15.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -4097,6 +4589,10 @@ static void DrawMenu()
                 if (ImGui::Checkbox("Post-processing (F11)", &en)) g_fx.enabled = en;
                 CheckboxInt("Apply before the UI (keeps HUD and menus sharp)", &cfg.beforeHud);
                 CheckboxInt("FXAA anti-aliasing", &cfg.fxaa);
+                if (cfg.fxaa) {
+                    static const char* fq[] = { "Fast (console style)", "Quality (FXAA 3.11, edge search)" };
+                    ImGui::Combo("FXAA type", &cfg.fxaaQuality, fq, 2);
+                }
                 ImGui::SliderInt("Sharpening", &cfg.sharpen, 0, 100, cfg.sharpen ? "%d %%" : "off");
                 ImGui::SeparatorText("Display");
                 ImGui::SliderInt("Frame cap", &cfg.fpsLimit, 0, 240, cfg.fpsLimit ? "%d fps" : "off");
@@ -4151,6 +4647,9 @@ static void DrawMenu()
                 ImGui::SliderInt("Bloom intensity", &cfg.bloomIntensity, 0, 300, cfg.bloomIntensity ? "%d %%" : "off");
                 ImGui::SliderInt("Bloom threshold", &cfg.bloomThreshold, -50, 150, cfg.bloomThreshold ? "%+d" : "game's");
                 CheckboxInt("Smooth bloom (no blocky, shimmering glow)", &cfg.bloomSmooth);
+                ImGui::SliderInt("Wide HDR bloom", &cfg.bloomModern, 0, 200, cfg.bloomModern ? "%d %%" : "off");
+                ImGui::SliderInt("Wide bloom threshold", &cfg.bloomModernThr, 0, 400, "%d %%");
+                ImGui::TextDisabled("APRenewal's own bloom: a soft, wide glow from the HDR scene, added to the game's.");
                 ImGui::SeparatorText("Depth of field");
                 ImGui::SliderInt("Depth of field strength", &cfg.dofStrength, 0, 150, cfg.dofStrength ? "%d %%" : "off");
                 CheckboxInt("Smooth depth of field blur", &cfg.dofSmooth);
@@ -4193,6 +4692,13 @@ static void DrawMenu()
                 }
                 if (g_shadowBig) ImGui::TextDisabled("Now: shadow map %ux%u (game asked for %ux%u). Applies at next launch.", g_shadowBig, g_shadowBig, g_shadowSize, g_shadowSize);
                 else ImGui::TextDisabled("Applies at next launch.");
+                ImGui::SeparatorText("Reflections");
+                CheckboxInt("Screen-space reflections on floors", &cfg.ssr);
+                ImGui::SliderInt("Reflection strength", &cfg.ssrStrength, 0, 100, "%d %%");
+                ImGui::SliderInt("Reflection distance", &cfg.ssrLength, 300, 5000, "%d units");
+                ImGui::SliderInt("Only surfaces this flat", &cfg.ssrFloor, 30, 98, "%d %%");
+                ImGui::TextDisabled("Reflects what's on screen in floors and other upward-facing surfaces. Needs the view");
+                ImGui::TextDisabled("matrix from the game (%s).", g_vpKey / 64u == g_frameNo ? "found" : "not seen this frame");
                 ImGui::SeparatorText("Character lighting");
                 ImGui::SliderInt("Even out lighting", &cfg.charEven, 0, 100, cfg.charEven ? "%d %%" : "game's");
                 ImGui::SliderInt("Fill light", &cfg.charFill, 0, 150, cfg.charFill ? "+%d %%" : "game's");
@@ -4211,6 +4717,7 @@ static void DrawMenu()
                 ImGui::SliderInt("Near fade", &cfg.aoNear, 0, 200, "%d units");
                 ImGui::SliderInt("Protect highlights", &cfg.aoProtect, 0, 100, "%d %%");
                 ImGui::SliderInt("Hide AO behind glass", &cfg.aoGlass, 0, 100, cfg.aoGlass ? "%d %%" : "off");
+                ImGui::SliderInt("Fade AO with fog", &cfg.aoFog, 0, 100, cfg.aoFog ? "%d %%" : "off");
                 CheckboxInt("Precise depth (24-bit INTZ, applies at next launch)", &cfg.aoPrecise);
                 ImGui::TextDisabled("Method: %s", g_fx.aoIsGtao ? "GTAO" : "fallback (GTAO shader failed - see log)");
                 ImGui::TextDisabled("Depth source: %s", (g_fx.aoIsGtao && cfg.aoPrecise && g_fx.zcopy && g_fx.fitValid) ? "24-bit depth buffer (calibrated)"
@@ -4289,6 +4796,8 @@ static void DrawMenu()
         if (ImGui::BeginTabItem("Game")) {
             CheckboxInt("Skip the intro logo movies", &cfg.skipIntros);
             ImGui::TextDisabled("Only movies before the first 3D scene; story movies still play.");
+            CheckboxInt("No occlusion culling (fixes distant objects popping in late)", &cfg.noOcclusion);
+            ImGui::TextDisabled("Every object the game would hide behind walls is drawn. %ld hidden draws rescued so far.", g_occForced);
             ImGui::SeparatorText("Developer console");
             if (!g_conOk) ImGui::TextDisabled("Unavailable (see the log: console:).");
             else {
@@ -4305,15 +4814,44 @@ static void DrawMenu()
                 static char buf[256] = "";
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::InputText("##con", buf, sizeof buf, ImGuiInputTextFlags_EnterReturnsTrue) && buf[0]) {
-                    ConAddLine(std::string("> ") + buf);
-                    EnterCriticalSection(&g_conCs);
-                    snprintf(g_conPending, sizeof g_conPending, "%s", buf);
-                    g_conQueued = true;
-                    LeaveCriticalSection(&g_conCs);
+                    ConQueue(buf);
                     buf[0] = 0;
                     ImGui::SetKeyboardFocusHere(-1);
                 }
                 ImGui::TextDisabled("Commands run when the game next pumps messages (close the menu if one seems stuck).");
+                // Shortcuts: commands found in the game's own exec handler (APGame.exe), plus UE3 cheats
+                struct Sc { const char* label; const char* cmd; const char* tip; };
+                static const Sc sc[] = {
+                    { "Hide / show HUD", "TOGGLEUI", "Toggles the whole game UI (screenshots)." },
+                    { "Screenshot", "SHOT", "Saved by the game to APGame\\ScreenShots." },
+                    { "Hi-res screenshot (2x)", "TILEDSHOT 2", "Renders the frame in tiles at twice the resolution." },
+                    { "FPS counter", "STAT FPS", "Toggles the engine's FPS display." },
+                    { "Frame timing", "STAT UNIT", "Game / draw / GPU times." },
+                    { "Slow motion", "slomo 0.3", "UE3 cheat; may need the cheat manager." },
+                    { "Normal speed", "slomo 1", "" },
+                    { "Occlusion culling on/off", "TOGGLEOCCLUSION", "The game's own switch (APRenewal also has 'No occlusion culling' above)." },
+                    { "High-quality character light on/off", "HQDLE", "Obsidian's high-quality dynamic light environments (on by default)." },
+                    { "Character rim light on/off", "USEMAGICRIM", "Obsidian's 'magic rim' light on characters (on by default)." },
+                    { "Door lighting fix on/off", "DOORLIGHTINGFIX", "Obsidian's fix for lighting on doors." },
+                    { "DOF bleeding fix on/off", "TOGGLEDOFFIX", "" },
+                    { "Lit view", "VIEWMODE LIT", "" },
+                    { "Lighting only", "VIEWMODE LIGHTINGONLY", "Shows only lighting - nice for checking lights." },
+                    { "Unlit", "VIEWMODE UNLIT", "" },
+                    { "Wireframe", "VIEWMODE WIREFRAME", "" },
+                    { "Fog on/off", "SHOW FOG", "" },
+                    { "Particles on/off", "SHOW PARTICLES", "" },
+                    { "Decals on/off", "SHOW DECALS", "" },
+                    { "Post-processing on/off", "SHOW POSTPROCESS", "The game's own post-processing." },
+                };
+                ImGui::SeparatorText("Shortcuts");
+                for (int i = 0; i < (int)(sizeof sc / sizeof sc[0]); i++) {
+                    if (i % 3) ImGui::SameLine();
+                    if (ImGui::Button(sc[i].label, ImVec2(ImGui::GetFontSize() * 11.0f, 0))) ConQueue(sc[i].cmd);
+                    if (sc[i].tip[0] && ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", sc[i].cmd, sc[i].tip);
+                    else if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", sc[i].cmd);
+                }
+                ImGui::TextDisabled("Value commands (type them): MINAMBIENT x, IRRADIANCESCALE x, IRRADIANCECONTRAST x,");
+                ImGui::TextDisabled("LIGHTSCALE x, SHADOWINTENSITY x, SHARPNESS x, DESATURATE x, MOTIONBLURAMOUNT x, MAGICRIMSCALE x.");
             }
             ImGui::EndTabItem();
         }
@@ -4580,6 +5118,7 @@ static HRESULT STDMETHODCALLTYPE hk_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARA
     IntzForget(); g_fx.intz = nullptr;
     g_rt0Scale = 1;
     GlassMaskRelease();
+    BloomRelease();
     g_bbPtr = nullptr; g_curRT = nullptr; g_worldRT = nullptr; g_bbW = g_bbH = 0;
     DumpPP("Reset (game)", pp);
     ApplyPresentParams(pp, nullptr);
@@ -4741,7 +5280,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.14.2 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.15.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

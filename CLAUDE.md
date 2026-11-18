@@ -188,6 +188,28 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   with o_SetRT, PostDrawRestore unbinds it. AO composite samples it at s2: ao = lerp(ao, 1, mask·c4.z).
   0.14.2: mask keyed by frame×64 + g_scenesThisFrame (scene-capture glass leaked into the main view as
   a light trapezoid without AO), only bound when RT0 = g_ppW×g_ppH, mask alpha = saturate(alpha·4).
+- 0.15.0:
+  - Fog: one-layer height fog (HeightFogPixelShader OneLayerMain) rebuilt (kFogBodyHLSL) to write its
+    transmittance to RT1 (g_fogMask, cleared to 1 per scene; blend ONE/SRCALPHA → mask written as
+    (0,0,0,sc), otherwise (sc,sc,sc,1)). AO composite s3: ao = lerp(1, ao, lerp(1, fogT, c4.w)).
+  - Door glass cc79d4cd: two normal maps (Texture2D_0 × US1 + Texture2D_1 × US3, z summed), mask
+    Texture2D_2, diffuse Texture2D_3, cube s4 (DUALNORMAL in kGlassBodyHLSL); refraction 855d48c7 →
+    UniformScalar_5 is its overall scale.
+  - Pop-in: occlusion queries' GetData (IDirect3DQuery9 vtable 7, patched on the first occlusion query
+    from CreateQuery 118) reports ≥64 pixels. The game's own TOGGLEOCCLUSION flips 0x16F95C4.
+  - Vertex shaders: CreateVertexShader 91 (CTAB ViewProjectionMatrix reg), SetVertexShader 92,
+    SetVertexShaderConstantF 94 mirrored (g_vsc). PreDraw copies the VP (row-major, world→clip) while
+    the RT is the HDR scene → g_vp/g_vpKey. SSR (kSSRPS): wp = ((sx·w, sy·w, w) − t)·inv(M3) with M3
+    rows (r_i.x, r_i.y, r_i.w), t = (r3.x, r3.y, r3.w); normals from depth, world Z up.
+  - Wide bloom: BuildModernBloom in the final blend's PreDraw (XPass chain, 6 levels, fp16), bound at
+    s10 (apBloomTex), apTM4.x intensity. Our "ap*" constants/samplers may sit above the game's (c ≥
+    paramReg, s ≥ 8). hk_SetPS / PreDraw / PostDrawRestore / constant mirrors ignore g_inPostFX work.
+  - FXAA 3.11 quality (kFxaaQPS, [PostFX] FXAAQuality).
+  - Console: commands queue (g_conQueue). The game's viewport Exec (0x50E000–0x513800) has AP
+    commands: HQDLE (0x137A6BC, default 1), USEMAGICRIM (0x137A6A8, 1), TOGGLEUI (0x137ABD8),
+    TOGGLEOCCLUSION, DOORLIGHTINGFIX, TOGGLEDOFFIX, EDAA/DEDAA/EDAAOFF, value commands MINAMBIENT,
+    IRRADIANCESCALE/CONTRAST, LIGHTSCALE, STATICLIGHTSCALE, SHADOWINTENSITY(MIN), SHARPNESS,
+    DESATURATE, VIGNETTEFADE*, MOTIONBLURAMOUNT/STRETCH, MAGICRIMSCALE/Z/ROTATION, SHADOWFALLOFFRANGE.
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 
