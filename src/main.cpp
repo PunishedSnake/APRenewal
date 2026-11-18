@@ -32,6 +32,7 @@
 #include "matclass.h"
 #include "smaa.h"
 #include "specregs.h"
+#include <cctype>
 #include "imgui/imgui_impl_dx9.h"
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
@@ -174,7 +175,7 @@ struct Config {
     int  gradeContrast = 106;   // percent, S-curve pivoting on mid grey
     int  gradeVibrance = 45;    // percent extra saturation for muted colours
     int  gradeSaturation = 100; // percent, all colours
-    int  gradeBlack    = 1;     // black level offset, 1/1000 of linear white
+    int  gradeBlack    = 0;     // black level, 1/10000 of linear white: > 0 soft toe (deeper blacks, no clip), < 0 lift
     int  gradeTemp     = 0;     // -100 cool .. +100 warm
     // supersampling: the game renders RenderScale% of the desktop, shown downscaled
     int  renderScale   = 100;
@@ -324,7 +325,7 @@ static void LoadConfig()
     cfg.gradeContrast = GetPrivateProfileIntA("Grade", "Contrast", 106, g_ini);
     cfg.gradeVibrance = (int)GetPrivateProfileIntA("Grade", "Vibrance", 45, g_ini);
     cfg.gradeSaturation = GetPrivateProfileIntA("Grade", "Saturation", 100, g_ini);
-    cfg.gradeBlack    = (int)GetPrivateProfileIntA("Grade", "BlackLevel", 1, g_ini);
+    cfg.gradeBlack    = (int)GetPrivateProfileIntA("Grade", "BlackLevel2", 0, g_ini);   // new scale in 0.20.0
     cfg.gradeTemp     = (int)GetPrivateProfileIntA("Grade", "Temperature", 0, g_ini);
     cfg.renderScale   = GetPrivateProfileIntA("Display", "RenderScale", 100, g_ini);
     if (cfg.renderScale < 100) cfg.renderScale = 100;
@@ -1134,7 +1135,7 @@ VOut main(float4 pos : POSITION, float2 uv : TEXCOORD0)
 static const char* kGradePS = R"HLSL(
 sampler2D sColor : register(s0);
 float4 g0 : register(c2);   // x exposure multiplier, y contrast, z vibrance, w saturation
-float4 g1 : register(c3);   // x black offset (linear), y warmth -1..1
+float4 g1 : register(c3);   // x black level (linear; > 0 soft toe, < 0 lift), y warmth -1..1
 float Curve(float x, float k)
 {
     const float p = 0.4588;                      // 0.18 in gamma 2.2
@@ -1155,7 +1156,11 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
     float mx = max(c.r, max(c.g, c.b)), mn = min(c.r, min(c.g, c.b));
     float sat = (mx - mn) / max(mx, 1e-5);
     c = Yc + (c - Yc) * (g0.w * (1 + g0.z * (1 - sat)));
-    c = max(c - g1.x, 0) / (1 - g1.x);
+    // black level as a soft toe: ~c - b well above b, c^2 / b near zero - shadows get deeper but keep
+    // their gradation instead of everything under b clipping to pitch black; white stays at 1
+    float bp = max(g1.x, 0), bl = max(-g1.x, 0);
+    c = c * c / (c + bp + 1e-8) * (1 + bp);
+    c += bl * saturate(1 - c);
     return float4(pow(c, 1 / 2.2), s.a);
 }
 )HLSL";
@@ -1657,11 +1662,15 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 )HLSL";
 
 // Light shafts (screen-space, GPU Gems 3 style): bright HDR areas are blurred radially toward up to
-// four light positions found on screen (brightest spots of a tiny max-map, read back a frame late).
+// four light positions. Peaks of a tiny max-map (read back a frame late, with their depth) are turned
+// into world-space points and tracked there, then re-projected every frame - so a shaft stays anchored
+// to its lamp / window as the camera moves instead of hopping to whatever is brightest on screen.
 static const char* kShaftBrightPS = R"HLSL(
 sampler2D sHdr : register(s0);
 sampler2D sMat : register(s1);   // brightly lit faces are not light sources
+sampler2D sDepth : register(s2);
 float4 sp : register(c1);   // x threshold, yz source texel, w material mask valid
+float4 dP : register(c2);   // x precise z (1/(y + z*r)), w depth texture valid (else scene alpha)
 float4 main(float2 uv : TEXCOORD0) : COLOR0
 {
     float3 c = 0;
@@ -1672,7 +1681,10 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
     c *= 0.25;
     float l = dot(c, float3(0.2126, 0.7152, 0.0722));
     float skin = sp.w > 0.5 ? tex2Dlod(sMat, float4(uv, 0, 0)).r : 0;
-    return float4(c * saturate((l - sp.x) / max(sp.x, 0.01)) * (1 - skin), 1);
+    float4 t = tex2Dlod(sDepth, float4(uv, 0, 0));          // linear view depth, as in the AO
+    float d = dP.x > 0.5 ? 1.0 / max(dP.y + dP.z * t.r, 1e-6) : t.a;
+    d = dP.w > 0.5 ? d : tex2Dlod(sHdr, float4(uv, 0, 0)).a;
+    return float4(c * saturate((l - sp.x) / max(sp.x, 0.01)) * (1 - skin), d);
 }
 )HLSL";
 static const char* kShaftMaxPS = R"HLSL(
@@ -1681,13 +1693,17 @@ float4 sp : register(c1);   // xy source texel, zw cell size in uv
 float4 main(float2 uv : TEXCOORD0) : COLOR0
 {
     float2 o0 = uv - sp.zw * 0.5;
-    float best = 0;
+    float best = 0, bdep = 0;
+    float2 buv = uv;
     [loop] for (int y = 0; y < 12; y++)
     [loop] for (int x = 0; x < 12; x++) {
-        float3 c = tex2Dlod(sSrc, float4(o0 + (float2(x, y) + 0.5) / 12.0 * sp.zw, 0, 0)).rgb;
-        best = max(best, dot(c, float3(0.2126, 0.7152, 0.0722)));
+        float2 p = o0 + (float2(x, y) + 0.5) / 12.0 * sp.zw;
+        float4 c = tex2Dlod(sSrc, float4(p, 0, 0));
+        float l = dot(c.rgb, float3(0.2126, 0.7152, 0.0722));
+        float t = step(best + 1e-6, l);                      // branch-free argmax: where, and how deep
+        best = max(best, l); buv = lerp(buv, p, t); bdep = lerp(bdep, c.a, t);
     }
-    return float4(best, best, best, 1);
+    return float4(best, buv, bdep);   // read back: peak brightness, its uv and its view depth
 }
 )HLSL";
 static const char* kShaftRadialPS = R"HLSL(
@@ -2324,49 +2340,93 @@ static float HalfToFloat(WORD h)
     else f = sgn | ((ex + 112) << 23) | (mant << 13);
     float r; memcpy(&r, &f, 4); return r;
 }
-// light shaft sources: up to four, tracked across frames so they fade in/out instead of popping
-struct ShaftLight { float x, y, s; };
+// light shaft sources: up to four, tracked in world space across frames so they fade in/out and stay put
+struct ShaftLight { float p[3]; float s, target; int miss; };
 static ShaftLight g_shaft[4] = {};
 static int g_shaftTiny = 0;
+static float g_shaftVp[2][4][4];        // view-projection of the frame each tiny map was drawn in
+static bool g_shaftVpOk[2] = {};
 static unsigned g_taaFrame = ~0u;
 static float g_taaVp[4][4];
+// screen uv + linear view depth -> world, for a row-major world->clip matrix (clip = (p,1)·M, w = view depth)
+static bool ShaftUnproject(const float M[4][4], float u, float v, float d, float out[3])
+{
+    const float sx = u * 2 - 1, sy = 1 - v * 2;
+    const int col[3] = { 0, 1, 3 };
+    const float rhs[3] = { sx * d - M[3][0], sy * d - M[3][1], d - M[3][3] };
+    float A[3][3];                                   // A[k][i] = M[i][col k]:  A p = rhs
+    for (int k = 0; k < 3; k++) for (int i = 0; i < 3; i++) A[k][i] = M[i][col[k]];
+    auto det3 = [](const float m[3][3]) {
+        return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+               m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]); };
+    const float D = det3(A);
+    if (!(fabsf(D) > 1e-12f)) return false;
+    for (int c = 0; c < 3; c++) {
+        float B[3][3]; memcpy(B, A, sizeof B);
+        for (int k = 0; k < 3; k++) B[k][c] = rhs[k];
+        out[c] = det3(B) / D;
+    }
+    return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+}
+static bool ShaftProject(const float M[4][4], const float p[3], float& u, float& v, float& w)
+{
+    float c[4];
+    for (int j = 0; j < 4; j++) c[j] = p[0] * M[0][j] + p[1] * M[1][j] + p[2] * M[2][j] + M[3][j];
+    w = c[3];
+    if (w <= 1.0f) return false;                     // behind or at the camera
+    u = (c[0] / w) * 0.5f + 0.5f; v = 0.5f - (c[1] / w) * 0.5f;
+    return true;
+}
 static void ShaftFindLights(IDirect3DDevice9* dev)
 {
-    const int W = 32, H = 18;
-    ShaftLight found[4] = {}; int nf = 0;
+    const int W = 32, H = 18, NF = 6;
+    struct Found { float p[3]; float s, d; } found[NF] = {}; int nf = 0;
+    const int rd = g_shaftTiny ^ 1;
     IDirect3DSurface9* src = nullptr;
-    if (g_fx.shSys && g_fx.shTiny[g_shaftTiny ^ 1] && SUCCEEDED(g_fx.shTiny[g_shaftTiny ^ 1]->GetSurfaceLevel(0, &src))) {
+    if (g_shaftVpOk[rd] && g_fx.shSys && g_fx.shTiny[rd] && SUCCEEDED(g_fx.shTiny[rd]->GetSurfaceLevel(0, &src))) {
         if (SUCCEEDED(dev->GetRenderTargetData(src, g_fx.shSys))) {
             D3DLOCKED_RECT lr;
             if (SUCCEEDED(g_fx.shSys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
-                float v[18][32];
-                for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) v[y][x] = HalfToFloat(((const WORD*)((const BYTE*)lr.pBits + y * lr.Pitch))[x * 4]);
+                static float v[18][32][4];
+                for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) for (int c = 0; c < 4; c++)
+                    v[y][x][c] = HalfToFloat(((const WORD*)((const BYTE*)lr.pBits + y * lr.Pitch))[x * 4 + c]);
                 g_fx.shSys->UnlockRect();
-                for (nf = 0; nf < 4; nf++) {
+                while (nf < NF) {
                     int bx = -1, by = -1; float bv = 0.02f;
-                    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) if (v[y][x] > bv) { bv = v[y][x]; bx = x; by = y; }
+                    for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) if (v[y][x][0] > bv) { bv = v[y][x][0]; bx = x; by = y; }
                     if (bx < 0) break;
-                    found[nf] = { (bx + 0.5f) / W, (by + 0.5f) / H, std::min(bv * 2.0f, 1.0f) };
+                    const float d = std::min(std::max(v[by][bx][3], 1.0f), 60000.0f);
+                    Found f = {}; f.s = std::min(bv * 2.0f, 1.0f); f.d = d;
+                    if (ShaftUnproject(g_shaftVp[rd], v[by][bx][1], v[by][bx][2], d, f.p)) found[nf++] = f;
                     for (int y = std::max(by - 3, 0); y <= std::min(by + 3, H - 1); y++)
-                        for (int x = std::max(bx - 4, 0); x <= std::min(bx + 4, W - 1); x++) v[y][x] = 0;
+                        for (int x = std::max(bx - 4, 0); x <= std::min(bx + 4, W - 1); x++) v[y][x][0] = 0;
                 }
             }
         }
         src->Release();
     }
-    // match to the tracked lights: move toward the nearest new one, fade the rest out
-    bool used[4] = {};
+    // match in world space (tolerance grows with distance); a light survives a few missed frames
+    bool used[NF] = {};
     for (auto& L : g_shaft) {
-        int best = -1; float bd = 0.12f;
+        if (L.s <= 0 && L.target <= 0) continue;
+        int best = -1; float bd = 1e30f;
         for (int i = 0; i < nf; i++) if (!used[i]) {
-            const float d = hypotf(found[i].x - L.x, found[i].y - L.y);
-            if (d < bd) { bd = d; best = i; }
+            const float dx = found[i].p[0] - L.p[0], dy = found[i].p[1] - L.p[1], dz = found[i].p[2] - L.p[2];
+            const float dist = sqrtf(dx * dx + dy * dy + dz * dz), tol = 40.0f + 0.12f * found[i].d;
+            if (dist < tol && dist < bd) { bd = dist; best = i; }
         }
-        if (best >= 0 && L.s > 0) { used[best] = true; L.x += (found[best].x - L.x) * 0.5f; L.y += (found[best].y - L.y) * 0.5f; L.s += (found[best].s - L.s) * 0.25f; }
-        else L.s *= 0.8f;
+        if (best >= 0) {
+            used[best] = true; L.miss = 0;
+            for (int c = 0; c < 3; c++) L.p[c] += (found[best].p[c] - L.p[c]) * 0.15f;   // lamps don't move: settle slowly
+            L.target = found[best].s;
+        } else if (++L.miss > 8) L.target = 0;
     }
     for (int i = 0; i < nf; i++) if (!used[i])
-        for (auto& L : g_shaft) if (L.s < 0.02f) { L = { found[i].x, found[i].y, found[i].s * 0.25f }; break; }
+        for (auto& L : g_shaft) if (L.s < 0.01f && L.target <= 0) { memcpy(L.p, found[i].p, sizeof L.p); L.s = 0; L.target = found[i].s; L.miss = 0; break; }
+    for (auto& L : g_shaft) {
+        L.s += (L.target - L.s) * (L.target > L.s ? 0.08f : 0.12f);   // fade in over ~0.5 s, out a bit faster
+        if (L.target <= 0 && L.s < 0.01f) L.s = 0;
+    }
 }
 
 // Run SSAO / FXAA / sharpen on `target` in place. `inScene`: called between
@@ -2578,18 +2638,34 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
                 const float b1[4] = { cfg.shaftThr / 100.0f, 1.0f / hd.Width, 1.0f / hd.Height, matOk ? 1.0f : 0.0f };
                 dev->SetPixelShaderConstantF(1, b1, 1);
                 dev->SetTexture(1, matOk ? (IDirect3DBaseTexture9*)g_matMask : nullptr);
-                DrawFullscreen(dev, g_prevHdr, sA, g_fx.psShB);                       // bright areas, quarter res
-                dev->SetTexture(1, nullptr);
+                const bool shPrecise = g_fx.aoIsGtao && cfg.aoPrecise && g_fx.zcopy && g_fx.zValid && g_fx.fitValid;
+                const bool shDepth = g_fx.depthValid && (shPrecise || g_fx.depth);
+                const float b2[4] = { shPrecise ? 1.0f : 0.0f, g_fx.fitA, g_fx.fitB, shDepth ? 1.0f : 0.0f };
+                dev->SetPixelShaderConstantF(2, b2, 1);
+                dev->SetTexture(2, shDepth ? (shPrecise ? (IDirect3DBaseTexture9*)g_fx.zcopy : g_fx.depth) : nullptr);
+                SamplerSet(dev, 2, D3DTEXF_POINT);
+                DrawFullscreen(dev, g_prevHdr, sA, g_fx.psShB);                       // bright areas (+ depth), quarter res
+                dev->SetTexture(1, nullptr); dev->SetTexture(2, nullptr);
                 const float hpt[4] = { -1.0f / 32, 1.0f / 18, 0, 0 };
                 dev->SetVertexShaderConstantF(0, hpt, 1);
                 const float m1[4] = { 1.0f / qw, 1.0f / qh, 1.0f / 32, 1.0f / 18 };
                 dev->SetPixelShaderConstantF(1, m1, 1);
                 SamplerSet(dev, 0, D3DTEXF_POINT);
-                DrawFullscreen(dev, g_fx.shA, sT, g_fx.psShM);                        // brightest value per cell
+                DrawFullscreen(dev, g_fx.shA, sT, g_fx.psShM);                        // brightest value + where, per cell
+                memcpy(g_shaftVp[g_shaftTiny], g_vpPrev, sizeof g_vpPrev);           // the VP g_prevHdr was rendered with
+                g_shaftVpOk[g_shaftTiny] = true;
                 ShaftFindLights(dev);                                                 // reads last frame's cells
                 g_shaftTiny ^= 1;
                 float L[4][4] = {};
-                for (int i = 0; i < 4; i++) { L[i][0] = g_shaft[i].x; L[i][1] = g_shaft[i].y; L[i][2] = g_shaft[i].s > 0.02f ? g_shaft[i].s : 0.0f; L[i][3] = (float)bd.Width / bd.Height; }
+                for (int i = 0; i < 4; i++) {
+                    float u, v, w;
+                    L[i][3] = (float)bd.Width / bd.Height;
+                    if (g_shaft[i].s <= 0.02f || !ShaftProject(g_vp, g_shaft[i].p, u, v, w)) continue;
+                    // fade a source out as it leaves the screen (its shafts would point at nothing)
+                    const float edge = std::min(std::min(u + 0.15f, 1.15f - u), std::min(v + 0.15f, 1.15f - v));
+                    const float vis = std::min(std::max(edge / 0.2f, 0.0f), 1.0f);
+                    L[i][0] = u; L[i][1] = v; L[i][2] = g_shaft[i].s * vis;
+                }
                 const float r6[4] = { 0.85f, 0.96f, 0, 0 };
                 dev->SetPixelShaderConstantF(2, &L[0][0], 4);
                 dev->SetPixelShaderConstantF(6, r6, 1);
@@ -2623,7 +2699,7 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
         if (doGrade) {
             const float g0[4] = { powf(2.0f, cfg.gradeExposure / 100.0f), cfg.gradeContrast / 100.0f,
                                   cfg.gradeVibrance / 100.0f, cfg.gradeSaturation / 100.0f };
-            const float g1[4] = { cfg.gradeBlack / 1000.0f, cfg.gradeTemp / 100.0f, 0, 0 };
+            const float g1[4] = { cfg.gradeBlack / 10000.0f, cfg.gradeTemp / 100.0f, 0, 0 };
             dev->SetPixelShaderConstantF(2, g0, 1);
             dev->SetPixelShaderConstantF(3, g1, 1);
             IDirect3DSurface9* o = nextOut(&outTex);
@@ -4213,7 +4289,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.19.0") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.20.0") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4222,7 +4298,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.19.0", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.20.0", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -5459,10 +5535,12 @@ static HRESULT WINAPI hk_DI8Create(HINSTANCE inst, DWORD ver, REFIID iid, LPVOID
     return hr;
 }
 
-// ---- XInput (imported by ordinal from xinput1_3.dll)
+// ---- XInput (imported by ordinal from xinput1_3.dll): our controller layer (pad.h) replaces dixi
+#include "pad.h"
 typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, void*);
 static PFN_XInputGetState o_XInputGetState = nullptr;
-static DWORD WINAPI hk_XInputGetState(DWORD idx, void* state)
+static bool g_dixiPresent = false;
+static DWORD WINAPI hk_XInputGetState(DWORD idx, void* state)     // dixi still installed: pass through
 {
     DWORD r = o_XInputGetState(idx, state);
     if (r == 0 && g_menuOpen && state) memset((BYTE*)state + 4, 0, 12);   // keep dwPacketNumber, clear XINPUT_GAMEPAD
@@ -5505,9 +5583,32 @@ static void InstallInputHooks()
     if (!o_DI8Create)
         if (void** s = FindIAT(exe, "dinput8.dll", "DirectInput8Create"))
             o_DI8Create = (PFN_DI8Create)SafePatchIAT(s, (void*)hk_DI8Create);
-    if (!o_XInputGetState)
-        if (void** s = FindIATOrdinal(exe, "xinput1_3.dll", 2))
-            o_XInputGetState = (PFN_XInputGetState)SafePatchIAT(s, (void*)hk_XInputGetState);
+    // dixi = one DLL installed as both dinput8.dll and xinput1_3.dll, with XInput exports in its dinput8
+    HMODULE di8 = GetModuleHandleA("dinput8.dll");
+    g_dixiPresent = di8 && GetProcAddress(di8, "XInputGetState");
+    static bool padDone = false;
+    if (!padDone) {
+        padDone = true;
+        PadLoadConfig();
+        void** gs = FindIATOrdinal(exe, "xinput1_3.dll", 2);
+        void** ss = FindIATOrdinal(exe, "xinput1_3.dll", 3);
+        HMODULE owner = nullptr;
+        if (gs && *gs) GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)*gs, &owner);
+        if (g_dixiPresent) {
+            Log("pad: GOG dixi is still installed (dinput8.dll / xinput1_3.dll) - leaving the controller to it. "
+                "Delete both and use APRenewal's xinput1_3.dll for the built-in controller support.");
+            if (gs) o_XInputGetState = (PFN_XInputGetState)SafePatchIAT(gs, (void*)hk_XInputGetState);
+        } else {
+            if (owner == g_self) Log("pad: xinput1_3.dll is APRenewal's forwarder");
+            else {
+                char mp[MAX_PATH] = "?"; if (owner) GetModuleFileNameA(owner, mp, MAX_PATH);
+                Log("pad: xinput1_3.dll is %s - redirecting the game's XInput calls", mp);
+                if (gs) SafePatchIAT(gs, (void*)APR_XInputGetState);
+                if (ss) SafePatchIAT(ss, (void*)APR_XInputSetState);
+            }
+            PadStart();
+        }
+    }
     Log("menu: input hooks DirectInput8Create=%p XInputGetState=%p", (void*)o_DI8Create, (void*)o_XInputGetState);
 }
 
@@ -5540,6 +5641,7 @@ static bool SaveConfig()
     cfg.aoMode = g_fx.aoMode;
     WriteIniInt("Display", "Borderless", cfg.borderless);
     WriteIniInt("Game", "SkipIntros", cfg.skipIntros);
+    PadSaveConfig();
     WriteIniInt("Game", "NoOcclusionCulling", cfg.noOcclusion);
     WriteIniInt("Game", "DrawDistance", cfg.drawDistance);
     WriteIniInt("Textures", "Anisotropy", cfg.anisotropy);
@@ -5624,7 +5726,7 @@ static bool SaveConfig()
     WriteIniInt("Grade", "Contrast", cfg.gradeContrast);
     WriteIniInt("Grade", "Vibrance", cfg.gradeVibrance);
     WriteIniInt("Grade", "Saturation", cfg.gradeSaturation);
-    WriteIniInt("Grade", "BlackLevel", cfg.gradeBlack);
+    WriteIniInt("Grade", "BlackLevel2", cfg.gradeBlack);
     WriteIniInt("Grade", "Temperature", cfg.gradeTemp);
     WriteIniInt("Display", "RenderScale", cfg.renderScale);
     WriteIniInt("HDR", "Enable", cfg.hdrEnable);
@@ -5719,7 +5821,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.19.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.20.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -5773,9 +5875,10 @@ static void DrawMenu()
                 ImGui::SliderInt("Contrast", &cfg.gradeContrast, 70, 160, "%d %%");
                 ImGui::SliderInt("Vibrance", &cfg.gradeVibrance, -50, 150, "%d %%");
                 ImGui::SliderInt("Saturation", &cfg.gradeSaturation, 0, 200, "%d %%");
-                ImGui::SliderInt("Black level", &cfg.gradeBlack, -10, 30, "%d");
+                ImGui::SliderInt("Black level", &cfg.gradeBlack, -50, 100, cfg.gradeBlack ? (cfg.gradeBlack > 0 ? "%d deeper" : "%d lifted") : "game");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Soft toe: positive values deepen shadows gradually, negative lift them. 0 = untouched.");
                 ImGui::SliderInt("Temperature", &cfg.gradeTemp, -100, 100, cfg.gradeTemp ? (cfg.gradeTemp > 0 ? "%d warm" : "%d cool") : "neutral");
-                if (ImGui::Button("Defaults (vivid)")) { cfg.gradeExposure = 10; cfg.gradeContrast = 106; cfg.gradeVibrance = 45; cfg.gradeSaturation = 100; cfg.gradeBlack = 1; cfg.gradeTemp = 0; }
+                if (ImGui::Button("Defaults (vivid)")) { cfg.gradeExposure = 10; cfg.gradeContrast = 106; cfg.gradeVibrance = 45; cfg.gradeSaturation = 100; cfg.gradeBlack = 0; cfg.gradeTemp = 0; }
                 ImGui::SameLine();
                 if (ImGui::Button("Neutral")) { cfg.gradeExposure = 0; cfg.gradeContrast = 100; cfg.gradeVibrance = 0; cfg.gradeSaturation = 100; cfg.gradeBlack = 0; cfg.gradeTemp = 0; }
                 ImGui::TextDisabled("Runs on the 3D image only, before the HUD. Part of post-processing (F11).");
@@ -5965,6 +6068,40 @@ static void DrawMenu()
                 static const char* st[] = { "disabled", "enabled", "denied", "required", "headphones detected", "unsupported output" };
                 ImGui::TextDisabled("OpenAL Soft on: %s", g_alDevName);
                 ImGui::TextDisabled("HRTF: %s %s", (g_alHrtfStatus >= 0 && g_alHrtfStatus <= 5) ? st[g_alHrtfStatus] : "unknown", g_alHrtfName);
+            }
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Controller")) {
+            if (g_dixiPresent) {
+                ImGui::TextWrapped("GOG's dixi (dinput8.dll + xinput1_3.dll in Binaries) is still installed, so it handles the "
+                                   "controller. Delete both, copy APRenewal's xinput1_3.dll to Binaries and restart for the built-in support.");
+            } else {
+                ImGui::TextDisabled("One merged pad for player 1: Xbox (XInput), DualSense / DualShock 4 (USB or Bluetooth),");
+                ImGui::TextDisabled("and other DirectInput pads. Source changes apply after a restart.");
+                CheckboxInt("Built-in controller support", &g_padCfg.enable);
+                CheckboxInt("Xbox / XInput pads", &g_padCfg.xinput);
+                CheckboxInt("DualSense / DualShock 4 (direct, with rumble)", &g_padCfg.sony);
+                CheckboxInt("Other DirectInput gamepads", &g_padCfg.dinput);
+                ImGui::SliderInt("Rumble", &g_padCfg.rumble, 0, 200, g_padCfg.rumble ? "%d %%" : "off");
+                ImGui::SliderInt("Extra stick dead zone", &g_padCfg.deadzone, 0, 30, g_padCfg.deadzone ? "%d %%" : "game's own");
+                CheckboxInt("Touchpad click = Back", &g_padCfg.touchpadBack);
+                bool lightOn = g_padCfg.light >= 0;
+                if (ImGui::Checkbox("Set the Sony light bar colour", &lightOn)) g_padCfg.light = lightOn ? 0x2060FF : -1;
+                if (g_padCfg.light >= 0) {
+                    float col[3] = { ((g_padCfg.light >> 16) & 255) / 255.0f, ((g_padCfg.light >> 8) & 255) / 255.0f, (g_padCfg.light & 255) / 255.0f };
+                    if (ImGui::ColorEdit3("Light bar", col, ImGuiColorEditFlags_NoInputs))
+                        g_padCfg.light = (int)(col[0] * 255 + 0.5f) << 16 | (int)(col[1] * 255 + 0.5f) << 8 | (int)(col[2] * 255 + 0.5f);
+                }
+                bool swapAB = strstr(g_padCfg.remap, "A=B") && strstr(g_padCfg.remap, "B=A");
+                if (ImGui::Checkbox("Swap A / B (confirm on the right button)", &swapAB))
+                    snprintf(g_padCfg.remap, sizeof g_padCfg.remap, "%s", swapAB ? "A=B B=A" : "");
+                ImGui::InputText("Button remap", g_padCfg.remap, sizeof g_padCfg.remap);
+                ImGui::TextDisabled("e.g. \"A=B B=A BACK=START\" - Xbox names: A B X Y LB RB LS RS BACK START GUIDE UP DOWN LEFT RIGHT");
+                ImGui::Separator();
+                PadDescribe();
+                if (!g_padInfoN) ImGui::TextDisabled("No controller connected.");
+                for (int i = 0; i < g_padInfoN; i++) ImGui::BulletText("%s", g_padInfo[i]);
+                if (g_padInfoN > 1) ImGui::TextDisabled("Steam Input or DS4Windows show a pad twice - harmless here, but turn them off if buttons act oddly.");
             }
             ImGui::EndTabItem();
         }
@@ -6493,7 +6630,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.19.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.20.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

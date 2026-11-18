@@ -1,22 +1,25 @@
-# APRenewal 0.19.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.20.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
 | Slot | Who owns it |
 |---|---|
 | `winmm.dll` (AlphaFixer, not needed from 0.9) | AlphaProtocolFixer (FOV / HUD / widescreen) |
-| `dinput8.dll`, `xinput1_3.dll` | GOG "dixi" input wrapper |
+| `xinput1_3.dll` | **APRenewal** controller layer (replaces GOG's "dixi" `dinput8.dll` + `xinput1_3.dll` from 0.20) |
 | `d3d9.dll` | **APRenewal** |
 | `OpenAL32.dll` | **OpenAL Soft 1.25.2** (optional, replaces Creative's router; for HRTF) |
 
 ## Install
-Copy `d3d9.dll` + `APRenewal.ini` into `Alpha Protocol\Binaries\`. Uninstall = delete both.
+Copy `d3d9.dll`, `xinput1_3.dll` and `APRenewal.ini` into `Alpha Protocol\Binaries\`.
+From 0.20 APRenewal does the controller support itself: **delete (or move out) GOG's dixi** -
+`Binaries\dinput8.dll` and `Binaries\xinput1_3.dll` - and use APRenewal's `xinput1_3.dll` instead.
+Uninstall = delete APRenewal's files (and put dixi back if you want it).
 The log goes to `Binaries\APRenewal\APRenewal.log`.
 
 ## Steam Deck / Linux (Proton) — untested yet, please send logs
 1. Copy `d3d9.dll`, `APRenewal.ini` and `OpenAL32.dll` into `Alpha Protocol/Binaries/`.
    Leave `RealD3D9` **empty**: Proton's own DXVK is used. Don't copy `winmm.dll`, `dinput8.dll` or
-   `xinput1_3.dll` (Steam Input handles the controller).
+   `xinput1_3.dll` (Steam Input handles the controller; APRenewal still routes it through Wine's XInput).
 2. Steam > Alpha Protocol > Properties > Launch options:
    `WINEDLLOVERRIDES="d3d9,openal32=n,b" %command%`
 3. Check `APRenewal.log`: it should say `compat: running under Wine ...` and `system d3d9 ... -> <address>`.
@@ -24,6 +27,26 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.20.0
+- **Controller support built in - dixi is retired.** One merged pad for player 1, from whatever is
+  plugged in: Xbox 360 / One / Series pads (XInput, any connection), **DualSense, DualSense Edge and
+  DualShock 4 read directly over USB or Bluetooth** (with rumble, and an optional light bar colour),
+  and other DirectInput pads (Switch Pro, DualShock 3, Logitech in D mode, PS2 adapters, generic USB
+  pads) with built-in button maps. Mix and match - use the DualSense one evening and the Xbox pad the
+  next, no settings to change. New **Controller** tab: rumble strength, extra dead zone, touchpad =
+  Back, Swap A/B, free button remap, light bar colour, and a list of what's connected. The game no
+  longer needs the DirectX runtime's xinput1_3: APRenewal ships its own `xinput1_3.dll`.
+  Unknown DirectInput pad with odd buttons? Add `Map_VVVVPPPP=` under `[Controller]` (see the ini).
+  If Steam Input or DS4Windows is running too, the pad shows up twice - harmless, buttons are merged,
+  but turn those off if anything acts strange.
+- **Light shafts stay put.** They used to re-pick "the brightest spots on screen" every frame, so they
+  jumped around whenever the camera moved. Now each source is located in the world (from the depth
+  buffer), tracked there and re-projected every frame, fades in over half a second, survives a few
+  frames of being hidden, and fades out as it leaves the screen.
+- **Black level is a soft toe now** (`[Grade] BlackLevel2`, default 0). The old one subtracted a value
+  and clipped - even 1 turned everything under ~4 % brightness pitch black. Now positive values deepen
+  shadows gradually without losing their gradation, negative values lift them; 0 leaves them alone.
 
 ## New in 0.19.0
 - **Skin and weapon gloss** (`[Materials] SkinGloss / MetalGloss`, Lighting & shadows tab). From your

@@ -24,7 +24,9 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   (`89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50` at +9: ecx = width, esi = left), menu viewport
   (`FF D2 85 C0 89 44 24 08 DB 44 24 08` at +2: eax = width; first of 3 matches). HUD width came from
   AlphaFixer.ini or the desktop — that broke supersampling.
-- `dinput8.dll` / `xinput1_3.dll` = GOG "dixi" controller remapper (`dixi.ini`).
+- `dinput8.dll` / `xinput1_3.dll` = GOG "dixi" controller remapper (`dixi.ini`) — one DLL under both names (XInput
+  implemented itself via winmm + SetupAPI, no real xinput). Replaced by our controller layer in 0.20.0 (user told to delete it).
+  User's pads: DualSense (USB, sometimes BT), Xbox Series X; wants complete support, not tailored.
 - MulderConfig launcher edits `APEngine.ini` etc. (`MulderConfig.json`, save file must list every group).
 - `d3d9.dll` = APRenewal, chain-loads `RealD3D9=` (user runs DXVK as `d3d9_dxvk.dll`).
 - `OpenAL32.dll` = OpenAL Soft 1.25.2 we built (original Creative router kept as backup).
@@ -316,6 +318,23 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   - Still to do (part 2): weapon master + skin sheen rebuild (needs a values census near a weapon /
     face), dixi absorption (user's dixi.ini: Sony pads via DirectInput, button/axis remaps; dixi exposes
     them as XInput), HUD/subtitle scale (Scaleform canvas RE), 120 fps physics check.
+- 0.20.0:
+  - Light shafts were re-picked from screen-space peaks every frame → jumped with the camera. Now the max map
+    outputs (peak lum, its uv, its depth from g_fx.depth/zcopy), peaks are unprojected with the VP the tiny map
+    was drawn with (g_shaftVp[], = g_vpPrev at copy time), tracked in world space (tolerance 40 + 12 % of
+    depth, 8 missed frames before fading, slow EMA), re-projected with g_vp each frame, faded at screen edges.
+  - Grade black level: old c − b clip (b = 1/1000) crushed everything under ~4 % sRGB. Now soft toe
+    c²/(c+b)·(1+b), negative = lift; ini key BlackLevel2 (1/10000), default 0.
+  - Controller layer src/pad.h (`pad:` log): game imports xinput1_3 ordinals 2 (GetState) and 3 (SetState)
+    + dinput8 DirectInput8Create (mouse). out/xinput1_3.dll (src/xinput/) = forwarders to d3d9.APR_XInput*
+    exports (d3d9.def). If the exe's import still points elsewhere (system/Wine xinput) the IAT is redirected
+    to APR_*; if dixi is present (dinput8 exports XInputGetState) we stay out of the way. Merged virtual pad
+    on slot 0: system XInput (xinput1_4 → 9_1_0 → 1_3 by System32 path, GetStateEx ordinal 100), Sony HID
+    thread per device (DS4 05C4/09CC/0BA0, DualSense 0CE6/0DF2; BT = InputReportByteLength != 64; feature
+    0x02/0x05 read switches BT to full reports 0x11/0x31; output 0x05/0x11 (DS4), 0x02/0x31 (DS5), BT CRC32
+    seeded 0xA2 at [74]), DirectInput pads polled every 4 ms in the pad thread with maps (kDiKnown, generic
+    D-mode if Rz exists else Xbox-style, ini Map_VVVVPPPP). XInput-capable DI devices ("IG_") and Sony (not
+    DS3) are skipped in DI. Untested on hardware (Wine is broken in this sandbox).
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 
