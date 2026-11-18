@@ -91,6 +91,10 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   Soft we map legacy names to the default device and request `ALC_HRTF_SOFT` +
   `ALC_OUTPUT_MODE_SOFT=ALC_STEREO_HRTF_SOFT`; `alcResetDeviceSOFT` toggles it live.
 
+## Reverse engineering
+- `docs/apgame-re.md` has the exe findings; `tools/re/apgame_natives.json` maps 2804 UE3 natives
+  (`Class::execFunc` → address, Steam exe); `tools/re/dis.py` disassembles with names. Start there.
+
 ## Known not-our-bugs
 - MulderConfig "Allow higher-res world/weapon textures" breaks textures (see-through gun cabinet,
   blocky pants). Parked.
