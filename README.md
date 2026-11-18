@@ -1,4 +1,4 @@
-# APRenewal 0.14.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.14.2 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,12 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.14.2
+- Fixed the light trapezoid without AO at some angles: some frames first render a second view
+  (scene capture) that also contains glass, and its glass coverage was left in the mask for the main
+  view. The mask is now per scene, only for full-resolution views, and weighted by how opaque the
+  glass is (near-invisible glass keeps the AO behind it).
 
 ## New in 0.14.1
 - **No more AO through windows** (`[AO] BehindGlass`, Video → Lighting & shadows). Our glass shader

@@ -186,6 +186,8 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
 - 0.14.1 AO behind glass: glass replacement writes COLOR1 = 1; PreDraw binds g_glassMaskSurf (same
   size/format as RT0, cleared once per frame via ColorFill, g_frameNo from TraceFrameBoundary) as RT1
   with o_SetRT, PostDrawRestore unbinds it. AO composite samples it at s2: ao = lerp(ao, 1, mask·c4.z).
+  0.14.2: mask keyed by frame×64 + g_scenesThisFrame (scene-capture glass leaked into the main view as
+  a light trapezoid without AO), only bound when RT0 = g_ppW×g_ppH, mask alpha = saturate(alpha·4).
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 

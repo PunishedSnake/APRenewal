@@ -57,7 +57,9 @@ static bool    g_hdrForced = false;               // we replaced the backbuffer 
 static volatile bool g_worldEverSeen = false;
 static IDirect3DTexture9* g_glassMask = nullptr;  // coverage of our window glass this frame (MRT 1)
 static IDirect3DSurface9* g_glassMaskSurf = nullptr;
-static unsigned g_frameNo = 0, g_glassMaskFrame = ~0u;
+static int  g_scenesThisFrame = 0;               // scenes rendered so far this frame (scene captures first)
+static unsigned g_frameNo = 0, g_glassMaskFrame = ~0u;   // g_glassMaskFrame = frame * 64 + scene of the mask's content
+static unsigned GlassMaskKey() { return g_frameNo * 64u + (unsigned)(g_scenesThisFrame & 63); }
 static bool g_glassMaskBound = false;
 static void GlassMaskRelease()
 {
@@ -1672,7 +1674,7 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
             const float tx = tanf((liveFov ? g_gameFov : (float)cfg.aoFov) * 0.5f * 3.14159265f / 180.0f);
             const float c2[4] = { tx, tx * bd.Height / bd.Width, (float)cfg.aoRadius, cfg.aoIntensity / 100.0f };
             const float c3[4] = { 0.2f, (float)cfg.aoMaxDist, cfg.aoMaxDist * 0.6f, (float)bd.Width / bd.Height };
-            const bool glassNow = g_glassMask && g_glassMaskFrame == g_frameNo;
+            const bool glassNow = g_glassMask && g_glassMaskFrame == GlassMaskKey();   // only this frame's final scene
             const float c4[4] = { g_fx.aoMode == 2 ? 1.0f : 0.0f, cfg.aoProtect / 100.0f, glassNow ? cfg.aoGlass / 100.0f : 0.0f, 0 };
             const float c5[4] = { (float)cfg.aoNear, 0, 0, 0 };
             dev->SetPixelShaderConstantF(5, c5, 1);
@@ -1750,7 +1752,6 @@ static IDirect3DSurface9* g_curRT = nullptr;   // identity only
 static int  g_curRTDraws = 0;
 static bool g_curRTSmall = false, g_sawSmallRT = false, g_fxDoneThisFrame = false;
 static bool g_curRTIsHDR = false;
-static int  g_scenesThisFrame = 0;
 static bool g_multiSceneLogged = false;
 static bool g_sawHDR = false;                  // the base pass (full-res HDR) has been drawn this frame
 static char g_frameSeq[1024];                  // compact RT sequence of the current frame (diagnostics)
@@ -3028,7 +3029,7 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
     // a reflection replaces what's seen through the glass: bright reflections add opacity
     alpha = saturate(alpha + dot(mr, float3(0.299, 0.587, 0.114)) * apTM.z * 0.5);
     OutColor = float4(col * fog.w + fog.rgb, alpha);
-    OutMask = float4(1, 1, 1, 1);   // glass coverage for the AO pass (only written when we bind a 2nd target)
+    OutMask = float4(1, 1, 1, saturate(alpha * 4));   // glass coverage for the AO pass (blended: near-invisible glass keeps AO)
 }
 )HLSL";
 
@@ -3300,6 +3301,7 @@ static void PreDraw(IDirect3DDevice9* d)
             IDirect3DSurface9* rt = nullptr;
             if (SUCCEEDED(d->GetRenderTarget(0, &rt)) && rt) {
                 D3DSURFACE_DESC rd; rt->GetDesc(&rd); rt->Release();
+                if (g_ppW && (rd.Width != g_ppW || rd.Height != g_ppH)) return;   // scene captures / reflections: not the view the AO sees
                 D3DSURFACE_DESC md = {};
                 if (g_glassMaskSurf) g_glassMaskSurf->GetDesc(&md);
                 if (!g_glassMask || md.Width != rd.Width || md.Height != rd.Height || md.Format != rd.Format) {
@@ -3310,7 +3312,7 @@ static void PreDraw(IDirect3DDevice9* d)
                     } else { g_glassMask = nullptr; Log("shaders: glass mask creation failed - AO stays behind glass"); cfg.aoGlass = 0; }
                 }
                 if (g_glassMaskSurf) {
-                    if (g_glassMaskFrame != g_frameNo) { d->ColorFill(g_glassMaskSurf, nullptr, 0); g_glassMaskFrame = g_frameNo; }
+                    if (g_glassMaskFrame != GlassMaskKey()) { d->ColorFill(g_glassMaskSurf, nullptr, 0); g_glassMaskFrame = GlassMaskKey(); }
                     o_SetRT(d, 1, g_glassMaskSurf);
                     g_glassMaskBound = true;
                 }
@@ -4085,7 +4087,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.14.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.14.2", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -4739,7 +4741,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.14.1 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.14.2 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();
