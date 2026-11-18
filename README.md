@@ -1,4 +1,4 @@
-# APRenewal 0.9 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.9.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -12,6 +12,17 @@ A research-and-fix base layer. It sits alongside the mods you already have:
 ## Install
 Copy `d3d9.dll` + `APRenewal.ini` into `Alpha Protocol\Binaries\`. Uninstall = delete both.
 The log goes to `Binaries\APRenewal\APRenewal.log`.
+
+## New in 0.9.1
+- FOV is now set in degrees (`[View] FOV`, default 85). The game's camera is 60 degrees and
+  AlphaFixer simply forced it to ~85 (with FOVFactor 1.20); 0.9 multiplied the game's 60 by 1.2,
+  which gave a cramped ~69. Every camera mode is scaled by the same ratio, so aim/zoom still work.
+  The log lists each camera FOV the game uses and what it became.
+- HDR: removed the HDR10 option (froze the game with DXVK); scRGB only. Highlights now roll off
+  softly below the display peak instead of clipping, there is a saturation trim (`[HDR] Saturation`),
+  and the menu warns when paper white is too close to the display peak (blown-out whites).
+- Recommended DXVK: 3.1.1 + the upstream HDR fix only (`d3d9_dxvk.dll` in the dxvk zip). The
+  master build added newer present-timing code; it is the first suspect for the Steam overlay.
 
 ## New in 0.9
 - **AlphaFixer is no longer needed.** Delete `winmm.dll` and `AlphaFixer.ini` from Binaries;

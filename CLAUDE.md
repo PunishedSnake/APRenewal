@@ -34,7 +34,9 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
 - Code patches: `MidHook(site, len, expect, fn, repl)` — our own mid-function hook (pushfd/pushad/
   XMM save, `fn(HookRegs*)` may edit registers, then original or replacement bytes, jmp back).
   Sites must be whole instructions without relative operands; `expect` bytes are verified first.
-  View module (`InstallViewHooks`): FOV blend function at 0xA8F020 in the Steam exe — per-module
+  View module (`InstallViewHooks`): the game's normal camera module FOV is 60 deg (measured);
+  `[View] FOV` is the target for that camera at 16:9 and all modules get the same tan ratio.
+  FOV blend function at 0xA8F020 in the Steam exe — per-module
   FOV scaled via a replacement `mulss xmm0,[g_fovScratch]`, blended result read at its `fld [esp+8]`
   (feeds AO's FOV); HUD and menu hooks only act when wider than 16:9.
 - Proxy exports Direct3DCreate9/Ex + D3DPERF_*. IAT hooks on APGame.exe: D3DXCompileShader, QPC,
@@ -77,8 +79,11 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   at Present. DXVK **v3.1.1 never enables VK_EXT_swapchain_colorspace** (it sat in the device
   extension list; fixed upstream in 3c40ca1, 2026-09-28) and then silently clips HDR to an SDR
   swapchain → neon oversaturation. We check the loader ourselves (`CheckVulkanHdr`). Use a DXVK built
-  from master until 3.2 ships. DXVK ignores gamma ramps in windowed mode; we still keep the game's
-  ramp out of the HDR path.
+  with 3c40ca1 cherry-picked onto v3.1.1 until 3.2 ships (master's new present-timing code is the
+  suspect for a broken Steam overlay). scRGB only: HDR10 colour space with the fp16 backbuffer froze
+  presentation (game stuck after a few frames). Encode has a soft shoulder to the peak and a
+  saturation trim; paper white near the peak = blown-out look. DXVK ignores gamma ramps in windowed
+  mode; we still keep the game's ramp out of the HDR path.
 - **Audio**: game loads OpenAL at runtime (`DeviceName=Generic Software` in APEngine.ini). With OpenAL
   Soft we map legacy names to the default device and request `ALC_HRTF_SOFT` +
   `ALC_OUTPUT_MODE_SOFT=ALC_STEREO_HRTF_SOFT`; `alcResetDeviceSOFT` toggles it live.

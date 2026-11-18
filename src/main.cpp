@@ -50,9 +50,9 @@ static bool    g_ssaa = false;                    // backbuffer larger than the 
 static UINT    g_outW = 0, g_outH = 0;            // window (output) size while supersampling
 static bool    g_hdrUnlocked = false;             // DXVK allowed an fp16 backbuffer
 static bool    g_hdrForced = false;               // we replaced the backbuffer format with fp16
-static bool    g_hdrActive = false;
-static bool    g_hdrPQ = false;
-static float   g_gammaExp = 1.0f;                 // game's brightness ramp as an exponent (HDR applies it itself)                   // HDR10 colour space (we encode PQ) instead of scRGB               // scRGB colour space is set: encode at Present
+static bool    g_hdrActive = false;               // scRGB colour space is set: encode at Present
+static bool    g_hdrPQ = false;                   // HDR10 colour space (unused since 0.9.1)
+static float   g_gammaExp = 1.0f;                 // game's brightness ramp as an exponent (HDR applies it itself)
 static float   g_hdrMaxNits = 0;                  // what the display reports
 static D3DFORMAT g_bbLogicalFmt = D3DFMT_A8R8G8B8; // format the game asked for
 static IDirect3DSurface9* g_hdrSceneSurf = nullptr; // this frame's HDR scene target (identity)
@@ -110,12 +110,13 @@ struct Config {
     int  hdrPaper      = 200;   // nits for UI / SDR white
     int  hdrPeak       = 0;     // nits, 0 = what the display reports
     int  hdrHighlights = 100;   // percent highlight expansion
-    int  hdrEncoding   = 1;     // 0 = HDR10 (PQ, Rec.2020) - we do the conversion; 1 = scRGB - DXVK converts
+    int  hdrEncoding   = 1;     // scRGB only (HDR10 + fp16 backbuffer froze the game with DXVK)
+    int  hdrSaturation = 100;   // percent, HDR only
     // audio
     int  hrtf          = 1;     // 0 off, 1 on (headphones), 2 leave to OpenAL
     // view (replaces AlphaFixer)
     int  viewEnable    = 1;
-    int  fovScale      = 120;   // percent on top of Hor+ (AlphaFixer's FOVFactor 1.20)
+    int  fovDeg        = 85;    // gameplay camera FOV at 16:9, degrees (AlphaFixer FOVFactor 1.20 = 85)
     int  hudLimit      = 1;     // keep HUD and menus 16:9 on wider screens
     int  aoFovAuto     = 1;     // AO follows the game's live FOV    // apply PostFX to the finished world image, before the UI is drawn
 } cfg;
@@ -183,19 +184,21 @@ static void LoadConfig()
     cfg.hdrPaper      = GetPrivateProfileIntA("HDR", "PaperWhite", 200, g_ini);
     cfg.hdrPeak       = GetPrivateProfileIntA("HDR", "PeakNits", 0, g_ini);
     cfg.hdrHighlights = GetPrivateProfileIntA("HDR", "Highlights", 100, g_ini);
-    cfg.hdrEncoding   = GetPrivateProfileIntA("HDR", "Encoding", 1, g_ini) ? 1 : 0;
+    cfg.hdrEncoding   = 1;
+    cfg.hdrSaturation = GetPrivateProfileIntA("HDR", "Saturation", 100, g_ini);
     if (cfg.hdrPaper < 80) cfg.hdrPaper = 80;
     cfg.hrtf          = GetPrivateProfileIntA("Audio", "HRTF", 1, g_ini);
     {
-        // first run after AlphaFixer: take its FOVFactor as our default
-        int def = 120;
+        // first run after AlphaFixer: AlphaFixer set every camera to 2*atan(tan(37.5 deg) * FOVFactor)
+        int def = 85;
         char af[MAX_PATH]; PathJoin(af, g_dir, "AlphaFixer.ini");
         char v[32] = "";
-        if (GetPrivateProfileStringA("Settings", "FOVFactor", "", v, sizeof v, af) && v[0]) def = (int)(atof(v) * 100 + 0.5);
-        cfg.fovScale = GetPrivateProfileIntA("View", "FOVFactor", def, g_ini);
+        if (GetPrivateProfileStringA("Settings", "FOVFactor", "", v, sizeof v, af) && v[0])
+            def = (int)(2.0 * atan(tan(37.5 * 3.14159265 / 180.0) * atof(v)) * 180.0 / 3.14159265 + 0.5);
+        cfg.fovDeg = GetPrivateProfileIntA("View", "FOV", def, g_ini);
     }
-    if (cfg.fovScale < 50) cfg.fovScale = 50;
-    if (cfg.fovScale > 200) cfg.fovScale = 200;
+    if (cfg.fovDeg < 40) cfg.fovDeg = 40;
+    if (cfg.fovDeg > 130) cfg.fovDeg = 130;
     cfg.viewEnable = GetPrivateProfileIntA("View", "Enable", 1, g_ini);
     cfg.hudLimit   = GetPrivateProfileIntA("View", "HUD169", 1, g_ini);
     cfg.aoFovAuto  = GetPrivateProfileIntA("AO", "FOVAuto", 1, g_ini);
@@ -331,11 +334,15 @@ static float ViewAspect()
     return (g_ppW && g_ppH) ? (float)g_ppW / (float)g_ppH : 16.0f / 9.0f;
 }
 
-// Hor+ with a user factor: keep the game's vertical extent for 16:9, widen for wider screens.
+// The game's normal third-person camera is 60 degrees (measured: the module FOV the blend sees).
+// The user picks what that camera should become at 16:9; every camera mode is scaled by the same
+// tangent ratio, so aim/zoom keep their relation to it, and wider screens widen further (Hor+).
+static const float kGameBaseFov = 60.0f;
 static float ScaleFov(float deg)
 {
     if (!(deg > 1.0f && deg < 170.0f)) return deg;
-    const float k = (cfg.fovScale / 100.0f) * (ViewAspect() / (16.0f / 9.0f));
+    const float d2r = 3.14159265f / 180.0f;
+    const float k = tanf(cfg.fovDeg * 0.5f * d2r) / tanf(kGameBaseFov * 0.5f * d2r) * (ViewAspect() / (16.0f / 9.0f));
     if (k > 0.999f && k < 1.001f) return deg;
     float r = 2.0f * atanf(tanf(deg * 0.5f * 3.14159265f / 180.0f) * k) * 180.0f / 3.14159265f;
     return r < 170.0f ? r : 170.0f;
@@ -346,6 +353,10 @@ static void __cdecl View_ModuleFov(HookRegs* r)
 {
     const float f = *(const float*)(r->eax + 0x10C);
     g_fovScratch = cfg.viewEnable ? ScaleFov(f) : f;
+    static float seen[8]; static int nSeen = 0;          // log the distinct camera FOVs the game uses
+    bool known = false;
+    for (int i = 0; i < nSeen; i++) if (fabsf(seen[i] - f) < 0.05f) known = true;
+    if (!known && nSeen < 8) { seen[nSeen++] = f; Log("view: camera mode FOV %.1f deg -> %.1f deg", f, g_fovScratch); }
 }
 // at the blend's `fld [esp+8]` return: remember the final FOV
 static void __cdecl View_BlendResult(HookRegs* r)
@@ -405,9 +416,9 @@ static void InstallViewHooks()
     BYTE* menu = FindPattern("FF D2 85 C0 89 44 24 08 DB 44 24 08");
     if (MidHook(menu ? menu + 2 : nullptr, 6, menuOrig, View_Menu)) g_viewSites |= 8;
     g_viewHooks = g_viewSites != 0;
-    Log("view: hooks - module FOV %s, FOV readback %s, HUD %s, menu %s (FOV factor %d%%)",
+    Log("view: hooks - module FOV %s, FOV readback %s, HUD %s, menu %s (FOV %d deg at 16:9)",
         (g_viewSites & 1) ? "ok" : "NOT FOUND", (g_viewSites & 2) ? "ok" : "NOT FOUND",
-        (g_viewSites & 4) ? "ok" : "NOT FOUND", (g_viewSites & 8) ? "ok" : "NOT FOUND", cfg.fovScale);
+        (g_viewSites & 4) ? "ok" : "NOT FOUND", (g_viewSites & 8) ? "ok" : "NOT FOUND", cfg.fovDeg);
 }
 
 // --------------------------------------------------------------------------
@@ -808,7 +819,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 static const char* kHdrEncodePS = R"HLSL(
 sampler2D sSrc : register(s0);
 float4 e : register(c1);    // x paper white nits, y peak nits, z 1 = PQ / 0 = scRGB
-float4 e2 : register(c2);   // xy uv scale (only part of the source holds the image), z game gamma ramp exponent
+float4 e2 : register(c2);   // xy uv scale (only part of the source holds the image), z game gamma ramp exponent, w saturation
 float3 PQ(float3 nits)
 {
     float3 y = pow(saturate(nits / 10000.0), 0.1593017578125);
@@ -817,8 +828,12 @@ float3 PQ(float3 nits)
 float4 main(float2 uv : TEXCOORD0) : COLOR0
 {
     float3 c = pow(max(tex2Dlod(sSrc, float4(uv * e2.xy, 0, 0)).rgb, 0), 2.2 * e2.z) * e.x;   // nits, Rec.709
+    float Y = dot(c, float3(0.2126, 0.7152, 0.0722));
+    c = max(lerp(Y, c, e2.w), 0);                                                        // saturation trim
     float m = max(c.r, max(c.g, c.b));
-    c *= min(1, e.y / max(m, 1e-4));                                                     // hue-preserving peak clamp
+    float s = 0.7 * e.y;                                                                 // soft shoulder to the peak
+    float mr = min(m, s) + (e.y - s) * (1 - exp(-max(m - s, 0) / (e.y - s)));
+    c *= mr / max(m, 1e-4);                                                              // hue preserved
     float3 c2020 = float3(dot(c, float3(0.6274, 0.3293, 0.0433)),
                           dot(c, float3(0.0691, 0.9195, 0.0114)),
                           dot(c, float3(0.0164, 0.0880, 0.8956)));
@@ -1738,7 +1753,7 @@ static const RECT* PresentExtras(IDirect3DDevice9* dev)
     }
     if (g_hdrActive && g_psHdrEncode && CopyToTex(dev, bb, &g_xCopy)) {
         const float e[4] = { (float)cfg.hdrPaper, HdrPeakNits(), g_hdrPQ ? 1.0f : 0.0f, 0 };
-        const float e2[4] = { (float)iw / bd.Width, (float)ih / bd.Height, g_gammaExp, 0 };
+        const float e2[4] = { (float)iw / bd.Width, (float)ih / bd.Height, g_gammaExp, cfg.hdrSaturation / 100.0f };
         XPass(dev, bb, iw, ih, g_xCopy, false, nullptr, false, g_psHdrEncode, e, e2, false);
     }
     bb->Release();
@@ -1812,9 +1827,8 @@ static void HdrSetupSwapchain(IDirect3DDevice9* dev)
     if (FAILED(dev->GetSwapChain(0, &sc)) || !sc) return;
     IVkExtSwapchain_* ext = nullptr;
     if (SUCCEEDED(sc->QueryInterface(IID_D3D9VkExtSwapchain, (void**)&ext)) && ext) {
-        // HDR10 first: we write PQ / Rec.2020 ourselves, so nothing downstream has to convert
-        const int order[2] = { cfg.hdrEncoding ? VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT_ : VK_COLOR_SPACE_HDR10_ST2084_EXT_,
-                               cfg.hdrEncoding ? VK_COLOR_SPACE_HDR10_ST2084_EXT_ : VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT_ };
+        // scRGB only: HDR10 with the fp16 backbuffer stalled presentation in DXVK (game froze)
+        const int order[1] = { VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT_ };
         for (int cs : order) {
             if (!ext->CheckColorSpaceSupport(cs) || FAILED(ext->SetColorSpace(cs))) continue;
             g_hdrActive = true;
@@ -2767,10 +2781,10 @@ static bool SaveConfig()
     WriteIniInt("HDR", "PaperWhite", cfg.hdrPaper);
     WriteIniInt("HDR", "PeakNits", cfg.hdrPeak);
     WriteIniInt("HDR", "Highlights", cfg.hdrHighlights);
-    WriteIniInt("HDR", "Encoding", cfg.hdrEncoding);
+    WriteIniInt("HDR", "Saturation", cfg.hdrSaturation);
     WriteIniInt("Audio", "HRTF", cfg.hrtf);
     WriteIniInt("View", "Enable", cfg.viewEnable);
-    WriteIniInt("View", "FOVFactor", cfg.fovScale);
+    WriteIniInt("View", "FOV", cfg.fovDeg);
     WriteIniInt("View", "HUD169", cfg.hudLimit);
     WriteIniInt("AO", "FOVAuto", cfg.aoFovAuto);
     if (g_saveFailures) Log("menu: save finished with %d failure(s) - %s", g_saveFailures, g_ini);
@@ -2853,7 +2867,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.9", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.9.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -2882,8 +2896,9 @@ static void DrawMenu()
             CheckboxInt("HDR output (applies at next launch)", &cfg.hdrEnable);
             ImGui::SliderInt("Paper white", &cfg.hdrPaper, 80, 400, "%d nits");
             ImGui::SliderInt("Peak brightness", &cfg.hdrPeak, 0, 4000, cfg.hdrPeak ? "%d nits" : "display's own");
-            static const char* enc[] = { "HDR10 / PQ (experimental)", "scRGB (recommended)" };
-            ImGui::Combo("Encoding (next launch)", &cfg.hdrEncoding, enc, 2);
+            ImGui::SliderInt("Saturation", &cfg.hdrSaturation, 50, 130, "%d %%");
+            if (g_hdrActive && cfg.hdrPaper > HdrPeakNits() * 0.75f)
+                ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Paper white is close to the display peak: whites will look blown out.");
             ImGui::SliderInt("Highlights", &cfg.hdrHighlights, 0, 150, cfg.hdrHighlights ? "%d %%" : "off (SDR in HDR)");
             if (g_hdrActive)
                 ImGui::TextDisabled("Active: %s", g_hdrPQ ? "HDR10 (PQ)" : "scRGB");
@@ -2901,12 +2916,14 @@ static void DrawMenu()
         }
         if (ImGui::BeginTabItem("View")) {
             CheckboxInt("FOV and HUD fixes (replaces AlphaFixer)", &cfg.viewEnable);
-            ImGui::SliderInt("Field of view", &cfg.fovScale, 50, 200, "%d %%");
+            ImGui::SliderInt("Field of view", &cfg.fovDeg, 40, 130, "%d deg");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Game default")) cfg.fovDeg = 60;
             CheckboxInt("Keep HUD and menus 16:9 on wider screens", &cfg.hudLimit);
             if (!g_viewHooks) ImGui::TextDisabled("Not active - see the log (AlphaFixer's winmm.dll still installed?)");
             else {
                 ImGui::TextDisabled("Rendering %ux%u (aspect %.3f). Game FOV now: %.1f deg", g_ppW, g_ppH, ViewAspect(), g_gameFov);
-                ImGui::TextDisabled("Applies live. 100%% = the game's own FOV (widened for wider screens).");
+                ImGui::TextDisabled("The normal camera at 16:9 (game default 60, AlphaFixer at 1.20 = 85). Aim/zoom scale along. Live.");
             }
             ImGui::EndTabItem();
         }
@@ -3347,7 +3364,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.9 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.9.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         ApplySavedToggles();
