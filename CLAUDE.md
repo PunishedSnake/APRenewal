@@ -94,6 +94,10 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   With Compensate the pattern matches the SDR reference but the game looks like plain SDR (user).
   0.9.7 adds a "Highlight test" row (1x-4x paper white) to tell whether anything above paper white
   survives this path; all patches equal = the path is SDR-limited, HDR has no gain → advise HDR off.
+  RESULT (user, 0.9.7): all six patches identical with and without Compensate → native HDR via
+  DXVK's Vulkan swapchain is SDR-limited on this PC. HDR stays default off; user pointed to NVIDIA
+  RTX HDR instead. Only remaining native route: our own DXGI/D3D11 fp16 swapchain via interop
+  (Special K-style) — big job, not started.
   Quit fix confirmed by the user (log ends with shutdown).
 - Focus pause must never park the thread while the window is closing/hidden (0.9.5: g_exiting) —
   that kept the process alive after quitting.
