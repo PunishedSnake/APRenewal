@@ -626,6 +626,7 @@ static void UpdateCursorClip(bool focused)
 typedef BOOL (WINAPI *PFN_PeekMessageW)(LPMSG, HWND, UINT, UINT, UINT);
 static PFN_PeekMessageW o_PeekMessageW = nullptr;
 static DWORD g_mainThread = 0;
+static volatile bool g_exiting = false;   // window closing / game shutting down: never park the thread
 
 static bool GameHasFocus()
 {
@@ -645,7 +646,7 @@ static void WaitWhileUnfocused()
     SetGamePaused(true);
     Log("focus lost - game paused");
     bool quit = false;
-    while (!quit && !GameHasFocus() && IsWindow(g_hwnd)) {
+    while (!quit && !g_exiting && !GameHasFocus() && IsWindow(g_hwnd) && IsWindowVisible(g_hwnd)) {
         MSG m;
         while (o_PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
             if (m.message == WM_QUIT) { PostQuitMessage((int)m.wParam); quit = true; break; }
@@ -655,13 +656,14 @@ static void WaitWhileUnfocused()
         if (!quit) MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
     }
     SetGamePaused(false);
-    Log(quit ? "quit requested while paused - resuming to exit" : "focus regained - resuming");
+    Log(quit || g_exiting ? "game is closing - resuming so it can exit" : "focus regained - resuming");
     inWait = false;
 }
 
 static BOOL WINAPI hk_PeekMessageW(LPMSG msg, HWND wnd, UINT fmin, UINT fmax, UINT remove)
 {
-    if (cfg.pauseOnFocusLoss && g_hwnd && GetCurrentThreadId() == g_mainThread && !GameHasFocus())
+    if (cfg.pauseOnFocusLoss && g_hwnd && !g_exiting && GetCurrentThreadId() == g_mainThread &&
+        IsWindowVisible(g_hwnd) && !GameHasFocus())
         WaitWhileUnfocused();
     return o_PeekMessageW(msg, wnd, fmin, fmax, remove);
 }
@@ -2624,6 +2626,11 @@ static WNDPROC g_origWndProc = nullptr;
 static bool    g_wndUnicode = true;
 static LRESULT CALLBACK hk_WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (m == WM_CLOSE || m == WM_DESTROY || m == WM_QUERYENDSESSION || m == WM_ENDSESSION ||
+        (m == WM_SYSCOMMAND && (w & 0xFFF0) == SC_CLOSE)) {
+        if (!g_exiting) Log("window closing (msg 0x%x) - focus pause disabled", m);
+        g_exiting = true;
+    }
     // supersampling: the game's view of the window is the render size
     if (g_ssaa && g_outW && g_outH) {
         // the game resizes its window to the render size (3840x2160 on a 2560x1440 screen):
@@ -2986,7 +2993,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.9.4", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.9.5", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -3015,6 +3022,10 @@ static void DrawMenu()
             CheckboxInt("HDR output (applies at next launch)", &cfg.hdrEnable);
             CheckboxInt("Reference: plain SDR exactly as Windows shows it (A/B)", &cfg.hdrReference);
             ImGui::Checkbox("Test pattern (compare with hdr_testpattern.png in an SDR viewer)", &g_hdrPattern);
+            if (g_hdrPattern)
+                ImGui::TextWrapped("If the grey ramp turns flat white after about half way and the 75%% bars look like pure primaries, "
+                                   "Windows is treating the game's HDR picture as SDR. On NVIDIA: Control Panel > Manage 3D settings > "
+                                   "Vulkan/OpenGL present method > Prefer layered on DXGI Swapchain.");
             ImGui::SliderInt("Paper white", &cfg.hdrPaper, 0, 400, cfg.hdrPaper ? "%d nits" : "Windows setting");
             static const char* curves[] = { "sRGB (like Windows)", "Gamma 2.2 (deeper shadows)" };
             ImGui::Combo("SDR curve", &cfg.hdrCurve, curves, 2);
@@ -3496,7 +3507,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.9.4 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.9.5 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         ApplySavedToggles();

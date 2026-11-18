@@ -87,6 +87,11 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   knee on luminance (max-channel knee boosted graded blue lights), and an A/B "Reference" toggle.
   User confirmed DXVK 3.1.1 + 3c40ca1 keeps the Steam overlay working; FOV 60 base confirmed. DXVK ignores gamma ramps in windowed
   mode; we still keep the game's ramp out of the HDR path.
+  0.9.4 test pattern on the user's PC (monitor on the RTX, Windows HDR on, scRGB swapchain per DXVK log):
+  output came out as if decoded as SDR sRGB at SDR white and clipped at 1.0 — the HDR colour space
+  gets lost after DXVK. Prime suspect: NVIDIA Vulkan "present method" (native vs layered on DXGI).
+- Focus pause must never park the thread while the window is closing/hidden (0.9.5: g_exiting) —
+  that kept the process alive after quitting.
 - **Audio**: game loads OpenAL at runtime (`DeviceName=Generic Software` in APEngine.ini). With OpenAL
   Soft we map legacy names to the default device and request `ALC_HRTF_SOFT` +
   `ALC_OUTPUT_MODE_SOFT=ALC_STEREO_HRTF_SOFT`; `alcResetDeviceSOFT` toggles it live.

@@ -1,4 +1,4 @@
-# APRenewal 0.9.4 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.9.5 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -12,6 +12,15 @@ A research-and-fix base layer. It sits alongside the mods you already have:
 ## Install
 Copy `d3d9.dll` + `APRenewal.ini` into `Alpha Protocol\Binaries\`. Uninstall = delete both.
 The log goes to `Binaries\APRenewal\APRenewal.log`.
+
+## New in 0.9.5
+- Fixed: the game could stay in memory after quitting. While closing, its window loses focus,
+  and the focus pause parked the game thread waiting for focus that never came back. The pause
+  now stands down once the window is closing or hidden.
+- HDR: the user's test pattern showed the output being decoded as SDR sRGB at SDR white and
+  clipped at 1.0 (grey ramp flat above ~57%, 75% bars → full primaries), so the HDR colour space
+  is lost after DXVK. The HDR tab now explains the NVIDIA "Vulkan/OpenGL present method → Prefer
+  layered on DXGI Swapchain" setting, which routes Vulkan windows through DXGI (HDR-aware).
 
 ## New in 0.9.4
 - HDR diagnostics: the log and HDR tab now say which GPU the game's monitor is plugged into and
