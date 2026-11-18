@@ -1,4 +1,4 @@
-# APRenewal 0.9.2 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.9.3 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -12,6 +12,13 @@ A research-and-fix base layer. It sits alongside the mods you already have:
 ## Install
 Copy `d3d9.dll` + `APRenewal.ini` into `Alpha Protocol\Binaries\`. Uninstall = delete both.
 The log goes to `Binaries\APRenewal\APRenewal.log`.
+
+## New in 0.9.3
+- HDR test pattern (HDR tab): replaces the frame with colour bars, a grey ramp, primaries and skin
+  tones, sent through the same HDR path as plain SDR. `docs/hdr_testpattern.png` is the identical
+  image: open it in the Windows Photos app (an SDR app) with HDR on and compare side by side.
+  Same look = APRenewal's HDR path is correct and the punchiness is the game's own colours;
+  different = something between APRenewal and the screen (DXVK, driver, display mode).
 
 ## New in 0.9.2
 - HDR, still too punchy in 0.9.1:

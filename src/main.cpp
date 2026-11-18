@@ -818,6 +818,33 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 }
 )HLSL";
 
+// HDR test pattern, in the same gamma-encoded form as the game's frame (docs/hdr_testpattern.png is
+// the identical image for an SDR viewer): 75% colour bars, a grey ramp, 100% primaries, skin tones.
+static const char* kHdrPatternPS = R"HLSL(
+float Sel(float x, float lo, float hi) { return step(lo, x) * (1 - step(hi, x)); }
+float4 main(float2 uv : TEXCOORD0) : COLOR0
+{
+    float x = uv.x;
+    // row 1: 75% bars white yellow cyan green magenta red blue black
+    float3 bars = 0.75 * (float3(1,1,1) * Sel(x, 0, 0.125) + float3(1,1,0) * Sel(x, 0.125, 0.25)
+                + float3(0,1,1) * Sel(x, 0.25, 0.375) + float3(0,1,0) * Sel(x, 0.375, 0.5)
+                + float3(1,0,1) * Sel(x, 0.5, 0.625) + float3(1,0,0) * Sel(x, 0.625, 0.75)
+                + float3(0,0,1) * Sel(x, 0.75, 0.875));
+    // row 2: 32-step grey ramp
+    float3 ramp = floor(min(x, 0.999) * 32) / 31;
+    // row 3: 100% red green blue, white, 50% grey, 20% grey
+    float3 prim = float3(1,0,0) * Sel(x, 0, 1.0/6) + float3(0,1,0) * Sel(x, 1.0/6, 2.0/6)
+                + float3(0,0,1) * Sel(x, 2.0/6, 3.0/6) + float3(1,1,1) * Sel(x, 3.0/6, 4.0/6)
+                + float3(0.5,0.5,0.5) * Sel(x, 4.0/6, 5.0/6) + float3(0.2,0.2,0.2) * Sel(x, 5.0/6, 2);
+    // row 4: skin tones
+    float3 skin = float3(0.94,0.78,0.69) * Sel(x, 0, 0.25) + float3(0.78,0.57,0.44) * Sel(x, 0.25, 0.5)
+                + float3(0.55,0.38,0.26) * Sel(x, 0.5, 0.75) + float3(0.36,0.22,0.15) * Sel(x, 0.75, 2);
+    float y = uv.y;
+    float3 c = bars * Sel(y, -1, 0.45) + ramp * Sel(y, 0.45, 0.65) + prim * Sel(y, 0.65, 0.85) + skin * Sel(y, 0.85, 2);
+    return float4(c, 1);
+}
+)HLSL";
+
 // HDR: gamma-encoded frame -> HDR10 (Rec.2020 primaries, PQ) or scRGB (linear Rec.709, 1.0 = 80 nits)
 static const char* kHdrEncodePS = R"HLSL(
 sampler2D sSrc : register(s0);
@@ -1576,7 +1603,8 @@ static void BeforeHudOnSetRT(IDirect3DDevice9* dev, IDirect3DSurface9* next)
 // Extras: supersampling downscale, HDR output, shared fullscreen pass helper
 // ==========================================================================
 static IDirect3DVertexShader9* g_xvs = nullptr;
-static IDirect3DPixelShader9 *g_psDown = nullptr, *g_psHdrFit = nullptr, *g_psHdrExpand = nullptr, *g_psHdrEncode = nullptr;
+static IDirect3DPixelShader9 *g_psDown = nullptr, *g_psHdrFit = nullptr, *g_psHdrExpand = nullptr, *g_psHdrEncode = nullptr, *g_psHdrPattern = nullptr;
+static bool g_hdrPattern = false;   // menu: replace the frame with the HDR test pattern
 static bool g_xTried = false;
 static IDirect3DStateBlock9* g_xsb = nullptr;
 static IDirect3DTexture9 *g_xCopy = nullptr, *g_xScene = nullptr, *g_xFitRT = nullptr;
@@ -1600,6 +1628,7 @@ static bool ExtrasReady(IDirect3DDevice9* dev)
             g_psHdrFit    = CompilePS(dev, kHdrFitPS, "HDR exposure fit");
             g_psHdrExpand = CompilePS(dev, kHdrExpandPS, "HDR highlight expansion");
             g_psHdrEncode = CompilePS(dev, kHdrEncodePS, "HDR scRGB encode");
+            g_psHdrPattern = CompilePS(dev, kHdrPatternPS, "HDR test pattern");
         }
     }
     return g_xvs != nullptr;
@@ -1796,10 +1825,11 @@ static const RECT* PresentExtras(IDirect3DDevice9* dev)
         iw = g_outW; ih = g_outH;
     }
     if (g_hdrActive && g_psHdrEncode && CopyToTex(dev, bb, &g_xCopy)) {
+        const bool ref = cfg.hdrReference || g_hdrPattern;
         const float e[4] = { HdrPaperNits(), HdrPeakNits(), g_hdrPQ ? 1.0f : 0.0f,
-                             (cfg.hdrReference || cfg.hdrCurve == 0) ? 1.0f : 0.0f };
-        const float e2[4] = { (float)iw / bd.Width, (float)ih / bd.Height, g_gammaExp,
-                              cfg.hdrReference ? 1.0f : cfg.hdrSaturation / 100.0f };
+                             (ref || cfg.hdrCurve == 0) ? 1.0f : 0.0f };
+        const float e2[4] = { (float)iw / bd.Width, (float)ih / bd.Height, g_hdrPattern ? 1.0f : g_gammaExp,
+                              (cfg.hdrReference || g_hdrPattern) ? 1.0f : cfg.hdrSaturation / 100.0f };
         XPass(dev, bb, iw, ih, g_xCopy, false, nullptr, false, g_psHdrEncode, e, e2, false);
     }
     bb->Release();
@@ -2915,7 +2945,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.9.2", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.9.3", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -2943,6 +2973,7 @@ static void DrawMenu()
         if (ImGui::BeginTabItem("HDR")) {
             CheckboxInt("HDR output (applies at next launch)", &cfg.hdrEnable);
             CheckboxInt("Reference: plain SDR exactly as Windows shows it (A/B)", &cfg.hdrReference);
+            ImGui::Checkbox("Test pattern (compare with hdr_testpattern.png in an SDR viewer)", &g_hdrPattern);
             ImGui::SliderInt("Paper white", &cfg.hdrPaper, 0, 400, cfg.hdrPaper ? "%d nits" : "Windows setting");
             static const char* curves[] = { "sRGB (like Windows)", "Gamma 2.2 (deeper shadows)" };
             ImGui::Combo("SDR curve", &cfg.hdrCurve, curves, 2);
@@ -3257,6 +3288,14 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDirect3DDevice9* dev, const RECT* a
         g_frameSeqLen = 0; g_frameSeq[0] = 0;
         g_hdrArm = false; g_hdrSceneSurf = nullptr;
     }
+    if (g_hdrActive && g_hdrPattern && g_psHdrPattern) {      // test pattern under the menu
+        IDirect3DSurface9* bb = nullptr;
+        if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
+            D3DSURFACE_DESC bd; bb->GetDesc(&bd);
+            XPass(dev, bb, bd.Width, bd.Height, nullptr, false, nullptr, false, g_psHdrPattern, nullptr, nullptr, false);
+            bb->Release();
+        }
+    }
     MenuFrame(dev);
     const RECT* srcRect = PresentExtras(dev);
     HRESULT hr = srcRect ? o_Present(dev, srcRect, nullptr, c, d) : o_Present(dev, a, b, c, d);
@@ -3416,7 +3455,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.9.2 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.9.3 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         ApplySavedToggles();
