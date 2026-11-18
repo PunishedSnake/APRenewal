@@ -4568,7 +4568,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.24.0") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.24.1") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4577,7 +4577,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.24.0", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.24.1", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -6030,12 +6030,36 @@ static BOOL WINAPI hk_SetCursorPos(int x, int y)
     return o_SetCursorPos(x, y);
 }
 
+// What kind of device an IDirectInputDevice8 is (GetCapabilities, vtable 3): the game doesn't necessarily
+// create its mouse with GUID_SysMouse (it can use the instance GUID from an enumeration), so the menu's
+// blocking goes by type. 0x12 = DI8DEVTYPE_MOUSE, 0x13 = DI8DEVTYPE_KEYBOARD.
+static std::unordered_map<void*, BYTE> g_diType;
+static SRWLOCK g_diTypeLock = SRWLOCK_INIT;
+static BYTE DIDevType(void* dev)
+{
+    AcquireSRWLockShared(&g_diTypeLock);
+    auto it = g_diType.find(dev);
+    const int known = it != g_diType.end() ? it->second : -1;
+    ReleaseSRWLockShared(&g_diTypeLock);
+    if (known >= 0) return (BYTE)known;
+    struct { DWORD dwSize, dwFlags, dwDevType, dwAxes, dwButtons, dwPOVs, a, b, c, d, e; } caps = {};
+    caps.dwSize = sizeof caps;
+    BYTE t = 0;
+    if (SUCCEEDED(((HRESULT(STDMETHODCALLTYPE*)(void*, void*))(*(void***)dev)[3])(dev, &caps))) t = (BYTE)(caps.dwDevType & 0xFF);
+    AcquireSRWLockExclusive(&g_diTypeLock);
+    g_diType[dev] = t;
+    ReleaseSRWLockExclusive(&g_diTypeLock);
+    return t;
+}
+static bool DIIsMouse(void* dev) { return dev == g_diMouse || DIDevType(dev) == 0x12; }
+static bool DIIsKeyboard(void* dev) { return dev == g_diKeyboard || DIDevType(dev) == 0x13; }
 static HRESULT STDMETHODCALLTYPE hk_DIGetState(void* self, DWORD cb, void* data)
 {
     auto orig = (PFN_DIGetState)FindOrig(g_vtState, 8, self);
     HRESULT hr = orig ? orig(self, cb, data) : E_FAIL;
     if (SUCCEEDED(hr) && data) {
-        if (self == g_diMouse && cb >= 12) {
+        const bool mouse = DIIsMouse(self), kbd = !mouse && DIIsKeyboard(self);
+        if (mouse && cb >= 12) {
             const LONG* st = (const LONG*)data;
             InterlockedExchangeAdd(&g_miceX, st[0]);
             InterlockedExchangeAdd(&g_miceY, st[1]);
@@ -6045,13 +6069,13 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetState(void* self, DWORD cb, void* data)
             g_haveDIMouse = true;
         }
         if (g_menuOpen) {
-            if (self == g_diMouse) InterlockedIncrement(&g_mdStateMouse);
-            else if (self != g_diKeyboard) {
+            if (mouse) InterlockedIncrement(&g_mdStateMouse);
+            else if (!kbd) {
                 InterlockedIncrement(&g_mdOther);
                 if (cb >= 8 && (((const LONG*)data)[0] || ((const LONG*)data)[1])) InterlockedIncrement(&g_mdOtherMove);
             }
         }
-        if (g_menuOpen && (self == g_diMouse || self == g_diKeyboard)) memset(data, 0, cb);
+        if (g_menuOpen && (mouse || kbd)) memset(data, 0, cb);
     }
     return hr;
 }
@@ -6076,8 +6100,9 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetData(void* self, DWORD cbObj, void* rgd
     if (!orig) return E_FAIL;
     // Menu open: the game reads the mouse buffer in small chunks and stops when it gets nothing back,
     // so a fast mouse would pile up events (slow, laggy cursor). Drain the whole buffer here instead.
-    if (g_menuOpen && self == g_diMouse) InterlockedIncrement(&g_mdDataMouse);
-    if (g_menuOpen && self == g_diMouse && inout && cbObj >= 8 && cbObj <= 64 && !(flags & 1 /*DIGDD_PEEK*/)) {
+    const bool mouse = DIIsMouse(self), kbd = !mouse && DIIsKeyboard(self);
+    if (g_menuOpen && mouse) InterlockedIncrement(&g_mdDataMouse);
+    if (g_menuOpen && mouse && inout && cbObj >= 8 && cbObj <= 64 && !(flags & 1 /*DIGDD_PEEK*/)) {
         BYTE buf[64 * 64];
         for (int guard = 0; guard < 64; guard++) {
             DWORD n = sizeof(buf) / cbObj;
@@ -6091,9 +6116,9 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetData(void* self, DWORD cbObj, void* rgd
     }
     HRESULT hr = orig(self, cbObj, rgdod, inout, flags);
     if (SUCCEEDED(hr) && inout) {
-        if (self == g_diMouse && rgdod && cbObj >= 8) AccumulateMouseData(rgdod, cbObj, *inout);
-        if (g_menuOpen && self != g_diMouse && self != g_diKeyboard && *inout) { InterlockedIncrement(&g_mdOther); InterlockedIncrement(&g_mdOtherMove); }
-        if (g_menuOpen && (self == g_diMouse || self == g_diKeyboard)) *inout = 0;
+        if (mouse && rgdod && cbObj >= 8) AccumulateMouseData(rgdod, cbObj, *inout);
+        if (g_menuOpen && !mouse && !kbd && *inout) { InterlockedIncrement(&g_mdOther); InterlockedIncrement(&g_mdOtherMove); }
+        if (g_menuOpen && (mouse || kbd)) *inout = 0;
     }
     return hr;
 }
@@ -6106,6 +6131,11 @@ static HRESULT STDMETHODCALLTYPE hk_DICreateDevice(void* self, REFGUID guid, voi
     // our controller scan shares DirectInput's vtables: its devices (and the mouse / keyboard objects
     // DirectInput creates while enumerating) must not replace the game's mouse - that broke the menu's
     // mouse blocking (camera moved with the menu open) and flooded the log every 2 s
+    if (SUCCEEDED(hr) && dev && *dev) {
+        AcquireSRWLockExclusive(&g_diTypeLock);
+        g_diType.erase(*dev);
+        ReleaseSRWLockExclusive(&g_diTypeLock);
+    }
     if (GetCurrentThreadId() == g_padThreadId) return hr;
     if (SUCCEEDED(hr) && dev && *dev) {
         const char* kind = "other";
@@ -6426,7 +6456,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.24.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.24.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -7293,7 +7323,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.24.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.24.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

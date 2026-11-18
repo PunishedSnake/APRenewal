@@ -14,7 +14,7 @@ def props(p, b, o):
         if nm == 'None': return out, o
         tn = p.names[struct.unpack_from('<i', b, o)[0]]; o += 8
         sz, ai = struct.unpack_from('<ii', b, o); o += 8
-        if tn == 'BoolProperty': v = b[o]; o += 1
+        if tn == 'BoolProperty': v = b[o]; o += 4          # UBOOL: 4 bytes in this engine version
         elif tn == 'ByteProperty': v = p.names[struct.unpack_from('<i', b, o)[0]] if sz == 8 else b[o]; o += sz
         elif tn == 'StructProperty': o += 8; v = b[o:o + sz]; o += sz
         elif tn == 'IntProperty': v = struct.unpack_from('<i', b, o)[0]; o += sz

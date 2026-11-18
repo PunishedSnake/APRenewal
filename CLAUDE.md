@@ -77,6 +77,11 @@ README = current feature list only (no changelog). These notes = current knowled
   g_diMouse every 2 s → menu didn't blank the real mouse → camera moved with the menu open).
 - Menu input blocking: WndProc subclass, DI mouse/keyboard GetDeviceState/GetDeviceData blanked (mouse
   buffer drained), XInput zeroed. Menu close logs what the game read while open (`MenuInputReport`).
+  Mice/keyboards are recognised by device TYPE (GetCapabilities dwDevType 0x12 / 0x13, cached per pointer,
+  cache entry dropped on every CreateDevice): the user's 0.22 log showed the game reading its mouse through
+  a device that wasn't created with GUID_SysMouse (0 reads on g_diMouse, ~420/s on an "other" device).
+- Keyboard prompts: the PC (non-gp_) icons in UI_ButtonIcons are blank - the game prints key names as text,
+  which already follows rebinding.
 
 ## UE3 frame structure
 1. Occlusion queries; 2. depth prepass (full-res LDR), HDR fp16 base pass (alpha = linear view depth);
@@ -200,4 +205,4 @@ AO → SSS (2 passes) → SSR → light shafts → grade → SMAA/FXAA → TAA �
 ## Open items
 - PS prompts and UI text scale: built from the user's UI packages, untested in game.
 - 120 fps: user says cutscenes run at 120 and keep the FOV; physics/minigames untested.
-- Menu + mouse: fix for the stolen g_diMouse in 0.21.1 — confirm with the user.
+- Menu + mouse: device-type blocking in 0.24.1 — confirm with the user (menu close log line).
