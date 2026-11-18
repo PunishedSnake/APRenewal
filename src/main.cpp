@@ -54,7 +54,17 @@ static bool    g_ssaa = false;                    // backbuffer larger than the 
 static UINT    g_outW = 0, g_outH = 0;            // window (output) size while supersampling
 static bool    g_hdrUnlocked = false;             // DXVK allowed an fp16 backbuffer
 static bool    g_hdrForced = false;               // we replaced the backbuffer format with fp16
-static volatile bool g_worldEverSeen = false;    // a 3D scene was rendered (intro logos are over)
+static volatile bool g_worldEverSeen = false;
+static IDirect3DTexture9* g_glassMask = nullptr;  // coverage of our window glass this frame (MRT 1)
+static IDirect3DSurface9* g_glassMaskSurf = nullptr;
+static unsigned g_frameNo = 0, g_glassMaskFrame = ~0u;
+static bool g_glassMaskBound = false;
+static void GlassMaskRelease()
+{
+    if (g_glassMaskSurf) { g_glassMaskSurf->Release(); g_glassMaskSurf = nullptr; }
+    if (g_glassMask) { g_glassMask->Release(); g_glassMask = nullptr; }
+    g_glassMaskFrame = ~0u;
+}    // a 3D scene was rendered (intro logos are over)
 static char    g_wineVer[64] = "";                // non-empty = running under Wine/Proton
 static bool    g_steamDeck = false;               // Steam sets SteamDeck=1 on the Deck
 static bool    g_hdrActive = false;               // scRGB colour space is set: encode at Present
@@ -95,6 +105,7 @@ struct Config {
     int  aoMaxDist   = 5000;  // world units; AO fades out towards this distance
     int  aoKey       = VK_F10;
     int  aoProtect   = 50;    // highlight protection, percent
+    int  aoGlass     = 100;   // % of AO removed where window glass covers the pixel
     int  aoNear      = 30;    // AO fades in from this camera distance (world units)
     int  aoPrecise   = 1;     // read the game's depth buffer via INTZ (24-bit) instead of HDR alpha
     // in-game menu
@@ -209,6 +220,7 @@ static void LoadConfig()
     cfg.aoMaxDist   = GetPrivateProfileIntA("AO", "MaxDistance", 5000, g_ini);
     cfg.aoKey       = GetPrivateProfileIntA("AO", "ToggleKey", VK_F10, g_ini);
     cfg.aoProtect   = GetPrivateProfileIntA("AO", "ProtectHighlights", 50, g_ini);
+    cfg.aoGlass     = GetPrivateProfileIntA("AO", "BehindGlass", 100, g_ini);
     cfg.aoNear      = GetPrivateProfileIntA("AO", "NearFade", 30, g_ini);
     cfg.aoPrecise   = GetPrivateProfileIntA("AO", "PreciseDepth", 1, g_ini);
     cfg.menuKey     = GetPrivateProfileIntA("Menu", "Key", VK_INSERT, g_ini);
@@ -1318,7 +1330,8 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 static const char* kAOCompositePS = R"HLSL(
 sampler2D sColor : register(s0);
 sampler2D sAO    : register(s1);
-float4 opt : register(c4);        // x = debug view, y = highlight protection 0..1
+sampler2D sGlass : register(s2);  // window glass coverage, written by our glass shader (MRT)
+float4 opt : register(c4);        // x = debug view, y = highlight protection 0..1, z = glass mask strength
 float4 main(float2 uv : TEXCOORD0) : COLOR0
 {
     float3 c = tex2D(sColor, uv).rgb;
@@ -1326,6 +1339,7 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
     if (opt.x > 0.5) return float4(ao, ao, ao, 1);
     float l = dot(c, float3(0.299, 0.587, 0.114));
     ao = lerp(ao, 1, smoothstep(0.65, 1.0, l) * opt.y);   // soft: keeps lamps from greying without popping
+    ao = lerp(ao, 1, saturate(tex2D(sGlass, uv).r) * opt.z); // seen through glass: the glass isn't occluded
     return float4(c * ao, 1);
 }
 )HLSL";
@@ -1658,7 +1672,8 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
             const float tx = tanf((liveFov ? g_gameFov : (float)cfg.aoFov) * 0.5f * 3.14159265f / 180.0f);
             const float c2[4] = { tx, tx * bd.Height / bd.Width, (float)cfg.aoRadius, cfg.aoIntensity / 100.0f };
             const float c3[4] = { 0.2f, (float)cfg.aoMaxDist, cfg.aoMaxDist * 0.6f, (float)bd.Width / bd.Height };
-            const float c4[4] = { g_fx.aoMode == 2 ? 1.0f : 0.0f, cfg.aoProtect / 100.0f, 0, 0 };
+            const bool glassNow = g_glassMask && g_glassMaskFrame == g_frameNo;
+            const float c4[4] = { g_fx.aoMode == 2 ? 1.0f : 0.0f, cfg.aoProtect / 100.0f, glassNow ? cfg.aoGlass / 100.0f : 0.0f, 0 };
             const float c5[4] = { (float)cfg.aoNear, 0, 0, 0 };
             dev->SetPixelShaderConstantF(5, c5, 1);
             const bool precise = g_fx.aoIsGtao && cfg.aoPrecise && g_fx.zcopy && g_fx.zValid && g_fx.fitValid;
@@ -1677,9 +1692,11 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
             DrawFullscreen(dev, g_fx.aoB, sa, g_fx.psAOBlur);                 // blur V -> aoA
             dev->SetPixelShaderConstantF(1, prm, 1);
             dev->SetTexture(1, g_fx.aoA);
+            dev->SetTexture(2, glassNow ? (IDirect3DBaseTexture9*)g_glassMask : nullptr);
             IDirect3DSurface9* o = nextOut(&outTex);
             DrawFullscreen(dev, cur, o, g_fx.psAOComp);                       // color * AO
             dev->SetTexture(1, nullptr);
+            dev->SetTexture(2, nullptr);
             if (outTex) cur = outTex;
         }
         if (doGrade) {
@@ -2978,7 +2995,7 @@ static IDirect3DPixelShader9* BuildSoftShadow(IDirect3DDevice9* dev, GameShader&
 // apTM2: x normal-map strength
 static const char* kGlassBodyHLSL = R"HLSL(
 void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 fog : TEXCOORD4, float3 camv : TEXCOORD6,
-          out float4 OutColor : COLOR0)
+          out float4 OutColor : COLOR0, out float4 OutMask : COLOR1)
 {
     float4 m = tex2D(Texture2D_1, uv);
     float3 a = normalize((tx.xyz - 0.5) * 2);
@@ -3011,6 +3028,7 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
     // a reflection replaces what's seen through the glass: bright reflections add opacity
     alpha = saturate(alpha + dot(mr, float3(0.299, 0.587, 0.114)) * apTM.z * 0.5);
     OutColor = float4(col * fog.w + fog.rgb, alpha);
+    OutMask = float4(1, 1, 1, 1);   // glass coverage for the AO pass (only written when we bind a 2nd target)
 }
 )HLSL";
 
@@ -3278,6 +3296,26 @@ static void PreDraw(IDirect3DDevice9* d)
             { std::max(cfg.glassClarity, 0) / 100.0f, std::max(cfg.glassRefl, 0) / 100.0f, clamp01(cfg.glassFresnel), clamp01(cfg.glassReflContrast) },
             { std::max(cfg.glassBump, 0) / 100.0f, 0, 0, 0 } };
         o_SetPSConstF(d, gs->paramReg, &p[0][0], 2);
+        if (cfg.aoGlass > 0 && cfg.aoEnable) {
+            IDirect3DSurface9* rt = nullptr;
+            if (SUCCEEDED(d->GetRenderTarget(0, &rt)) && rt) {
+                D3DSURFACE_DESC rd; rt->GetDesc(&rd); rt->Release();
+                D3DSURFACE_DESC md = {};
+                if (g_glassMaskSurf) g_glassMaskSurf->GetDesc(&md);
+                if (!g_glassMask || md.Width != rd.Width || md.Height != rd.Height || md.Format != rd.Format) {
+                    GlassMaskRelease();
+                    if (SUCCEEDED(d->CreateTexture(rd.Width, rd.Height, 1, D3DUSAGE_RENDERTARGET, rd.Format, D3DPOOL_DEFAULT, &g_glassMask, nullptr))) {
+                        g_glassMask->GetSurfaceLevel(0, &g_glassMaskSurf);
+                        Log("shaders: glass mask %ux%u (fmt %d) for AO", rd.Width, rd.Height, rd.Format);
+                    } else { g_glassMask = nullptr; Log("shaders: glass mask creation failed - AO stays behind glass"); cfg.aoGlass = 0; }
+                }
+                if (g_glassMaskSurf) {
+                    if (g_glassMaskFrame != g_frameNo) { d->ColorFill(g_glassMaskSurf, nullptr, 0); g_glassMaskFrame = g_frameNo; }
+                    o_SetRT(d, 1, g_glassMaskSurf);
+                    g_glassMaskBound = true;
+                }
+            }
+        }
         return;
     }
     case SK_GLASSDIST: {
@@ -3299,6 +3337,7 @@ static void PreDraw(IDirect3DDevice9* d)
 }
 static void PostDrawRestore(IDirect3DDevice9* d)
 {
+    if (g_glassMaskBound) { o_SetRT(d, 1, nullptr); g_glassMaskBound = false; }
     if (g_preDrawLo < 0) return;
     o_SetPSConstF(d, g_preDrawLo, g_psc[g_preDrawLo], g_preDrawHi - g_preDrawLo + 1);
     g_preDrawLo = g_preDrawHi = -1;
@@ -3359,6 +3398,7 @@ static void HookTraceVtbl(IDirect3DDevice9* dev)
 // Called at every Present (before PostFX). Ends a running trace, starts an armed one.
 static void TraceFrameBoundary(IDirect3DDevice9* dev)
 {
+    g_frameNo++;
     if (g_censusOn) { g_censusOn = false; CensusDump(); }
     if (g_censusArm) { g_censusArm = false; g_census.clear(); g_censusOn = true; }
     const bool key = (GetAsyncKeyState(cfg.toggleKey) & 0x8000) && (GetAsyncKeyState(VK_CONTROL) & 0x8000);
@@ -3942,6 +3982,7 @@ static bool SaveConfig()
     WriteIniInt("AO", "MaxDistance", cfg.aoMaxDist);
     WriteIniInt("AO", "NearFade", cfg.aoNear);
     WriteIniInt("AO", "ProtectHighlights", cfg.aoProtect);
+    WriteIniInt("AO", "BehindGlass", cfg.aoGlass);
     WriteIniInt("AO", "PreciseDepth", cfg.aoPrecise);
     WriteIniInt("Menu", "MouseSpeed", cfg.menuMouse);
     WriteIniInt("Grade", "Enable", cfg.gradeEnable);
@@ -4044,7 +4085,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.14.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.14.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -4167,6 +4208,7 @@ static void DrawMenu()
                 ImGui::SliderInt("Max distance", &cfg.aoMaxDist, 500, 20000, "%d units");
                 ImGui::SliderInt("Near fade", &cfg.aoNear, 0, 200, "%d units");
                 ImGui::SliderInt("Protect highlights", &cfg.aoProtect, 0, 100, "%d %%");
+                ImGui::SliderInt("Hide AO behind glass", &cfg.aoGlass, 0, 100, cfg.aoGlass ? "%d %%" : "off");
                 CheckboxInt("Precise depth (24-bit INTZ, applies at next launch)", &cfg.aoPrecise);
                 ImGui::TextDisabled("Method: %s", g_fx.aoIsGtao ? "GTAO" : "fallback (GTAO shader failed - see log)");
                 ImGui::TextDisabled("Depth source: %s", (g_fx.aoIsGtao && cfg.aoPrecise && g_fx.zcopy && g_fx.fitValid) ? "24-bit depth buffer (calibrated)"
@@ -4535,6 +4577,7 @@ static HRESULT STDMETHODCALLTYPE hk_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARA
     MenuOnReset();
     IntzForget(); g_fx.intz = nullptr;
     g_rt0Scale = 1;
+    GlassMaskRelease();
     g_bbPtr = nullptr; g_curRT = nullptr; g_worldRT = nullptr; g_bbW = g_bbH = 0;
     DumpPP("Reset (game)", pp);
     ApplyPresentParams(pp, nullptr);
@@ -4696,7 +4739,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.14.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.14.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

@@ -182,6 +182,10 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   TextureCube_0 env; refl = env·lum(env) (crushes dim reflections). Distortion accumulate shaders
   3e0261ff / 98160836: refraction scale UniformScalar_1 (c0).
   User: character lighting sliders work but can't fix the probe direction — accepted, not pursued.
+  User (0.14.0): glass tweaks great; soft shadows work perfectly (also very soft).
+- 0.14.1 AO behind glass: glass replacement writes COLOR1 = 1; PreDraw binds g_glassMaskSurf (same
+  size/format as RT0, cleared once per frame via ColorFill, g_frameNo from TraceFrameBoundary) as RT1
+  with o_SetRT, PostDrawRestore unbinds it. AO composite samples it at s2: ao = lerp(ao, 1, mask·c4.z).
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 
