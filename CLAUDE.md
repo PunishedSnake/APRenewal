@@ -17,6 +17,11 @@ README = current feature list only (no changelog). These notes = current knowled
   (git archive), README. Commit as PunishedSnake, push with `git -c push.negotiate=true push`.
 - Default branch `main`; work on a branch, merge by PR (REST API — gh GraphQL is blocked here).
 
+## Shader disk cache
+- CompileBlob checks `Binaries\APRenewal\shadercache\<fnv64(src, profile, compiler, "v1")>.cso` first
+  (DiskBlob = minimal ID3DBlob look-alike, validated by the 0x0000FFFF end token) and stores every new
+  compile. `[Shaders] DiskCache`, menu Diagnostics has Clear cache. Bump the "v1" salt if blob handling changes.
+
 ## HLSL rules (both compilers)
 - `[Shaders] Compiler=auto`: System32 d3dcompiler_47 D3DCompile (flag 1<<12 backwards compat) unless Wine;
   falls back to the game's d3dx9_42 (2009). One critical section around every compile.
@@ -175,6 +180,18 @@ AO → SSS (2 passes) → SSR → light shafts → grade → SMAA/FXAA → TAA �
 - Pads: DualSense (USB, sometimes BT) and Xbox Series X; wants generic support, not tailored.
 - AlphaFixer (winmm.dll) and dixi are replaced; user told to delete them.
 
+## Input / UI (0.23.0)
+- Raw mouse: console `set PlayerInput bEnableMouseSmoothing False` queued per new player controller.
+- Presets (ApplyPreset): Performance / Balanced / Quality (= defaults) / Ultra over the heavy effects.
+- AP's UI is UE3's native UI (UIScenes, not Scaleform). Button prompts: `<Images:UI_ButtonIcons.Generic.*_btn_gen>`,
+  `UI_ButtonIcons.PDA.pda_{bottom,left,right,top}_btn`, `csa_bottom_btn`, `gp_*`; inline font `GamepadKeyFont`.
+  Icons are named by position, so PS prompts = swap those textures (by content hash at SetTexture) when a
+  Sony pad is the active device — needs the UI packages from the user. Subtitles: UIScene HUD_Subtitles
+  (UIStyle text, ETextAutoScaleMode: None/Normal/ResolutionBased) - HUD scale needs those packages too.
+- Shadow filter / contact noise now rotates per frame (apTM.z) so TAA averages it; contact hits need
+  df > 1 + 0.4 % of depth (dotted self-shadow patches near the camera).
+
 ## Open items
-- HUD/subtitle scale (Scaleform canvas RE), 120 fps physics check.
+- PS button prompts + HUD/subtitle scale: waiting for the UI packages.
+- 120 fps: user says cutscenes run at 120 and keep the FOV; physics/minigames untested.
 - Menu + mouse: fix for the stolen g_diMouse in 0.21.1 — confirm with the user.

@@ -67,6 +67,7 @@ Steam Input handles the controller.
 - **Skips the intro logo movies.**
 - **No pop-in:** occlusion culling turned off, longer draw and detail distances.
 - **Developer console** in the menu, including Alpha Protocol's own rendering commands.
+- **Raw mouse:** Unreal's mouse smoothing switched off for direct 1:1 aiming.
 - **Pause on focus loss:** game and dialogue timers stop while you alt-tab. Also keeps the cursor
   inside the window.
 
@@ -84,7 +85,9 @@ Steam Input handles the controller.
   1.25.2. It can be switched live.
 
 ### Tools
-- In-game menu (Insert) with every option live, plus Save / Reload.
+- In-game menu (Insert) with every option live, plus Save / Reload and **quality presets**
+  (Performance / Balanced / Quality / Ultra).
+- **Shader disk cache:** APRenewal's shaders compile once and load instantly on later launches.
 - F11 toggles all post-processing; F10 cycles AO between on, off and a debug view.
 - Ctrl+F11 logs a one-frame render trace. Ctrl+Shift+F11 also saves every render target of that frame.
 - A shader census: each pixel shader of a frame, with its hash and constants.

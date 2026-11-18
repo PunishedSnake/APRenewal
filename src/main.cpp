@@ -132,6 +132,8 @@ struct Config {
     int  shLog      = 1;
     int  shDump     = 0;
     int  shOverride = 1;
+    int  shaderCache = 1;    // compiled shaders cached on disk (APRenewal\shadercache)
+    int  rawMouse   = 1;     // turn off UE3's mouse smoothing (1:1 aim)
     int  compiler   = 0;     // our shaders: 0 auto (Windows' d3dcompiler_47, else the game's), 1 d3dcompiler_47, 2 the game's D3DX
     int  verbose    = 0;
     int  captureFloatDDS = 1;   // save float/16-bit targets losslessly as .dds
@@ -281,6 +283,8 @@ static void LoadConfig()
     cfg.vsync      = (int)GetPrivateProfileIntA("Display", "VSync", -1, g_ini);
     cfg.fpsLimit   = GetPrivateProfileIntA("Display", "FPSLimit", 0, g_ini);
     cfg.shLog      = GetPrivateProfileIntA("Shaders", "LogCompiles", 1, g_ini);
+    cfg.shaderCache = GetPrivateProfileIntA("Shaders", "DiskCache", 1, g_ini) ? 1 : 0;
+    cfg.rawMouse   = GetPrivateProfileIntA("Game", "RawMouse", 1, g_ini) ? 1 : 0;
     cfg.shDump     = GetPrivateProfileIntA("Shaders", "DumpSource", 0, g_ini);
     cfg.shOverride = GetPrivateProfileIntA("Shaders", "Override", 1, g_ini);
     {
@@ -776,6 +780,13 @@ static void ApplyDrawDistance()
     char c[96]; snprintf(c, sizeof c, "set PlayerController LODDistanceFactor %.4f", 100.0f / pct);
     ConQueue(c, false);
 }
+// Raw mouse: UE3's PlayerInput averages mouse movement over recent frames (bEnableMouseSmoothing), which
+// makes aiming feel floaty. SET reaches every PlayerInput (APPlayerInput too) and the class default.
+static void ApplyMouseSmoothing()
+{
+    if (!cfg.console) return;
+    ConQueue(cfg.rawMouse ? "set PlayerInput bEnableMouseSmoothing False" : "set PlayerInput bEnableMouseSmoothing True", false);
+}
 static void __cdecl Con_CapturePC(HookRegs* r)
 {
     void* pc = (void*)r->ecx;
@@ -786,7 +797,7 @@ static void __cdecl Con_CapturePC(HookRegs* r)
     const bool fresh = g_pc != pc;
     if (fresh) Log("console: player controller %p (vtable %p)", pc, vt);
     g_pc = pc; g_pcTick = GetTickCount();
-    if (fresh) ApplyDrawDistance();    // a new level / controller starts with the default factor
+    if (fresh) { ApplyDrawDistance(); ApplyMouseSmoothing(); }   // a new level / controller starts with the defaults
 }
 static void ConRunOne(const char* cmd);
 static void ConRunQueued()
@@ -2147,6 +2158,54 @@ typedef HRESULT (WINAPI *PFN_D3DCompile)(const void*, SIZE_T, const char*, const
 static PFN_D3DCompile g_d3dCompile = nullptr;
 static int g_compilerUsed = -1;                    // 1 = d3dcompiler_47, 2 = the game's D3DX
 static CRITICAL_SECTION g_compileCs;
+// Compiled-shader cache on disk (Binaries\APRenewal\shadercache): APRenewal's own shaders and the
+// rebuilt game shaders compile once, then load instantly on every later launch (no first-frame hitch,
+// no compile during level loads). Keyed by source + profile + compiler, so any change recompiles.
+struct DiskBlob {   // minimal ID3DBlob / ID3DXBuffer look-alike (IUnknown + GetBufferPointer + GetBufferSize)
+    void** vt; LONG refs; std::vector<BYTE> data;
+    static HRESULT WINAPI QI(DiskBlob*, REFIID, void** o) { if (o) *o = nullptr; return E_NOINTERFACE; }
+    static ULONG WINAPI AddRef(DiskBlob* b) { return InterlockedIncrement(&b->refs); }
+    static ULONG WINAPI Release(DiskBlob* b) { const LONG r = InterlockedDecrement(&b->refs); if (!r) delete b; return r; }
+    static void* WINAPI Ptr(DiskBlob* b) { return b->data.data(); }
+    static SIZE_T WINAPI Size(DiskBlob* b) { return b->data.size(); }
+};
+static void* g_diskBlobVt[5] = { (void*)DiskBlob::QI, (void*)DiskBlob::AddRef, (void*)DiskBlob::Release, (void*)DiskBlob::Ptr, (void*)DiskBlob::Size };
+static size_t BufSize(void* b) { return ((SIZE_T(WINAPI*)(void*))(*(void***)b)[4])(b); }
+static long g_cacheHits = 0, g_cacheStores = 0;
+static bool ShaderCachePath(const char* src, const char* profile, int compiler, char* out)
+{
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const char* t) { for (; *t; t++) { h ^= (BYTE)*t; h *= 1099511628211ull; } h ^= 0xFF; h *= 1099511628211ull; };
+    mix(src); mix(profile); mix(compiler == 1 ? "47" : "d3dx42"); mix("v1");
+    char dir[MAX_PATH]; PathJoin(dir, g_dir, "APRenewal\\shadercache");
+    CreateDirectoryA(dir, nullptr);
+    snprintf(out, MAX_PATH, "%s\\%016llx.cso", dir, (unsigned long long)h);
+    return true;
+}
+static void* LoadCachedBlob(const char* path)
+{
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    DWORD n = GetFileSize(f, nullptr), got = 0;
+    DiskBlob* b = nullptr;
+    if (n >= 8 && n < (1u << 22) && n % 4 == 0) {
+        b = new DiskBlob{ g_diskBlobVt, 1, std::vector<BYTE>(n) };
+        if (!ReadFile(f, b->data.data(), n, &got, nullptr) || got != n ||
+            (((const DWORD*)b->data.data())[n / 4 - 1]) != 0x0000FFFF) { delete b; b = nullptr; }   // ends with the end token
+    }
+    CloseHandle(f);
+    return b;
+}
+static void StoreCachedBlob(const char* path, void* blob)
+{
+    char tmp[MAX_PATH]; snprintf(tmp, MAX_PATH, "%s.tmp", path);
+    HANDLE f = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0; const DWORD n = (DWORD)BufSize(blob);
+    const bool ok = WriteFile(f, BufPtr(blob), n, &w, nullptr) && w == n;
+    CloseHandle(f);
+    if (ok && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) g_cacheStores++; else DeleteFileA(tmp);
+}
 static void* CompileBlob(const char* src, const char* profile, const char* name)
 {
     static bool init = false;
@@ -2163,6 +2222,15 @@ static void* CompileBlob(const char* src, const char* profile, const char* name)
     EnterCriticalSection(&g_compileCs);
     void* code = nullptr; void* err = nullptr;
     HRESULT hr = E_FAIL;
+    char cpath[MAX_PATH] = "";
+    if (cfg.shaderCache) {
+        ShaderCachePath(src, profile, g_d3dCompile ? 1 : 2, cpath);
+        if ((code = LoadCachedBlob(cpath))) {
+            if (!g_cacheHits++) Log("compiler: loading APRenewal's shaders from the disk cache (APRenewal\\shadercache)");
+            LeaveCriticalSection(&g_compileCs);
+            return code;
+        }
+    }
     if (g_d3dCompile) {
         // backwards compatibility: accept the legacy D3D9 syntax our sources were written for
         hr = g_d3dCompile(src, strlen(src), name, nullptr, nullptr, "main", profile, 1u << 12, 0, &code, &err);
@@ -2186,6 +2254,7 @@ static void* CompileBlob(const char* src, const char* profile, const char* name)
         } else if (g_compilerUsed < 0) g_compilerUsed = 2;
     }
     if (err) BufRelease(err);
+    if (code && cpath[0]) StoreCachedBlob(cpath, code);
     LeaveCriticalSection(&g_compileCs);
     return code;
 }
@@ -4173,7 +4242,7 @@ void main(float4 ScreenPosition : TEXCOORD0, float2 vp : VPOS, out float4 OutCol
     float4 sp = apMul(p, ScreenToShadowMatrix[0], ScreenToShadowMatrix[1], ScreenToShadowMatrix[2], ScreenToShadowMatrix[3]);
     sp.xy /= sp.w;
     sp.z = min(sp.z, 0.999);
-    float rot = apIGN(vp) * 6.2831853;
+    float rot = apIGN(vp + apTM.z * 5.588238) * 6.2831853;    // apTM.z = frame: the TAA averages the pattern
     float sum = 0;
     [unroll] for (int i = 0; i < NTAPS; i++) {
         float r = sqrt((i + 0.5) / NTAPS);
@@ -4199,7 +4268,7 @@ void main(float4 ScreenPosition : TEXCOORD0, float2 vp : VPOS, out float4 OutCol
         qe /= qe.w;
         float3 dv = float3((qe.x - p.x) / apX[4].x, (qe.y - p.y) / apX[4].y, qe.z - p.z);
         float dz = eps * apX[4].w / max(length(dv), 1e-4) / 8.0;
-        float cj = apIGN(vp + float2(17, 31));
+        float cj = apIGN(vp + float2(17, 31) + apTM.z * 5.588238);
         float occ = 0;
         [unroll] for (int ci = 0; ci < 8; ci++) {
             float4 q = apMul(h0 - float4(0, 0, dz * (ci + cj), 0), apX[0], apX[1], apX[2], apX[3]);
@@ -4207,7 +4276,7 @@ void main(float4 ScreenPosition : TEXCOORD0, float2 vp : VPOS, out float4 OutCol
             float2 cuv = q.xy / max(q.z, 1) * ScreenPositionScaleBias.xy + ScreenPositionScaleBias.wz;
             float sd = tex2Dlod(SceneColorTexture, float4(cuv, 0, 0)).a;
             float df = q.z - sd;
-            occ = max(occ, step(1.0, df) * step(df, apX[5].x) * step(1, q.z) * (1 - ci / 12.0));
+            occ = max(occ, step(1.0 + 0.004 * q.z, df) * step(df, apX[5].x) * step(1, q.z) * (1 - ci / 12.0));
         }
         cov *= 1 - occ * apX[4].z;
     }
@@ -4482,7 +4551,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.22.0") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.23.0") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4491,7 +4560,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.22.0", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.23.0", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -5038,7 +5107,9 @@ static void PreDraw(IDirect3DDevice9* d)
                 o_SetPS(d, ps);     // re-bound before every draw: the game believes its own shader is set
                 const float mapPx = (float)(g_shadowBig ? g_shadowBig : (g_shadowSize ? g_shadowSize : 2048));
                 const float base  = (float)(g_shadowSize ? g_shadowSize : 2048);
-                const float r[4] = { std::max(cfg.shadowRadius, 1) / 10.0f / base, mapPx, 0, 0 };
+                static unsigned shFrame = 0; static unsigned shLastFrame = ~0u;
+                if (shLastFrame != g_frameNo) { shLastFrame = g_frameNo; shFrame = (shFrame + 1) % 64; }
+                const float r[4] = { std::max(cfg.shadowRadius, 1) / 10.0f / base, mapPx, (float)shFrame, 0 };
                 o_SetPSConstF(d, gs->paramReg, r, 1);
                 if (gs->paramReg + 16 <= 224) {
                     float x[6][4] = {};
@@ -5635,6 +5706,7 @@ static void CalibrateDepth(IDirect3DDevice9* dev)
 // ==========================================================================
 static volatile bool g_menuOpen = false;
 static void MenuInputReport();
+static void ApplyPreset(int p);
 
 // ---- events from the main thread -> render thread
 struct MenuEv { int type, a, b; };              // 0 = key(vk, down), 1 = char, 2 = wheel(delta)
@@ -5995,6 +6067,8 @@ static bool SaveConfig()
     WriteIniInt("Textures", "Anisotropy", cfg.anisotropy);
     WriteIniInt("Shadows", "ContactShadows", cfg.contactShadows);
     WriteIniInt("Textures", "LodBias", cfg.lodBias);
+    WriteIniInt("Shaders", "DiskCache", cfg.shaderCache);
+    WriteIniInt("Game", "RawMouse", cfg.rawMouse);
     WritePrivateProfileStringA("Shaders", "Compiler", cfg.compiler == 2 ? "game" : cfg.compiler == 1 ? "47" : "auto", g_ini);
     WriteIniInt("Shadows", "Scale", cfg.shadowScale);
     WriteIniInt("Shadows", "Softness", cfg.shadowSoft);
@@ -6169,10 +6243,14 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.22.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.23.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
+            ImGui::TextUnformatted("Preset:"); ImGui::SameLine();
+            static const char* pn[4] = { "Performance", "Balanced", "Quality", "Ultra" };
+            for (int i = 0; i < 4; i++) { if (i) ImGui::SameLine(); if (ImGui::Button(pn[i])) { ApplyPreset(i); MenuNote("Preset applied - Save to keep it. Shadow resolution changes after a restart."); } }
+            ImGui::TextDisabled("Sets the heavier effects at once; fine-tune below. Quality = the defaults.");
             if (ImGui::BeginTabBar("video")) {
             if (ImGui::BeginTabItem("Image")) {
                 bool en = g_fx.enabled;
@@ -6465,6 +6543,8 @@ static void DrawMenu()
             if (ImGui::Button("Apply")) ApplyDrawDistance();
             ImGui::TextDisabled("How far away objects are still drawn and keep their detailed models (100 = game). Applied at");
             ImGui::TextDisabled("every level load; needs the console.");
+            if (CheckboxInt("Raw mouse (no mouse smoothing)", &cfg.rawMouse)) ApplyMouseSmoothing();
+            ImGui::TextDisabled("Turns off Unreal's mouse smoothing for direct 1:1 aiming. Needs the console.");
             ImGui::SeparatorText("Developer console");
             if (!g_conOk) ImGui::TextDisabled("Unavailable (see the log: console:).");
             else {
@@ -6562,6 +6642,16 @@ static void DrawMenu()
             {
                 static const char* cn[] = { "Auto (Windows' d3dcompiler_47)", "d3dcompiler_47", "Game's D3DX (2009)" };
                 if (ImGui::Combo("Shader compiler", &cfg.compiler, cn, 3)) MenuNote("Applies at next launch.");
+                CheckboxInt("Cache compiled shaders on disk (faster start, no hitches)", &cfg.shaderCache);
+                ImGui::SameLine();
+                if (ImGui::Button("Clear cache")) {
+                    char dir[MAX_PATH], pat[MAX_PATH]; PathJoin(dir, g_dir, "APRenewal\\shadercache");
+                    snprintf(pat, MAX_PATH, "%s\\*.cso", dir);
+                    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd); int n = 0;
+                    if (h != INVALID_HANDLE_VALUE) { do { char f[MAX_PATH]; snprintf(f, MAX_PATH, "%s\\%s", dir, fd.cFileName); if (DeleteFileA(f)) n++; } while (FindNextFileA(h, &fd)); FindClose(h); }
+                    char note[96]; snprintf(note, sizeof note, "Removed %d cached shaders.", n); MenuNote(note);
+                }
+                ImGui::TextDisabled("This session: %ld loaded from the cache, %ld compiled and stored.", g_cacheHits, g_cacheStores);
                 ImGui::TextDisabled("Used for APRenewal's own shaders: %s.", g_compilerUsed == 1 ? "d3dcompiler_47" : g_compilerUsed == 2 ? "the game's D3DX" : "none compiled yet");
             }
             if (ImGui::Button("Shader census (one frame)")) { g_censusArm = true; MenuNote("Shader list written to the log (census:)."); }
@@ -6604,6 +6694,24 @@ static void DrawMenu()
     if (!open || ImGui::IsKeyPressed(ImGuiKey_Escape)) { g_menuOpen = false; MenuInputReport(); }
 }
 
+// Quality presets: set the live effects in one go (shadow map resolution applies after a restart)
+static void ApplyPreset(int p)
+{
+    struct P { int shadowScale, shadowFilter, contact, ssr, metalRefl, glassSsr, shafts, bloomModern, bokeh, aaMode, taa, sss, ao, aniso; };
+    static const P k[4] = {
+        { 1, 1,  0, 0,  0,   0,  0,  0, 0, 1, 0,  0, 1,  8 },   // performance
+        { 2, 1, 40, 1, 25, 100, 40, 35, 0, 2, 1, 40, 1, 16 },   // balanced
+        { 2, 2, 60, 1, 25, 100, 60, 35, 1, 2, 1, 40, 1, 16 },   // quality (the defaults)
+        { 4, 3, 70, 1, 35, 100, 60, 45, 1, 2, 1, 50, 1, 16 },   // ultra
+    };
+    const P& v = k[std::min(std::max(p, 0), 3)];
+    cfg.shadowScale = v.shadowScale; cfg.shadowFilter = v.shadowFilter; cfg.contactShadows = v.contact;
+    cfg.ssr = v.ssr; cfg.metalRefl = v.metalRefl; cfg.glassSsr = v.glassSsr; cfg.shafts = v.shafts;
+    cfg.bloomModern = v.bloomModern; cfg.bokeh = v.bokeh; cfg.aaMode = v.aaMode; cfg.fxaa = 1; cfg.taa = v.taa;
+    cfg.sssStrength = v.sss; cfg.aoEnable = v.ao; cfg.anisotropy = v.aniso;
+    static const char* names[4] = { "Performance", "Balanced", "Quality", "Ultra" };
+    Log("menu: preset %s", names[std::min(std::max(p, 0), 3)]);
+}
 static void MenuInputReport()
 {
     Log("menu closed (while open, the game read: mouse state %ld x, mouse buffer %ld x - both blanked; other devices %ld x, "
@@ -6988,7 +7096,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.22.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.23.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();
