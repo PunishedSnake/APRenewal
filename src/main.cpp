@@ -141,7 +141,15 @@ struct Config {
     int  shadowFilter  = 2;   // 0 game's PCF, 1 soft (16 taps), 2 softer (32), 3 smoothest (48)
     int  shadowRadius  = 25;  // soft filter radius in 1/10 texels of the game's 2048 map
     int  charEven      = 0;   // % flattening of the character/dynamic-object lighting (dark side lifted)
-    int  charFill      = 0;   // % extra ambient on characters/dynamic objects   // HDR on native Windows (never got above SDR white there)
+    int  charFill      = 0;   // % extra ambient on characters/dynamic objects
+    // window glass (the game's two glass materials, replaced; 100 = the game's look)
+    int  glassEnable   = 1;
+    int  glassClarity  = 65;  // % of the game's opacity
+    int  glassRefl     = 160; // % reflection strength
+    int  glassFresnel  = 70;  // % angle-dependent reflection (more at grazing angles)
+    int  glassReflContrast = 30;  // % of the game's luminance weighting that crushes dim reflections
+    int  glassBump     = 100; // % normal-map strength
+    int  glassRefract  = 100; // % refraction (distortion) strength   // HDR on native Windows (never got above SDR white there)
     int  hdrPaper      = 200;   // nits for UI / SDR white
     int  hdrPeak       = 0;     // nits, 0 = what the display reports
     int  hdrHighlights = 100;   // percent highlight expansion
@@ -247,6 +255,13 @@ static void LoadConfig()
     cfg.shadowRadius  = GetPrivateProfileIntA("Shadows", "Radius", 25, g_ini);
     cfg.charEven      = GetPrivateProfileIntA("Lighting", "CharacterEven", 0, g_ini);
     cfg.charFill      = GetPrivateProfileIntA("Lighting", "CharacterFill", 0, g_ini);
+    cfg.glassEnable   = GetPrivateProfileIntA("Glass", "Enable", 1, g_ini) ? 1 : 0;
+    cfg.glassClarity  = GetPrivateProfileIntA("Glass", "Opacity", 65, g_ini);
+    cfg.glassRefl     = GetPrivateProfileIntA("Glass", "Reflection", 160, g_ini);
+    cfg.glassFresnel  = GetPrivateProfileIntA("Glass", "Fresnel", 70, g_ini);
+    cfg.glassReflContrast = GetPrivateProfileIntA("Glass", "ReflectionContrast", 30, g_ini);
+    cfg.glassBump     = GetPrivateProfileIntA("Glass", "Bump", 100, g_ini);
+    cfg.glassRefract  = GetPrivateProfileIntA("Glass", "Refraction", 100, g_ini);
     cfg.hdrPaper      = GetPrivateProfileIntA("HDR", "PaperWhite", 0, g_ini);   // 0 = Windows' SDR content brightness
     cfg.hdrCurve      = GetPrivateProfileIntA("HDR", "Curve", 0, g_ini) ? 1 : 0;
     cfg.hdrCompensate = GetPrivateProfileIntA("HDR", "CompensateSRGB", 0, g_ini) ? 1 : 0;
@@ -2484,6 +2499,7 @@ static void SetSegSurf(IDirect3DSurface9* s)
 // buffer are created Scale x larger and every viewport / scissor / clear rect set while it is bound
 // is scaled to match. The game's shadow UVs are normalised, so sampling needs no change.
 static UINT g_shadowSize = 0, g_shadowBig = 0;   // the game's size and ours
+static int  g_shScaleRun = 1;                    // scale fixed at device creation (menu changes apply next launch)
 static int  g_rt0Scale = 1;                      // RT0 is the enlarged shadow map
 static bool IsDepthFmt(D3DFORMAT f)
 {
@@ -2494,7 +2510,7 @@ static bool IsDepthFmt(D3DFORMAT f)
 // a square shadow-sized resource we should enlarge
 static bool ShadowCandidate(UINT w, UINT h, D3DFORMAT f, bool rt, bool ds)
 {
-    if (cfg.shadowScale <= 1 || g_inPostFX || w != h || w < 512 || w > 4096) return false;
+    if (g_shScaleRun <= 1 || g_inPostFX || w != h || w < 512 || w > 4096) return false;
     if (rt && f == D3DFMT_R32F) {
         if (!g_shadowSize) g_shadowSize = w;
         return w == g_shadowSize;
@@ -2510,7 +2526,7 @@ static HRESULT STDMETHODCALLTYPE hk_CreateTexture(IDirect3DDevice9* d, UINT w, U
 {
     if (!sh && pool == D3DPOOL_DEFAULT &&
         ShadowCandidate(w, h, f, (usage & D3DUSAGE_RENDERTARGET) != 0, (usage & D3DUSAGE_DEPTHSTENCIL) != 0)) {
-        const UINT k = (UINT)cfg.shadowScale;
+        const UINT k = (UINT)g_shScaleRun;
         HRESULT hr = o_CreateTexture(d, w * k, h * k, lv, usage, f, pool, out, sh);
         if (SUCCEEDED(hr)) {
             if (f == D3DFMT_R32F) g_shadowBig = w * k;
@@ -2518,7 +2534,7 @@ static HRESULT STDMETHODCALLTYPE hk_CreateTexture(IDirect3DDevice9* d, UINT w, U
             return hr;
         }
         Log("shadow: %ux%u at %ux scale failed (0x%08lx) - normal size", w, h, k, hr);
-        if (f == D3DFMT_R32F) cfg.shadowScale = 1;
+        if (f == D3DFMT_R32F) g_shScaleRun = 1;
     }
     return o_CreateTexture(d, w, h, lv, usage, f, pool, out, sh);
 }
@@ -2577,7 +2593,7 @@ static HRESULT STDMETHODCALLTYPE hk_SetRT(IDirect3DDevice9* d, DWORD idx, IDirec
 {
     if (idx == 0) {
         const int was = g_rt0Scale;
-        g_rt0Scale = IsBigShadow(s) ? cfg.shadowScale : 1;
+        g_rt0Scale = IsBigShadow(s) ? g_shScaleRun : 1;
         static bool logged = false;
         if (g_rt0Scale > 1 && was == 1 && !logged) { logged = true; Log("shadow: rendering into the %ux%u shadow map", g_shadowBig, g_shadowBig); }
     }
@@ -2649,7 +2665,7 @@ static void STDMETHODCALLTYPE hk_SetGammaRamp(IDirect3DDevice9* d, UINT sc, DWOR
 // by constant names at CreatePixelShader, and either swap in our own version (compiled with the
 // exact same registers) at SetPixelShader, or adjust their constants around each draw.
 // --------------------------------------------------------------------------
-struct CtabConst { std::string name; int set; int reg; int count; };   // set: 0 bool 1 int 2 float 3 sampler
+struct CtabConst { std::string name; int set; int reg; int count; int type = 0; };   // type: D3DXPT_* (14 = cube sampler)   // set: 0 bool 1 int 2 float 3 sampler
 static bool ParseCtab(const DWORD* code, std::vector<CtabConst>& out)
 {
     if (!code || (code[0] & 0xFFFF0000) != 0xFFFF0000) return false;
@@ -2668,6 +2684,8 @@ static bool ParseCtab(const DWORD* code, std::vector<CtabConst>& out)
                 k.set   = *(const WORD*)(e + 4);
                 k.reg   = *(const WORD*)(e + 6);
                 k.count = *(const WORD*)(e + 8);
+                const DWORD ti = *(const DWORD*)(e + 12);
+                if (ti && ti + 4 <= (len - 1) * 4) k.type = *(const WORD*)(c + ti + 2);
                 out.push_back(k);
             }
             return true;
@@ -2682,7 +2700,8 @@ static const CtabConst* CtabFind(const std::vector<CtabConst>& v, const char* na
     return nullptr;
 }
 
-enum { SK_BLEND_BLOOM = 1, SK_BLEND_DOF = 2, SK_SHADOW = 3, SK_FOG = 4, SK_MBLUR = 5, SK_BLOOMGATHER = 6, SK_CHARLIGHT = 7, SK_COUNT = 8 };
+enum { SK_BLEND_BLOOM = 1, SK_BLEND_DOF = 2, SK_SHADOW = 3, SK_FOG = 4, SK_MBLUR = 5, SK_BLOOMGATHER = 6, SK_CHARLIGHT = 7,
+       SK_GLASS = 8, SK_GLASSDIST = 9, SK_COUNT = 10 };
 struct GameShader {
     int kind = 0;
     IDirect3DPixelShader9* repl = nullptr;   // our replacement (blend shaders)
@@ -2702,6 +2721,7 @@ struct GameShader {
     // character / dynamic object lighting
     int shReg[7] = { -1, -1, -1, -1, -1, -1, -1 };   // c_SHCoefficients_Ar Ag Ab Br Bg Bb Cc
     int skyUpReg = -1, skyLoReg = -1, ambReg = -1;
+    int distReg = -1;                        // glass refraction: UniformScalar_1 (normal offset scale)
     int uses = 0;
 };
 static std::unordered_map<IDirect3DPixelShader9*, GameShader> g_gameShaders;
@@ -2827,7 +2847,8 @@ static IDirect3DPixelShader9* BuildReplacement(IDirect3DDevice9* dev, const std:
     int maxC = -1;
     char line[160];
     for (auto& k : ct) {
-        if (k.set == 3) snprintf(line, sizeof line, "sampler2D %s : register(s%d);\n", k.name.c_str(), k.reg);
+        if (k.set == 3) snprintf(line, sizeof line, "%s %s : register(s%d);\n", k.type == 14 ? "samplerCUBE" : k.type == 13 ? "sampler3D" : "sampler2D",
+                                 k.name.c_str(), k.reg);
         else if (k.set == 2) {
             if (k.count > 1) snprintf(line, sizeof line, "float4 %s[%d] : register(c%d);\n", k.name.c_str(), k.count, k.reg);
             else snprintf(line, sizeof line, "float4 %s : register(c%d);\n", k.name.c_str(), k.reg);
@@ -2873,7 +2894,8 @@ static IDirect3DPixelShader9* BuildReplacement(IDirect3DDevice9* dev, const std:
 // variants), CLAMPUV. apTM.x = radius in shadow-map UV.
 static const char* kShadowCommonHLSL = R"HLSL(
 float apIGN(float2 p) { return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715)))); }
-float4 apMul(float4 v, float4 m0, float4 m1, float4 m2, float4 m3) { return float4(dot(v, m0), dot(v, m1), dot(v, m2), dot(v, m3)); }
+// UE3 compiles with row-major packing: register i = matrix row i, and mul(v, M) = sum v_i * row_i
+float4 apMul(float4 v, float4 m0, float4 m1, float4 m2, float4 m3) { return v.x * m0 + v.y * m1 + v.z * m2 + v.w * m3; }
 float apTap(float2 uv, float z)
 {
 #if CLAMPUV
@@ -2948,6 +2970,72 @@ static IDirect3DPixelShader9* BuildSoftShadow(IDirect3DDevice9* dev, GameShader&
     return ps;
 }
 
+// Window glass. The game's two glass materials (found with the census, identified by bytecode hash)
+// rebuilt from their disassembly: normal-mapped cubemap reflection masked by Texture2D_1.x, opacity
+// Texture2D_1.w x APTranslucentOpacity, tint UniformVector_0, diffuse Texture2D_2 x ambient, fog.
+// The "fresnel" one also has pow(1 - N.V, UniformScalar_2) between UniformScalar_4 and _3.
+// apTM: x opacity scale, y reflection strength, z our Fresnel amount, w game's luminance weighting
+// apTM2: x normal-map strength
+static const char* kGlassBodyHLSL = R"HLSL(
+void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 fog : TEXCOORD4, float3 camv : TEXCOORD6,
+          out float4 OutColor : COLOR0)
+{
+    float4 m = tex2D(Texture2D_1, uv);
+    float3 a = normalize((tx.xyz - 0.5) * 2);
+    float3 b = normalize((tz - 0.5) * 2);
+    float3 bin = normalize(((tx.w - 0.5) * 2) * cross(a, b));
+    float3 n = tex2D(Texture2D_0, uv).xyz * 2 - 1;
+    n.xy *= UniformScalar_1.x * apTM2.x;
+    n = normalize(n);
+    float3 V = normalize(camv);
+    float ndv = dot(n, V);
+    float3 R = 2 * ndv * n - V;
+    float3 L = R.x * b + R.y * bin + R.z * a;
+    float3 W = L.x * LocalToWorldMatrix[0].xyz + L.y * LocalToWorldMatrix[1].xyz + L.z * LocalToWorldMatrix[2].xyz;
+    float3 env = texCUBE(TextureCube_0, W).rgb;
+#if GAMEFRESNEL
+    float p = 0.9999 - ndv >= 0 ? pow(max(1 - ndv, 1e-4), UniformScalar_2.x) : 0;
+    env *= p * (UniformScalar_3.x - UniformScalar_4.x) + UniformScalar_4.x;
+#endif
+    float lum = dot(env, float3(0.299, 0.587, 0.114));
+    float3 refl = env * lerp(1, lum, apTM.w);
+    // angle-dependent reflection: weaker head-on, much stronger at grazing angles (Schlick-like)
+    float fr = pow(saturate(1 - abs(ndv)), 4);
+    refl *= apTM.y * lerp(1, 0.35 + 2.5 * fr, apTM.z);
+    float mask = m.x;
+    float3 mr = mask * refl;
+    float3 emis = mr + UniformVector_0.rgb;
+    float3 dif = (tex2D(Texture2D_2, uv).rgb * (1 - mr) + mr) * (1 - UniformVector_0.rgb);
+    float3 col = dif * AmbientColorAndSkyFactor.rgb + emis;
+    float alpha = m.w * APTranslucentOpacity.x * apTM.x;
+    // a reflection replaces what's seen through the glass: bright reflections add opacity
+    alpha = saturate(alpha + dot(mr, float3(0.299, 0.587, 0.114)) * apTM.z * 0.5);
+    OutColor = float4(col * fog.w + fog.rgb, alpha);
+}
+)HLSL";
+
+static uint32_t ShaderHash(const DWORD* code, UINT* lenOut = nullptr)
+{
+    const DWORD* t = code + 1;
+    for (int guard = 0; guard < 1 << 20; guard++) {
+        const DWORD tok = *t;
+        if (tok == 0x0000FFFF) { t++; break; }
+        if ((tok & 0xFFFF) == 0xFFFE) t += 1 + ((tok >> 16) & 0x7FFF);
+        else t += 1 + ((tok >> 24) & 0xF);
+    }
+    const UINT len = (UINT)((const BYTE*)t - (const BYTE*)code);
+    uint32_t h = 2166136261u;
+    for (UINT i = 0; i < len; i++) { h ^= ((const BYTE*)code)[i]; h *= 16777619u; }
+    if (lenOut) *lenOut = len;
+    return h;
+}
+static bool ReplActive(const GameShader* gs)
+{
+    if (!gs || !gs->repl) return false;
+    if (gs->kind == SK_GLASS) return cfg.glassEnable != 0;
+    return cfg.fxBlend != 0;
+}
+
 // Shader census: one frame's pixel shaders with draw counts and constant names (Diagnostics).
 static volatile bool g_censusArm = false;
 static bool g_censusOn = false;
@@ -2983,7 +3071,18 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
     std::vector<CtabConst> ct;
     if (!ParseCtab(fn, ct)) return hr;
     GameShader gs;
-    if (CtabFind(ct, "HSBContrast") && CtabFind(ct, "GammaColorScaleAndInverse") && CtabFind(ct, "LensFilterImage") &&
+    const uint32_t hash = ShaderHash(fn);
+    if (hash == 0xcb2f41c2u || hash == 0x23836016u) {
+        const bool fres = hash == 0x23836016u;
+        gs.kind = SK_GLASS;
+        gs.repl = BuildReplacement(d, ct, kGlassBodyHLSL, gs.paramReg, fres ? "window glass (fresnel)" : "window glass", "",
+                                   fres ? "#define GAMEFRESNEL 1\n" : "#define GAMEFRESNEL 0\n");
+        if (!gs.repl) g_shReplFail++;
+        Log("shaders: window glass material %08x recognised - %s", hash, gs.repl ? "improved version ready" : "replacement FAILED, game shader kept");
+    } else if (hash == 0x3e0261ffu || hash == 0x98160836u) {
+        gs.kind = SK_GLASSDIST;
+        if (auto k = CtabFind(ct, "UniformScalar_1")) gs.distReg = k->reg;
+    } else if (CtabFind(ct, "HSBContrast") && CtabFind(ct, "GammaColorScaleAndInverse") && CtabFind(ct, "LensFilterImage") &&
         CtabFind(ct, "SceneColorTexture") && CtabFind(ct, "FilterColor")) {
         const bool dof = CtabFind(ct, "NewDOF_noBleedBlurMap") && CtabFind(ct, "NewDOF_bleedBlurMap") &&
                          CtabFind(ct, "PackedParameters") && CtabFind(ct, "MinMaxBlurClamp") &&
@@ -3032,7 +3131,7 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
     (*out)->AddRef();   // keep the game's shader alive so its pointer is never reused for another one
     g_gameShaders[*out] = gs;
     g_shCount[gs.kind]++;
-    static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather", "character lighting" };
+    static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather", "character lighting", "window glass", "glass refraction" };
     if (gs.kind >= SK_FOG && gs.kind != SK_CHARLIGHT) Log("shaders: %s recognised (%p)", kn[gs.kind], (void*)*out);
     return hr;
 }
@@ -3065,7 +3164,7 @@ static void PreDraw(IDirect3DDevice9* d)
     if (!gs || g_inPostFX || !o_SetPSConstF) return;
     g_preDrawDev = d;
     if (!gs->uses++) {
-        static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather", "character lighting" };
+        static const char* kn[SK_COUNT] = { "", "final blend", "final blend (DOF)", "shadow projection", "height fog", "motion blur / edge AA", "bloom gather", "character lighting", "window glass", "glass refraction" };
         if (gs->kind != SK_CHARLIGHT || !g_shUsed[SK_CHARLIGHT]) Log("shaders: %s %p in use", kn[gs->kind], (void*)gs);
         g_shUsed[gs->kind]++;
     }
@@ -3104,8 +3203,8 @@ static void PreDraw(IDirect3DDevice9* d)
                 return;
             }
         }
-        if (!g_shadowBig || !g_shadowSize || cfg.shadowScale <= 1) return;
-        const float k = (float)cfg.shadowScale;
+        if (!g_shadowBig || !g_shadowSize || g_shScaleRun <= 1) return;
+        const float k = (float)g_shScaleRun;
         const float f = (1.0f / k) + (1.0f - 1.0f / k) * clamp01(cfg.shadowSoft);
         float tmp[64][4];
         for (int i = 0; i < 3; i++) {
@@ -3173,6 +3272,21 @@ static void PreDraw(IDirect3DDevice9* d)
         }
         return;
     }
+    case SK_GLASS: {
+        if (!ReplActive(gs) || gs->paramReg < 0 || gs->paramReg > 253) return;
+        const float p[2][4] = {
+            { std::max(cfg.glassClarity, 0) / 100.0f, std::max(cfg.glassRefl, 0) / 100.0f, clamp01(cfg.glassFresnel), clamp01(cfg.glassReflContrast) },
+            { std::max(cfg.glassBump, 0) / 100.0f, 0, 0, 0 } };
+        o_SetPSConstF(d, gs->paramReg, &p[0][0], 2);
+        return;
+    }
+    case SK_GLASSDIST: {
+        if (cfg.glassRefract == 100 || gs->distReg < 0) return;
+        const float* o = g_psc[gs->distReg];
+        const float v[4] = { o[0] * std::max(cfg.glassRefract, 0) / 100.0f, o[1], o[2], o[3] };
+        PdSet(gs->distReg, v);
+        return;
+    }
     case SK_BLOOMGATHER: {
         if (cfg.bloomThreshold == 0 || gs->bloomThrReg < 0) return;
         const float* o = g_psc[gs->bloomThrReg];
@@ -3212,7 +3326,7 @@ static HRESULT STDMETHODCALLTYPE hk_SetPS(IDirect3DDevice9* d, IDirect3DPixelSha
         auto it = g_gameShaders.find(ps);
         if (it != g_gameShaders.end()) {
             g_curGS = &it->second;
-            if (g_curGS->repl && BlendReplaced()) return o_SetPS(d, g_curGS->repl);
+            if (ReplActive(g_curGS)) return o_SetPS(d, g_curGS->repl);
         }
     }
     return o_SetPS(d, ps);
@@ -3224,7 +3338,8 @@ static void HookTraceVtbl(IDirect3DDevice9* dev)
     if ((p = PatchVtbl(dev, 34, (void*)hk_StretchRect))) o_StretchRect = (PFN_StretchRect)p;
     if ((p = PatchVtbl(dev, 37, (void*)hk_SetRT)))       o_SetRT = (PFN_SetRT)p;
     if ((p = PatchVtbl(dev, 43, (void*)hk_Clear)))       o_Clear = (PFN_Clear)p;
-    if (cfg.shadowScale > 1) {
+    g_shScaleRun = cfg.shadowScale;
+    if (g_shScaleRun > 1) {
         if ((p = PatchVtbl(dev, 23, (void*)hk_CreateTexture))) o_CreateTexture = (PFN_CreateTexture)p;
         if ((p = PatchVtbl(dev, 47, (void*)hk_SetViewport)))   o_SetViewport = (PFN_SetViewport)p;
         if ((p = PatchVtbl(dev, 48, (void*)hk_GetViewport)))   o_GetViewport = (PFN_GetViewport)p;
@@ -3310,7 +3425,7 @@ static HRESULT STDMETHODCALLTYPE hk_CreateDS(IDirect3DDevice9* dev, UINT w, UINT
 {
     const D3DFORMAT INTZ = (D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z');
     if (out && !shared && ms == D3DMULTISAMPLE_NONE && ShadowCandidate(w, h, fmt, false, true)) {
-        const UINT k = (UINT)cfg.shadowScale;
+        const UINT k = (UINT)g_shScaleRun;
         HRESULT hr = o_CreateDS(dev, w * k, h * k, fmt, ms, msq, discard, out, shared);
         if (SUCCEEDED(hr)) { Log("shadow: depth buffer %ux%u (fmt %d) created at %ux%u", w, h, fmt, w * k, h * k); return hr; }
     }
@@ -3804,6 +3919,13 @@ static bool SaveConfig()
     WriteIniInt("Shadows", "Radius", cfg.shadowRadius);
     WriteIniInt("Lighting", "CharacterEven", cfg.charEven);
     WriteIniInt("Lighting", "CharacterFill", cfg.charFill);
+    WriteIniInt("Glass", "Enable", cfg.glassEnable);
+    WriteIniInt("Glass", "Opacity", cfg.glassClarity);
+    WriteIniInt("Glass", "Reflection", cfg.glassRefl);
+    WriteIniInt("Glass", "Fresnel", cfg.glassFresnel);
+    WriteIniInt("Glass", "ReflectionContrast", cfg.glassReflContrast);
+    WriteIniInt("Glass", "Bump", cfg.glassBump);
+    WriteIniInt("Glass", "Refraction", cfg.glassRefract);
     WriteIniInt("Display", "VSync", cfg.vsync);
     WriteIniInt("Display", "FPSLimit", cfg.fpsLimit);
     WriteIniInt("Focus", "PauseOnFocusLoss", cfg.pauseOnFocusLoss);
@@ -3922,7 +4044,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.13.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.14.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -3999,7 +4121,19 @@ static void DrawMenu()
                 ImGui::TextDisabled("The game's edge AA blurs along edges; with FXAA on you may prefer it lower.");
                 if (ImGui::Button("Game defaults")) { cfg.bloomIntensity = 100; cfg.bloomThreshold = 0; cfg.dofStrength = 100; cfg.fogDensity = 100;
                                                        cfg.motionBlur = 100; cfg.edgeAA = 100; cfg.gameSharpen = 100; }
-                if (!cfg.fxBlend) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Bloom and DOF tuning need \"Use APRenewal's final pass\" (Colour tab).");
+                ImGui::SeparatorText("Window glass");
+            CheckboxInt("Improved glass", &cfg.glassEnable);
+            ImGui::SliderInt("Glass opacity", &cfg.glassClarity, 10, 150, "%d %%");
+            ImGui::SliderInt("Glass reflections", &cfg.glassRefl, 0, 400, "%d %%");
+            ImGui::SliderInt("Angle-dependent reflections", &cfg.glassFresnel, 0, 100, "%d %%");
+            ImGui::SliderInt("Reflection contrast (game's)", &cfg.glassReflContrast, 0, 100, "%d %%");
+            ImGui::SliderInt("Glass bumpiness", &cfg.glassBump, 0, 300, "%d %%");
+            ImGui::SliderInt("Glass refraction", &cfg.glassRefract, 0, 300, "%d %%");
+            if (ImGui::Button("Game's glass")) { cfg.glassClarity = 100; cfg.glassRefl = 100; cfg.glassFresnel = 0; cfg.glassReflContrast = 100; cfg.glassBump = 100; cfg.glassRefract = 100; }
+            ImGui::SameLine();
+            if (ImGui::Button("APRenewal defaults")) { cfg.glassClarity = 65; cfg.glassRefl = 160; cfg.glassFresnel = 70; cfg.glassReflContrast = 30; cfg.glassBump = 100; cfg.glassRefract = 100; }
+            ImGui::TextDisabled("%d glass material(s) recognised, %d used. Other glass: send a shader census.", g_shCount[SK_GLASS], g_shUsed[SK_GLASS]);
+            if (!cfg.fxBlend) ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Bloom and DOF tuning need \"Use APRenewal's final pass\" (Colour tab).");
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Lighting & shadows")) {
@@ -4010,7 +4144,7 @@ static void DrawMenu()
                 static const char* sh[] = { "1x (game default)", "2x", "4x" };
                 int si = cfg.shadowScale == 4 ? 2 : cfg.shadowScale == 2 ? 1 : 0;
                 if (ImGui::Combo("Shadow resolution", &si, sh, 3)) cfg.shadowScale = si == 2 ? 4 : si == 1 ? 2 : 1;
-                if (cfg.shadowScale > 1 && cfg.shadowFilter == 0) {
+                if (g_shScaleRun > 1 && cfg.shadowFilter == 0) {
                     ImGui::SliderInt("Shadow edge softness", &cfg.shadowSoft, 0, 100, cfg.shadowSoft ? "%d %%" : "sharp (matches the map)");
                     ImGui::TextDisabled("0 = filter sized for the bigger map, 100 = the game's original soft edges. %d shadow shaders adjusted.", g_shCount[SK_SHADOW]);
                 }
@@ -4562,7 +4696,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.13.0 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.14.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

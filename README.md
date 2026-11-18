@@ -1,4 +1,4 @@
-# APRenewal 0.13.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.14.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,17 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.14.0
+- **Window glass** (Video → Effects, `[Glass]`). From the shader census: the game's two glass
+  materials were rebuilt from their bytecode. They squared the reflection's brightness (dim
+  reflections went black) and had no angle dependence, at fixed opacity. Now: clearer glass,
+  stronger reflections, Fresnel-style reflections (weak head-on, strong at grazing angles), bright
+  reflections add opacity like real glass, plus bumpiness and refraction sliders. "Game's glass"
+  button restores the original look.
+- **Shadow fixes**: soft shadows used the wrong matrix layout (UE3 packs matrices row-major), so the
+  shadow landed in the wrong place → disappeared. Fixed. Changing the shadow resolution in the menu
+  no longer breaks shadows until restart (the running scale stays fixed until the next launch).
 
 ## New in 0.13.0
 - **Soft shadows** (Video → Lighting & shadows, `[Shadows] Filter/Radius`). The game's shadow

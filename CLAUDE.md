@@ -169,6 +169,19 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   fill = constant ×(1+f)). 2687 SH + 8786 sky shaders in RefShaderCache.
   Census: Diagnostics button → next frame's PS list (ptr, FNV hash of bytecode, draws, CTAB names).
   Glass: material CTABs only have generic names (UniformVector_N, Texture2D_N) — needs census + hash.
+- 0.14.0: UE3 compiles shaders with ROW-MAJOR matrix packing (disassembly: mad chain x·c18 + y·c19 +
+  z·c20 + c21) — register i = row i, mul(v,M) = Σ v_i·row_i. 0.13.0's dot() version put shadows in
+  the wrong place (user: "filters make it disappear"). Shadow scale used at runtime = g_shScaleRun
+  (fixed at device creation); 0.13.0 used live cfg → 1x/4x in the menu broke the viewport scaling.
+  CtabConst.type from the CTAB type info (14 = samplerCUBE) for generated headers.
+  Glass: census → hashes (FNV-1a of the bytecode, ShaderHash) cb2f41c2 (glass) / 23836016 (glass with
+  Fresnel) in RefShaderCache, unique shapes = the game's glass materials. Disassembled with
+  /tmp/apwork/dis9.py-style decoder: COLOR0 = TangentX (packed, w = sign), COLOR1 = TangentZ,
+  TEXCOORD0 uv, TEXCOORD4 fog (rgb add, w mul), TEXCOORD6 camera vector (tangent space); Texture2D_0
+  normal (xy × UniformScalar_1), Texture2D_1 mask (.x reflection, .w opacity), Texture2D_2 diffuse,
+  TextureCube_0 env; refl = env·lum(env) (crushes dim reflections). Distortion accumulate shaders
+  3e0261ff / 98160836: refraction scale UniformScalar_1 (c0).
+  User: character lighting sliders work but can't fix the probe direction — accepted, not pursued.
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 
