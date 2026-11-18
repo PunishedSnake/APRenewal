@@ -1,0 +1,7 @@
+out/
+obj/
+tools/shadercheck/shtest.c
+tools/shadercheck/shtest.exe
+tools/shadercheck/*.dll
+__pycache__/
+*.zip
