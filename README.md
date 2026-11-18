@@ -1,4 +1,4 @@
-# APRenewal 0.10.1 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.11.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,19 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.11.0 — game shader patching
+APRenewal now recognises the game's own shaders as they load (by the constant names compiled into
+them) and fixes them. Log prefix `shaders:`.
+- **Highlight roll-off** (Colour tab, `[Tonemap]`). The game's final HDR→LDR pass hard-clips
+  everything brighter than white (`saturate`) before its gamma, so lamps, windows and sky turn into
+  flat white blobs. Our version of that pass is the same maths with a smooth shoulder instead of
+  the clip: below the knee nothing changes, above it highlights keep their detail and colour. Both
+  variants are covered (plain bloom, and DOF + bloom + vignette). Toggle it to compare live.
+- **Shadow filter fix** (Game tab, `[Shadows] Softness`). The shadow shaders' sample offsets and
+  buffer size were sized for the 2048 map; with the bigger map they skipped texels (grainy edges).
+  They're now rescaled per draw: 0 = filter matched to the new map (sharp), 100 = the game's soft
+  width.
 
 ## New in 0.10.1
 - Intro skip fixed: the logo movies (`slate_sega`, `slate_obsidian`, `slate_ap`) start *after* the

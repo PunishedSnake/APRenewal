@@ -132,6 +132,26 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   thread. Result FString freed with GMalloc (0x16E8030) vtable +0xC.
 - dis.py must run with `python3 -P` (its name shadows the stdlib `dis` module).
 
+## Shader patching (0.11.0)
+- CreatePixelShader 106 → `ParseCtab` (constant names/registers) → classify. SetPixelShader 107 swaps
+  in our replacement; SetPixelShaderConstantF 109 is mirrored into `g_psc`; `PreDraw` (all 4 draw
+  hooks) feeds our values, `PostDrawRestore` (AfterDraw) puts the game's back.
+- Replacements are generated: a header with every CTAB constant at its original register, then our
+  body; compiled with D3DXCompileShader at runtime and rejected unless our CTAB is a subset of the
+  game's (same set/register). Our own extra constant `apTM` goes to max used c-register + 1.
+  Original shaders are AddRef'd so their pointers are never reused.
+- Final blend (HSBContrast + GammaColorScaleAndInverse + LensFilterImage + FilterColor): plain
+  (AP_BloomBlendPixelShader) and DOF (DOFAndBloomBlendPixelShader Main: NewDOF maps, PackedParameters,
+  vignette, c_finalColorScaleLow). The Epic variant without LensFilterImage is not touched.
+  Original order: scene + bloom(RGBE, ×4) → apApplySaturation → (overlay + c)·scale → saturate →
+  lerp(x, sqrt x, GammaInverseOn) → brightness, PS contrast, x² contrast, colour filter.
+- Shadow projection (ScreenToShadowMatrix + ShadowDepthTexture): SampleOffsets / RefiningSampleOffsets /
+  EdgeSampleOffsets × f, ShadowBufferSize × Scale; f = 1/Scale … 1 by [Shadows] Softness.
+- No offline HLSL compiler works here (Wine segfaults, apt's vkd3d 1.2 has no HLSL): replacement
+  compile errors only show in the user's log (`postfx: final blend compile failed`).
+- Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
+  height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
+
 ## Reverse engineering
 - `docs/apgame-re.md` has the exe findings; `tools/re/apgame_natives.json` maps 2804 UE3 natives
   (`Class::execFunc` → address, Steam exe); `tools/re/dis.py` disassembles with names. Start there.
