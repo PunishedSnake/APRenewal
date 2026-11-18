@@ -1,4 +1,4 @@
-# APRenewal 0.16.2 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.17.0 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -24,6 +24,22 @@ The log goes to `Binaries\APRenewal\APRenewal.log`.
 - HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
   add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
   path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.17.0
+- **Newer shader compiler** (`[Shaders] Compiler`, Diagnostics tab): APRenewal's own shaders are now
+  compiled with Windows' `d3dcompiler_47` (in System32 on Windows 10/11) instead of the game's 2009
+  compiler, which crashed on the glass shader. If it rejects a shader, the old one is tried; under
+  Wine/Proton the old one is used. `compiler:` lines in the log say which.
+- **Reflections, take two**:
+  - Blur that grows with distance (`[Reflections] Roughness`, `[Materials] MetalRoughness`), so
+    floors and metal look glossy instead of mirror-like.
+  - Floors reflect mostly at grazing angles (Fresnel), much less when you look down at them.
+  - Materials named like snow, dirt, grass, carpet, concrete, stone... (1,400+ shaders) are marked
+    rough and don't reflect at all.
+  - Metal: weaker by default (25 %), no more self-reflection bands (the ray starts off the surface,
+    better normals at edges and on small curved objects).
+  - Glass: more steps, refined hits and per-pixel jitter instead of the rings; the reflection is
+    blended in more gently head-on.
 
 ## New in 0.16.2
 - **Fixed the crash when loading a save.** The new glass-reflection shader crashed the game's own

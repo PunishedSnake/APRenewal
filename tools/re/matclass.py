@@ -7,16 +7,17 @@ if len(sys.argv)>1: pass  # edit shadercache.PATH to point at the cache
 def cls(n):
     if re.search(r'skin',n,re.I) and not re.search(r'skinned',n,re.I): return 'skin'
     if re.search(r'^MASTER_Weapon|^MASTER_BasicVehicleWeapon|^AP_Weapon_Master$|^Weapons_MST_MAT$|metal|chrome|steel|^Pipes|Chains|ShellCasing|ShotgunShell|^Shotgun_',n,re.I): return 'metal'
+    if re.search(r'snow|dirt|grass|terrain|sand|mud|carpet|rug|soil|gravel|ground|rock|foliage|leaf|leaves|bush|tree|hedge|plant|cloth|fabric|fur|hair|concrete|asphalt|brick|plaster|stone|ice_|_ice|moss|bark',n,re.I): return 'rough'
     return None
 owners=collections.defaultdict(set)
 for n,g,l in sc.material_maps():
     for st,h in l:
         if st.startswith('TBasePassPixelShader'): owners[h].add(cls(n))
-res={'skin':[],'metal':[]}
+res={'skin':[],'metal':[],'rough':[]}
 for h,s in owners.items():
     if len(s)==1 and next(iter(s)): res[next(iter(s))].append(h)
 print('#pragma once\n#include <cstdint>')
-for k in ('skin','metal'):
+for k in ('skin','metal','rough'):
     v=sorted(res[k]); print('static const uint32_t k%sHashes[%d] = {'%(k.capitalize(),len(v)))
     for i in range(0,len(v),8): print('    '+', '.join('0x%08xu'%h for h in v[i:i+8])+',')
     print('};')

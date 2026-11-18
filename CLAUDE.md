@@ -259,6 +259,18 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   Keep new HLSL for game-thread compiles simple: no loops with break in helper functions.
   A real d3dcompiler_43 is in the Microsoft.DXSDK.D3DX NuGet package, but running it under Wine was
   refused by the permission classifier — ask the user before trying that again.
+- 0.17.0 (user on 0.16.2: no crash, SSR works; snow reflected, metal mirror-like with black bands,
+  glass black rings, wood too reflective, no roughness/blur):
+  - CompileBlob: [Shaders] Compiler=auto|47|game. auto = System32 d3dcompiler_47 D3DCompile (flag
+    ENABLE_BACKWARDS_COMPATIBILITY 1<<12) unless Wine; on failure retries the game's D3DXCompileShader.
+    One critical section around every compile (game worker threads + render thread).
+  - matclass: third class 'rough' (snow|dirt|grass|terrain|carpet|concrete|stone|...; 1443 hashes) →
+    mask .b; SSR floors × (1 − rough). Tag order skin > metal > rough.
+  - kSSRPS: normals pick the neighbour with the smaller depth step per axis; tMin = 2 + 1 % of depth;
+    hits within 3 px of the start rejected; 7-tap rotated disc blur, radius = rough × hit distance /
+    hit depth (c18 = floor, metal roughness × 0.25); floor weight × lerp(0.08, 1, F5), metal × lerp(0.4, 1, F5).
+  - Glass SSR: 16 steps, branch-free 4-step refinement (lastMiss → hit), jitter = IGN of the glass
+    pixel's screen position (apX[10].zw = screen size), SSR mix × lerp(0.4, 1, 4F).
 - Next shader targets: bloom gather (box filter at 1/4 res, AP_BloomGatherPixelShader), DOF gather,
   height fog, motion blur; material shaders (RefShaderCache) are per-material and much harder.
 

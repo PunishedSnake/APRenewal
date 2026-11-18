@@ -120,6 +120,7 @@ struct Config {
     int  shLog      = 1;
     int  shDump     = 0;
     int  shOverride = 1;
+    int  compiler   = 0;     // our shaders: 0 auto (Windows' d3dcompiler_47, else the game's), 1 d3dcompiler_47, 2 the game's D3DX
     int  verbose    = 0;
     int  captureFloatDDS = 1;   // save float/16-bit targets losslessly as .dds
     // focus
@@ -149,7 +150,9 @@ struct Config {
     int  matEnable   = 1;     // tag skin / metal materials (by shader hash) for the effects below
     int  sssStrength = 50;    // % screen-space subsurface scattering on skin
     int  sssWidth    = 100;   // scatter width, % of ~1 cm
-    int  metalRefl   = 50;    // % screen-space reflections on metal (weapons, metal props)
+    int  metalRefl   = 25;    // % screen-space reflections on metal (weapons, metal props)
+    int  ssrRough    = 40;    // % blur of floor reflections (roughness)
+    int  metalRough  = 50;    // % blur of metal reflections
     int  glassSsr    = 100;   // % screen-space reflections on glass (from the previous frame)
     int  bloomModern = 35;    // % of APRenewal's wide HDR bloom added in the final pass
     int  bloomModernThr = 100;// threshold x100 (HDR scene value)
@@ -254,6 +257,11 @@ static void LoadConfig()
     cfg.shLog      = GetPrivateProfileIntA("Shaders", "LogCompiles", 1, g_ini);
     cfg.shDump     = GetPrivateProfileIntA("Shaders", "DumpSource", 0, g_ini);
     cfg.shOverride = GetPrivateProfileIntA("Shaders", "Override", 1, g_ini);
+    {
+        char c[32] = "";
+        GetPrivateProfileStringA("Shaders", "Compiler", "auto", c, sizeof c, g_ini);
+        cfg.compiler = !_stricmp(c, "game") ? 2 : (!_stricmp(c, "47") || !_stricmp(c, "new")) ? 1 : 0;
+    }
     cfg.verbose    = GetPrivateProfileIntA("Debug", "Verbose", 0, g_ini);
     cfg.captureFloatDDS = GetPrivateProfileIntA("Debug", "CaptureFloatDDS", 1, g_ini);
     cfg.pauseOnFocusLoss = GetPrivateProfileIntA("Focus", "PauseOnFocusLoss", 1, g_ini);
@@ -279,7 +287,9 @@ static void LoadConfig()
     cfg.matEnable   = GetPrivateProfileIntA("Materials", "Enable", 1, g_ini) ? 1 : 0;
     cfg.sssStrength = GetPrivateProfileIntA("Materials", "SkinScatter", 50, g_ini);
     cfg.sssWidth    = GetPrivateProfileIntA("Materials", "SkinScatterWidth", 100, g_ini);
-    cfg.metalRefl   = GetPrivateProfileIntA("Materials", "MetalReflections", 50, g_ini);
+    cfg.metalRefl   = GetPrivateProfileIntA("Materials", "MetalReflections", 25, g_ini);
+    cfg.metalRough  = GetPrivateProfileIntA("Materials", "MetalRoughness", 50, g_ini);
+    cfg.ssrRough    = GetPrivateProfileIntA("Reflections", "Roughness", 40, g_ini);
     cfg.glassSsr    = GetPrivateProfileIntA("Glass", "ScreenReflections", 100, g_ini);
     cfg.bloomModern = GetPrivateProfileIntA("Effects", "ModernBloom", 35, g_ini);
     cfg.bloomModernThr = GetPrivateProfileIntA("Effects", "ModernBloomThreshold", 100, g_ini);
@@ -1382,13 +1392,14 @@ float4 main(float2 uv : TEXCOORD0) : COLOR0
 static const char* kSSRPS = R"HLSL(
 sampler2D sColor : register(s0);
 sampler2D sDepth : register(s1);
+sampler2D sMat : register(s2);                   // r skin, g metal, b rough (snow, dirt, carpet... never reflect)
 float4 rcpFrame : register(c0);
 float4 dP  : register(c6);                       // depth source, as in the AO
 float4 sw0 : register(c8);  float4 sw1 : register(c9);  float4 sw2 : register(c10); float4 sw3 : register(c11);
 float4 ws0 : register(c12); float4 ws1 : register(c13); float4 ws2 : register(c14); float4 ws3 : register(c15);
-float4 sp  : register(c16);                      // x strength, y ray length, z thickness, w up threshold
+float4 sp  : register(c16);                      // x floor strength, y ray length, z thickness, w up threshold
 float4 sp2 : register(c17);                      // x metal strength, y material mask valid
-sampler2D sMat : register(s2);                   // r skin, g metal
+float4 sp3 : register(c18);                      // x floor roughness, y metal roughness (blur, in fractions of the ray length)
 float LinD(float2 uv)
 {
     float4 t = tex2Dlod(sDepth, float4(uv, 0, 0));
@@ -1409,23 +1420,31 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR0
     float3 col = tex2Dlod(sColor, float4(uv, 0, 0)).rgb;
     float d = LinD(uv);
     if (d <= 1 || d > 30000) return float4(col, 1);
+    float3 mat = sp2.y > 0.5 ? tex2Dlod(sMat, float4(uv, 0, 0)).rgb : 0;
+    float metal = mat.g, rough = mat.b;
     float3 p = W(uv, d);
     float2 b = rcpFrame.xy;
-    float3 n = normalize(cross(W(uv + float2(b.x, 0), LinD(uv + float2(b.x, 0))) - p,
-                               W(uv + float2(0, b.y), LinD(uv + float2(0, b.y))) - p));
+    // normal from depth: on each axis use the neighbour that continues the surface (smaller step),
+    // so edges and small curved objects don't get a sideways normal
+    float dl = LinD(uv - float2(b.x, 0)), dr = LinD(uv + float2(b.x, 0));
+    float du = LinD(uv - float2(0, b.y)), dd = LinD(uv + float2(0, b.y));
+    float3 ex = abs(dr - d) < abs(d - dl) ? W(uv + float2(b.x, 0), dr) - p : p - W(uv - float2(b.x, 0), dl);
+    float3 ey = abs(dd - d) < abs(d - du) ? W(uv + float2(0, b.y), dd) - p : p - W(uv - float2(0, b.y), du);
+    float3 n = normalize(cross(ex, ey));
     float3 cam = sw3.xyz;
     float3 V = normalize(p - cam);
     if (dot(n, V) > 0) n = -n;
     float up = saturate((n.z - sp.w) / max(1 - sp.w, 1e-3));
-    float metal = sp2.y > 0.5 ? tex2Dlod(sMat, float4(uv, 0, 0)).g : 0;
+    float wf = sp.x * up * (1 - rough);
     float wm = metal * sp2.x;
-    if (up * sp.x <= 0 && wm <= 0) return float4(col, 1);
+    if (wf <= 0 && wm <= 0) return float4(col, 1);
     float3 Rd = reflect(V, n);
     float noise = frac(52.9829189 * frac(dot(vpos, float2(0.06711056, 0.00583715))));
-    float tPrev = 0, tHit = -1;
+    float tMin = 2 + d * 0.01;                      // start a little off the surface: no self-hits
+    float tPrev = tMin, tHit = -1;
     [loop] for (int i = 1; i <= 24; i++) {
         float t = (i - 1 + noise) / 24.0;
-        t = t * t * sp.y;
+        t = tMin + t * t * sp.y;
         float3 s = S(p + Rd * t);
         if (s.x < 0 || s.x > 1 || s.y < 0 || s.y > 1 || s.z <= 1) break;
         float diff = s.z - LinD(s.xy);
@@ -1433,22 +1452,37 @@ float4 main(float2 uv : TEXCOORD0, float2 vpos : VPOS) : COLOR0
         tPrev = t;
     }
     if (tHit < 0) return float4(col, 1);
-    // refine between the last miss and the hit
     float lo = tPrev, hi = tHit;
     [unroll] for (int r = 0; r < 5; r++) {
         float mid = 0.5 * (lo + hi);
-        float3 s = S(p + Rd * mid);
-        if (s.z - LinD(s.xy) > 0) hi = mid; else lo = mid;
+        float3 sm = S(p + Rd * mid);
+        if (sm.z - LinD(sm.xy) > 0) hi = mid; else lo = mid;
     }
     float3 sh = S(p + Rd * hi);
+    if (length((sh.xy - uv) / b) < 3) return float4(col, 1);   // hit right next to the start: the surface itself
+    // glossy blur: a small rotated disc whose size grows with the ray length (rougher = wider)
+    float rough0 = lerp(sp3.x, sp3.y, metal);
+    float rad = rough0 * hi / max(sh.z, 1);
+    rad = min(rad, 0.04);
+    float ang = noise * 6.2831853;
+    float2 cs = float2(cos(ang), sin(ang));
     float3 rc = tex2Dlod(sColor, float4(sh.xy, 0, 0)).rgb;
+    [unroll] for (int k2 = 0; k2 < 6; k2++) {
+        float a2 = k2 * 1.0471976;
+        float2 dir = float2(cs.x * cos(a2) - cs.y * sin(a2), cs.x * sin(a2) + cs.y * cos(a2));
+        float2 o = sh.xy + dir * rad * float2(rcpFrame.x / rcpFrame.y, 1) * (0.5 + 0.5 * frac(k2 * 0.618 + noise));
+        rc += tex2Dlod(sColor, float4(saturate(o), 0, 0)).rgb;
+    }
+    rc /= 7;
     float2 e = min(sh.xy, 1 - sh.xy);
     float edge = saturate(min(e.x, e.y) * 12);
-    float fres = pow(1 - saturate(dot(-V, n)), 3);
-    // metals reflect at every angle and tint the reflection with their own colour
+    float fres = pow(1 - saturate(dot(-V, n)), 5);
+    float fade = 1 - hi / (tMin + sp.y);
+    // metals tint the reflection with their own colour
     float3 tint = saturate(col / max(max(col.r, max(col.g, col.b)), 0.04));
     rc *= lerp(1, lerp(1, tint, 0.7), metal);
-    float amt = max(sp.x * up, wm) * edge * lerp(lerp(0.35, 1.0, fres), 1.0, metal) * (1 - hi / sp.y);
+    // floors: mostly at grazing angles (Fresnel); metal: at every angle but weaker head-on
+    float amt = max(wf * lerp(0.08, 1.0, fres), wm * lerp(0.4, 1.0, fres)) * edge * fade;
     return float4(lerp(col, rc, saturate(amt)), 1);
 }
 )HLSL";
@@ -1760,21 +1794,56 @@ static void ApplySavedToggles()
     g_fx.aoMode  = cfg.aoMode;
 }
 
+// Our shaders can be compiled with Windows' own d3dcompiler_47 (System32, Windows 10+): much newer
+// than the game's 2009 D3DX compiler, which crashed on 0.16.0's glass shader. It still writes SM3
+// bytecode with a constant table, and its ID3DBlob has the same layout as ID3DXBuffer. Under Wine the
+// system d3dcompiler_47 is a reimplementation that rejects some SM3 code, so auto keeps the game's.
+// One lock around every compile: the game creates (and we rebuild) shaders on more than one thread.
+typedef HRESULT (WINAPI *PFN_D3DCompile)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*,
+                                         UINT, UINT, void**, void**);
+static PFN_D3DCompile g_d3dCompile = nullptr;
+static int g_compilerUsed = -1;                    // 1 = d3dcompiler_47, 2 = the game's D3DX
+static CRITICAL_SECTION g_compileCs;
 static void* CompileBlob(const char* src, const char* profile, const char* name)
 {
-    PFN_D3DXCompileShader compile = o_D3DXCompileShader;
-    if (!compile) {
-        HMODULE dx = GetModuleHandleA("d3dx9_42.dll");
-        if (dx) compile = (PFN_D3DXCompileShader)GetProcAddress(dx, "D3DXCompileShader");
+    static bool init = false;
+    if (!init) {
+        init = true;
+        InitializeCriticalSection(&g_compileCs);
+        const bool want47 = cfg.compiler == 1 || (cfg.compiler == 0 && !g_wineVer[0]);
+        if (want47) {
+            char p[MAX_PATH]; GetSystemDirectoryA(p, MAX_PATH); strncat(p, "\\d3dcompiler_47.dll", MAX_PATH - strlen(p) - 1);
+            if (HMODULE m = LoadLibraryA(p)) g_d3dCompile = (PFN_D3DCompile)GetProcAddress(m, "D3DCompile");
+            Log("compiler: %s", g_d3dCompile ? "Windows' d3dcompiler_47 for APRenewal's shaders" : "d3dcompiler_47 not found - using the game's D3DX");
+        } else Log("compiler: the game's D3DX for APRenewal's shaders (%s)", cfg.compiler == 2 ? "Compiler=game" : "Wine");
     }
-    if (!compile) { Log("postfx: D3DXCompileShader unavailable"); return nullptr; }
+    EnterCriticalSection(&g_compileCs);
     void* code = nullptr; void* err = nullptr;
-    HRESULT hr = compile(src, (UINT)strlen(src), nullptr, nullptr, "main", profile, 0, &code, &err, nullptr);
-    if (FAILED(hr) || !code) {
-        Log("postfx: %s compile failed 0x%08lx: %s", name, hr, err ? (const char*)BufPtr(err) : "");
-        if (code) { BufRelease(code); code = nullptr; }
+    HRESULT hr = E_FAIL;
+    if (g_d3dCompile) {
+        // backwards compatibility: accept the legacy D3D9 syntax our sources were written for
+        hr = g_d3dCompile(src, strlen(src), name, nullptr, nullptr, "main", profile, 1u << 12, 0, &code, &err);
+        if (FAILED(hr) || !code) {
+            Log("compiler: d3dcompiler_47 rejected %s (0x%08lx): %s - trying the game's", name, hr, err ? (const char*)BufPtr(err) : "");
+            if (code) { BufRelease(code); code = nullptr; }
+            if (err) { BufRelease(err); err = nullptr; }
+        } else g_compilerUsed = 1;
+    }
+    if (!code) {
+        PFN_D3DXCompileShader compile = o_D3DXCompileShader;
+        if (!compile) {
+            HMODULE dx = GetModuleHandleA("d3dx9_42.dll");
+            if (dx) compile = (PFN_D3DXCompileShader)GetProcAddress(dx, "D3DXCompileShader");
+        }
+        if (!compile) { LeaveCriticalSection(&g_compileCs); Log("postfx: D3DXCompileShader unavailable"); return nullptr; }
+        hr = compile(src, (UINT)strlen(src), nullptr, nullptr, "main", profile, 0, &code, &err, nullptr);
+        if (FAILED(hr) || !code) {
+            Log("postfx: %s compile failed 0x%08lx: %s", name, hr, err ? (const char*)BufPtr(err) : "");
+            if (code) { BufRelease(code); code = nullptr; }
+        } else if (g_compilerUsed < 0) g_compilerUsed = 2;
     }
     if (err) BufRelease(err);
+    LeaveCriticalSection(&g_compileCs);
     return code;
 }
 
@@ -2151,7 +2220,7 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
         if (doSSR) {
             float M[3][3], t[3], A[3][3], cam[3];
             if (VpInverse(g_vp, M, A, t, cam)) {
-                float c[18][4] = {};
+                float c[19][4] = {};
                 c[6][0] = precise ? 1.0f : 0.0f; c[6][1] = g_fx.fitA; c[6][2] = g_fx.fitB;
                 for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) c[8 + i][j] = A[i][j];
                 for (int j = 0; j < 3; j++) c[11][j] = cam[j];
@@ -2161,8 +2230,9 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
                 c[16][2] = 40.0f; c[16][3] = std::min(std::max(cfg.ssrFloor, 0), 99) / 100.0f;
                 dev->SetPixelShaderConstantF(6, c[6], 1);
                 c[17][0] = matOk ? std::max(cfg.metalRefl, 0) / 100.0f : 0.0f; c[17][1] = matOk ? 1.0f : 0.0f;
+                c[18][0] = std::max(cfg.ssrRough, 0) / 100.0f * 0.25f; c[18][1] = std::max(cfg.metalRough, 0) / 100.0f * 0.25f;
                 if (!cfg.ssr || cfg.ssrStrength <= 0) c[16][0] = 0;
-                dev->SetPixelShaderConstantF(8, c[8], 10);
+                dev->SetPixelShaderConstantF(8, c[8], 11);
                 dev->SetTexture(1, precise ? (IDirect3DBaseTexture9*)g_fx.zcopy : g_fx.depth);
                 dev->SetTexture(2, matOk ? (IDirect3DBaseTexture9*)g_matMask : nullptr);
                 IDirect3DSurface9* o = nextOut(&outTex);
@@ -2172,8 +2242,8 @@ static void PostFXRun(IDirect3DDevice9* dev, IDirect3DSurface9* target, bool inS
                 static bool logged = false;
                 if (!logged) { logged = true; Log("postfx: screen-space reflections running (camera at %.0f %.0f %.0f)", c[11][0], c[11][1], c[11][2]); }
             } else {
-                const float off[2][4] = { { 0, 1, 1, 1.5f }, { 0, 0, 0, 0 } };   // threshold above 1, no metal: colour unchanged
-                dev->SetPixelShaderConstantF(16, off[0], 2);
+                const float off[3][4] = { { 0, 1, 1, 1.5f }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };   // threshold above 1, no metal: colour unchanged
+                dev->SetPixelShaderConstantF(16, off[0], 3);
                 IDirect3DSurface9* o = nextOut(&outTex);   // keep the chain intact
                 DrawFullscreen(dev, cur, o, g_fx.psSSR);
                 if (outTex) cur = outTex;
@@ -3535,10 +3605,13 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
         float3 wcv = lcv.x * LocalToWorldMatrix[0].xyz + lcv.y * LocalToWorldMatrix[1].xyz + lcv.z * LocalToWorldMatrix[2].xyz;
         float3 gwp = apX[8].xyz - wcv;
         float3 Rw = normalize(W);
-        float jit = frac(52.9829189 * frac(dot(uv * 1024, float2(0.06711056, 0.00583715))));
-        float alive = 1, found = 0, hitT = 0;
-        [unroll] for (int si = 1; si <= 12; si++) {
-            float st = (si - 1 + jit) / 12.0;
+        // per-pixel jitter from the glass pixel's screen position (apX[10].zw = screen size)
+        float4 gc = gwp.x * apX[0] + gwp.y * apX[1] + gwp.z * apX[2] + apX[3];
+        float2 gpx = float2(gc.x / max(gc.w, 1) * 0.5 + 0.5, 0.5 - gc.y / max(gc.w, 1) * 0.5) * apX[10].zw;
+        float jit = frac(52.9829189 * frac(dot(floor(gpx), float2(0.06711056, 0.00583715))));
+        float alive = 1, found = 0, hitT = 0, lastMiss = 4;
+        [unroll] for (int si = 1; si <= 16; si++) {
+            float st = (si - 1 + jit) / 16.0;
             st = st * st * apX[9].z + 4;
             float3 rp = gwp + Rw * st;
             float4 rc4 = rp.x * apX[0] + rp.y * apX[1] + rp.z * apX[2] + apX[3];
@@ -3550,7 +3623,22 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
             float hit = (1 - found) * alive * step(0, dz) * step(dz, apX[10].x * (1 + rc4.w * 0.002));
             hitT += hit * st;
             found += hit;
+            lastMiss = lerp(lastMiss, st, (1 - found) * alive);
         }
+        // refine between the last miss and the hit (fixed 4 halvings, no branches)
+        float rlo = lastMiss, rhi = max(hitT, lastMiss);
+        [unroll] for (int ri = 0; ri < 4; ri++) {
+            float rm = 0.5 * (rlo + rhi);
+            float3 mp = gwp + Rw * rm;
+            float4 mc = mp.x * apX[0] + mp.y * apX[1] + mp.z * apX[2] + apX[3];
+            float mw = max(mc.w, 1);
+            float2 muv = saturate(float2(mc.x / mw * 0.5 + 0.5, 0.5 - mc.y / mw * 0.5));
+            float mz = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(muv, 0, 0)).r, 1e-6);
+            float above = step(0, mc.w - mz);
+            rhi = lerp(rhi, rm, above);
+            rlo = lerp(rm, rlo, above);
+        }
+        hitT = lerp(hitT, rhi, found);
         float3 hp = gwp + Rw * hitT;
         float4 pc = hp.x * apX[4] + hp.y * apX[5] + hp.z * apX[6] + apX[7];
         float pw = max(pc.w, 1);
@@ -3559,7 +3647,7 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
         float conf = found * step(1, pc.w) * min(pe.x, pe.y) * saturate(1 - hitT / (apX[9].z + 4)) * step(0.001, apX[8].w);
         float3 srgb = tex2Dlod(apPrevTex, float4(saturate(puv), 0, 0)).rgb;
         float fre = 0.04 + 0.96 * pow(saturate(1 - abs(ndv)), 5);
-        refl = lerp(refl, srgb * apX[8].w * lerp(0.6, 2.5, fre), conf);
+        refl = lerp(refl, srgb * apX[8].w * lerp(0.6, 2.5, fre), conf * lerp(0.4, 1.0, saturate(fre * 4)));
     }
 #endif
     float mask = m.x;
@@ -3604,7 +3692,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.16.2") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.17.0") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -3613,7 +3701,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.16.2", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.17.0", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -3649,7 +3737,7 @@ static IDirect3DPixelShader9* BuildTaggedShader(IDirect3DDevice9* dev, const DWO
     const int K = maxC + 1;
     if (!first || !end || K > 223) return nullptr;
     std::vector<DWORD> v(fn, fn + first);
-    const float val[4] = { tag == 1 ? 1.0f : 0.0f, tag == 2 ? 1.0f : 0.0f, 0.0f, 1.0f };
+    const float val[4] = { tag == 1 ? 1.0f : 0.0f, tag == 2 ? 1.0f : 0.0f, tag == 3 ? 1.0f : 0.0f, 1.0f };
     v.push_back(0x05000051); v.push_back(0xA00F0000u | (DWORD)K);
     for (int i = 0; i < 4; i++) { DWORD w; memcpy(&w, &val[i], 4); v.push_back(w); }
     v.insert(v.end(), fn + first, fn + end);
@@ -3665,9 +3753,10 @@ static int MaterialTag(uint32_t h)
 {
     if (std::binary_search(kSkinHashes, kSkinHashes + sizeof kSkinHashes / sizeof kSkinHashes[0], h)) return 1;
     if (std::binary_search(kMetalHashes, kMetalHashes + sizeof kMetalHashes / sizeof kMetalHashes[0], h)) return 2;
+    if (std::binary_search(kRoughHashes, kRoughHashes + sizeof kRoughHashes / sizeof kRoughHashes[0], h)) return 3;
     return 0;
 }
-static int g_matTagCount[3] = {}, g_matTagFail = 0;
+static int g_matTagCount[4] = {}, g_matTagFail = 0;
 
 static bool ReplActive(const GameShader* gs)
 {
@@ -3813,8 +3902,8 @@ static HRESULT STDMETHODCALLTYPE hk_CreatePS(IDirect3DDevice9* d, const DWORD* f
         gs.matTag = tag;
         gs.tagged = BuildTaggedShader(d, fn, ct, tag);
         if (gs.tagged) g_matTagCount[tag]++; else g_matTagFail++;
-        if (g_matTagCount[1] + g_matTagCount[2] + g_matTagFail <= 3 || !gs.tagged)
-            Log("materials: %s shader %08x %s", tag == 1 ? "skin" : "metal", hash, gs.tagged ? "tagged" : "could not be tagged");
+        if (g_matTagCount[1] + g_matTagCount[2] + g_matTagCount[3] + g_matTagFail <= 3 || !gs.tagged)
+            Log("materials: %s shader %08x %s", tag == 1 ? "skin" : tag == 2 ? "metal" : "rough", hash, gs.tagged ? "tagged" : "could not be tagged");
     }
     (*out)->AddRef();   // keep the game's shader alive so its pointer is never reused for another one
     g_gameShaders[*out] = gs;
@@ -4160,7 +4249,7 @@ static void PreDraw(IDirect3DDevice9* d)
                 memcpy(x[4], g_vpPrev, sizeof g_vpPrev);
                 x[8][0] = cam[0]; x[8][1] = cam[1]; x[8][2] = cam[2]; x[8][3] = cfg.glassSsr / 100.0f;
                 x[9][0] = g_fx.fitA; x[9][1] = g_fx.fitB; x[9][2] = 2000.0f;
-                x[10][0] = 30.0f;
+                x[10][0] = 30.0f; x[10][2] = (float)(g_ppW ? g_ppW : g_bbW); x[10][3] = (float)(g_ppH ? g_ppH : g_bbH);
                 d->SetTexture(12, g_fx.zcopy);
                 d->SetTexture(13, g_prevHdr);
                 for (DWORD sm = 12; sm <= 13; sm++) {
@@ -4814,6 +4903,7 @@ static bool SaveConfig()
     WriteIniInt("Game", "SkipIntros", cfg.skipIntros);
     WriteIniInt("Game", "NoOcclusionCulling", cfg.noOcclusion);
     WriteIniInt("Game", "DrawDistance", cfg.drawDistance);
+    WritePrivateProfileStringA("Shaders", "Compiler", cfg.compiler == 2 ? "game" : cfg.compiler == 1 ? "47" : "auto", g_ini);
     WriteIniInt("Shadows", "Scale", cfg.shadowScale);
     WriteIniInt("Shadows", "Softness", cfg.shadowSoft);
     WriteIniInt("Tonemap", "Enable", cfg.tmEnable);
@@ -4869,6 +4959,8 @@ static bool SaveConfig()
     WriteIniInt("Materials", "SkinScatter", cfg.sssStrength);
     WriteIniInt("Materials", "SkinScatterWidth", cfg.sssWidth);
     WriteIniInt("Materials", "MetalReflections", cfg.metalRefl);
+    WriteIniInt("Materials", "MetalRoughness", cfg.metalRough);
+    WriteIniInt("Reflections", "Roughness", cfg.ssrRough);
     WriteIniInt("Glass", "ScreenReflections", cfg.glassSsr);
     WriteIniInt("Effects", "ModernBloom", cfg.bloomModern);
     WriteIniInt("Effects", "ModernBloomThreshold", cfg.bloomModernThr);
@@ -4974,7 +5066,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.16.2", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.17.0", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -5094,6 +5186,7 @@ static void DrawMenu()
                 ImGui::SliderInt("Reflection strength", &cfg.ssrStrength, 0, 100, "%d %%");
                 ImGui::SliderInt("Reflection distance", &cfg.ssrLength, 300, 5000, "%d units");
                 ImGui::SliderInt("Only surfaces this flat", &cfg.ssrFloor, 30, 98, "%d %%");
+                ImGui::SliderInt("Reflection blur (roughness)", &cfg.ssrRough, 0, 100, cfg.ssrRough ? "%d %%" : "mirror");
                 ImGui::TextDisabled("Reflects what's on screen in floors and other upward-facing surfaces. Needs the view");
                 ImGui::TextDisabled("matrix from the game (%s).", g_vpKey / 64u == g_frameNo ? "found" : "not seen this frame");
                 ImGui::SeparatorText("Materials (skin, metal)");
@@ -5101,6 +5194,7 @@ static void DrawMenu()
                 ImGui::SliderInt("Skin subsurface scattering", &cfg.sssStrength, 0, 100, cfg.sssStrength ? "%d %%" : "off");
                 ImGui::SliderInt("Scattering width", &cfg.sssWidth, 25, 300, "%d %%");
                 ImGui::SliderInt("Metal reflections", &cfg.metalRefl, 0, 100, cfg.metalRefl ? "%d %%" : "off");
+                ImGui::SliderInt("Metal roughness", &cfg.metalRough, 0, 100, cfg.metalRough ? "%d %%" : "mirror");
                 ImGui::TextDisabled("Light bleeds softly through skin; weapons and metal props reflect the scene (needs");
                 ImGui::TextDisabled("screen-space reflections on). %d skin / %d metal shaders tagged, %s.", g_matTagCount[1], g_matTagCount[2],
                                     MatMaskValid() ? "mask drawn this frame" : "none on screen");
@@ -5302,6 +5396,11 @@ static void DrawMenu()
             }
             ImGui::Text("Input: DirectInput mouse %s, window hook %s",
                         g_diMouse ? "captured" : "not seen", g_origWndProc ? "ok" : "missing");
+            {
+                static const char* cn[] = { "Auto (Windows' d3dcompiler_47)", "d3dcompiler_47", "Game's D3DX (2009)" };
+                if (ImGui::Combo("Shader compiler", &cfg.compiler, cn, 3)) MenuNote("Applies at next launch.");
+                ImGui::TextDisabled("Used for APRenewal's own shaders: %s.", g_compilerUsed == 1 ? "d3dcompiler_47" : g_compilerUsed == 2 ? "the game's D3DX" : "none compiled yet");
+            }
             if (ImGui::Button("Shader census (one frame)")) { g_censusArm = true; MenuNote("Shader list written to the log (census:)."); }
             ImGui::SameLine();
             if (ImGui::Button("Trace one frame")) { g_traceArmed = true; g_wantCapture = false; MenuNote("Frame trace written to the log."); }
@@ -5717,7 +5816,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.16.2 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.17.0 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();
