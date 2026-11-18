@@ -98,12 +98,20 @@ Everything lives in `src/main.cpp`; Dear ImGui 1.91.9 is vendored in `src/imgui/
   DXVK's Vulkan swapchain is SDR-limited on this PC. HDR stays default off; user pointed to NVIDIA
   RTX HDR instead. Only remaining native route: our own DXGI/D3D11 fp16 swapchain via interop
   (Special K-style) — big job, not started.
+  0.9.8: HDR gated by HdrAllowed() = Wine || [HDR] AllowWindows. Under Proton/gamescope the scRGB
+  path should be composited properly (needs DXVK_HDR=1) — untested.
   Quit fix confirmed by the user (log ends with shutdown).
 - Focus pause must never park the thread while the window is closing/hidden (0.9.5: g_exiting) —
   that kept the process alive after quitting.
 - **Audio**: game loads OpenAL at runtime (`DeviceName=Generic Software` in APEngine.ini). With OpenAL
   Soft we map legacy names to the default device and request `ALC_HRTF_SOFT` +
   `ALC_OUTPUT_MODE_SOFT=ALC_STEREO_HRTF_SOFT`; `alcResetDeviceSOFT` toggles it live.
+
+## Proton / Steam Deck (0.9.8, untested)
+- `DetectCompat()`: ntdll `wine_get_version` → `g_wineVer`, env `SteamDeck=1` → `g_steamDeck`; logs `compat:`.
+- Launch options `WINEDLLOVERRIDES="d3d9,openal32=n,b" %command%`, `RealD3D9` empty → system d3d9 = Proton's
+  DXVK. `LoadReal` refuses if the system path resolves to our own module.
+- Windows-only bits (DisplayConfig SDR white, DXGI output diag) fail soft under Wine (paper white falls back to 200).
 
 ## Reverse engineering
 - `docs/apgame-re.md` has the exe findings; `tools/re/apgame_natives.json` maps 2804 UE3 natives

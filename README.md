@@ -1,4 +1,4 @@
-# APRenewal 0.9.7 — d3d9 proxy for Alpha Protocol (GOG 2023)
+# APRenewal 0.9.8 — d3d9 proxy for Alpha Protocol (GOG 2023)
 
 A research-and-fix base layer. It sits alongside the mods you already have:
 
@@ -12,6 +12,26 @@ A research-and-fix base layer. It sits alongside the mods you already have:
 ## Install
 Copy `d3d9.dll` + `APRenewal.ini` into `Alpha Protocol\Binaries\`. Uninstall = delete both.
 The log goes to `Binaries\APRenewal\APRenewal.log`.
+
+## Steam Deck / Linux (Proton) — untested yet, please send logs
+1. Copy `d3d9.dll`, `APRenewal.ini` and `OpenAL32.dll` into `Alpha Protocol/Binaries/`.
+   Leave `RealD3D9` **empty**: Proton's own DXVK is used. Don't copy `winmm.dll`, `dinput8.dll` or
+   `xinput1_3.dll` (Steam Input handles the controller).
+2. Steam > Alpha Protocol > Properties > Launch options:
+   `WINEDLLOVERRIDES="d3d9,openal32=n,b" %command%`
+3. Check `APRenewal.log`: it should say `compat: running under Wine ...` and `system d3d9 ... -> <address>`.
+- Performance on the Deck: keep `RenderScale=100`; if the frame rate drops, turn AO off first.
+- HDR (Deck OLED with HDR on, or a Linux desktop running gamescope with HDR): set `[HDR] Enable=1` and
+  add `DXVK_HDR=1` before `%command%`. Gamescope composites scRGB properly, so this is where the HDR
+  path can actually show highlights. Check with the test pattern + "Highlight test".
+
+## New in 0.9.8
+- HDR is off on native Windows. The 0.9.7 highlight test showed the output never gets brighter than
+  SDR white there (all patches equal, with or without Compensate), so it only cost performance. Use
+  NVIDIA RTX HDR (NVIDIA app) instead. `[HDR] AllowWindows=1` brings it back for experiments.
+  DXVK stays an optional presenter on Windows (`RealD3D9`).
+- Proton / Steam Deck support: Wine is detected (`compat:` in the log), HDR stays available there
+  (gamescope), and chain-loading guards against Wine handing back our own d3d9. See the Steam Deck section.
 
 ## New in 0.9.7
 - HDR test pattern: "Highlight test" checkbox (shown while the pattern is on). The bottom row becomes

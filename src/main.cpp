@@ -51,6 +51,8 @@ static bool    g_ssaa = false;                    // backbuffer larger than the 
 static UINT    g_outW = 0, g_outH = 0;            // window (output) size while supersampling
 static bool    g_hdrUnlocked = false;             // DXVK allowed an fp16 backbuffer
 static bool    g_hdrForced = false;               // we replaced the backbuffer format with fp16
+static char    g_wineVer[64] = "";                // non-empty = running under Wine/Proton
+static bool    g_steamDeck = false;               // Steam sets SteamDeck=1 on the Deck
 static bool    g_hdrActive = false;               // scRGB colour space is set: encode at Present
 static bool    g_hdrPQ = false;                   // HDR10 colour space (unused since 0.9.1)
 static float   g_gammaExp = 1.0f;                 // game's brightness ramp as an exponent (HDR applies it itself)
@@ -108,6 +110,7 @@ struct Config {
     int  renderScale   = 100;
     // HDR output (needs DXVK as RealD3D9 and Windows HDR on)
     int  hdrEnable     = 0;
+    int  hdrWindows    = 0;   // HDR on native Windows (never got above SDR white there)
     int  hdrPaper      = 200;   // nits for UI / SDR white
     int  hdrPeak       = 0;     // nits, 0 = what the display reports
     int  hdrHighlights = 100;   // percent highlight expansion
@@ -185,6 +188,7 @@ static void LoadConfig()
     if (cfg.renderScale < 100) cfg.renderScale = 100;
     if (cfg.renderScale > 200) cfg.renderScale = 200;
     cfg.hdrEnable     = GetPrivateProfileIntA("HDR", "Enable", 0, g_ini);
+    cfg.hdrWindows    = GetPrivateProfileIntA("HDR", "AllowWindows", 0, g_ini) ? 1 : 0;
     cfg.hdrPaper      = GetPrivateProfileIntA("HDR", "PaperWhite", 0, g_ini);   // 0 = Windows' SDR content brightness
     cfg.hdrCurve      = GetPrivateProfileIntA("HDR", "Curve", 0, g_ini) ? 1 : 0;
     cfg.hdrCompensate = GetPrivateProfileIntA("HDR", "CompensateSRGB", 0, g_ini) ? 1 : 0;
@@ -1909,9 +1913,17 @@ static const int VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT_ = 1000104002;
 static const int VK_COLOR_SPACE_SRGB_NONLINEAR_KHR_ = 0;
 static const int VK_COLOR_SPACE_HDR10_ST2084_EXT_ = 1000104008;
 
+// Native Windows: the DXVK path never got brighter than SDR white on the tested PC (0.9.7 highlight
+// test), so HDR is a Proton/gamescope feature unless [HDR] AllowWindows=1.
+static bool HdrAllowed() { return g_wineVer[0] || cfg.hdrWindows; }
+
 static void HdrUnlock(IDirect3D9* d3d)
 {
     if (!cfg.hdrEnable || !d3d) return;
+    if (!HdrAllowed()) {
+        static bool once; if (!once) { once = true; Log("hdr: off on native Windows (no gain over SDR here; [HDR] AllowWindows=1 to try anyway)"); }
+        return;
+    }
     IVkExtInterface_* ext = nullptr;
     if (SUCCEEDED(d3d->QueryInterface(IID_D3D9VkExtInterface, (void**)&ext)) && ext) {
         ext->UnlockAdditionalFormats();
@@ -1977,7 +1989,9 @@ static void HdrSetupSwapchain(IDirect3DDevice9* dev)
                 g_hdrPQ ? "HDR10 (PQ, Rec.2020)" : "scRGB", md.maxLum, md.maxFullFrameLum);
         } else {
             ext->SetColorSpace(VK_COLOR_SPACE_SRGB_NONLINEAR_KHR_);
-            Log("hdr: the display/driver offers no HDR colour space - is HDR on in Windows? Staying SDR");
+            Log("hdr: the display/driver offers no HDR colour space - %s. Staying SDR",
+                g_wineVer[0] ? "on Linux/Deck: HDR on in gamescope (Deck OLED: Settings > Display) and DXVK_HDR=1 in launch options"
+                             : "is HDR on in Windows?");
         }
         ext->Release();
     }
@@ -3009,7 +3023,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.9.7", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.9.8", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Image")) {
@@ -3034,7 +3048,13 @@ static void DrawMenu()
             ImGui::TextDisabled("Runs on the 3D image only, before the HUD. Part of post-processing (F11).");
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("HDR")) {
+        if (ImGui::BeginTabItem("HDR")) { if (!HdrAllowed()) {
+            ImGui::TextWrapped("HDR is off on Windows: on the tested setup the output never got brighter than SDR white, "
+                               "so it only cost performance. For HDR on Windows use NVIDIA RTX HDR (NVIDIA app) with this off.");
+            ImGui::TextWrapped("Under Proton with gamescope HDR (Steam Deck OLED, Linux desktops) it is available. "
+                               "To try it on Windows anyway: [HDR] AllowWindows=1 in APRenewal.ini.");
+            ImGui::EndTabItem();
+        } else {
             CheckboxInt("HDR output (applies at next launch)", &cfg.hdrEnable);
             CheckboxInt("Reference: plain SDR exactly as Windows shows it (A/B)", &cfg.hdrReference);
             ImGui::Checkbox("Test pattern (compare with hdr_testpattern.png in an SDR viewer)", &g_hdrPattern);
@@ -3066,7 +3086,7 @@ static void DrawMenu()
             else ImGui::TextDisabled("Off.");
             ImGui::TextDisabled("Highlights come from the game's own HDR scene buffer; the HUD stays at paper white.");
             ImGui::EndTabItem();
-        }
+        } }
         if (ImGui::BeginTabItem("View")) {
             CheckboxInt("FOV and HUD fixes (replaces AlphaFixer)", &cfg.viewEnable);
             ImGui::SliderInt("Field of view", &cfg.fovDeg, 40, 130, "%d deg");
@@ -3439,6 +3459,19 @@ static void HookD3D9(IDirect3D9* d3d)
 // --------------------------------------------------------------------------
 // Real d3d9 loading + exports
 // --------------------------------------------------------------------------
+static void DetectCompat()
+{
+    typedef const char* (__cdecl *PFN_wgv)();
+    if (HMODULE nt = GetModuleHandleA("ntdll.dll"))
+        if (PFN_wgv wgv = (PFN_wgv)GetProcAddress(nt, "wine_get_version")) {
+            const char* v = wgv(); snprintf(g_wineVer, sizeof g_wineVer, "%s", v ? v : "?");
+        }
+    char e[8] = "";
+    g_steamDeck = GetEnvironmentVariableA("SteamDeck", e, sizeof e) && e[0] == '1';
+    if (g_wineVer[0]) Log("compat: running under Wine %s%s", g_wineVer, g_steamDeck ? " on a Steam Deck" : "");
+    else Log("compat: native Windows");
+}
+
 static bool LoadReal()
 {
     if (g_real) return true;
@@ -3454,6 +3487,10 @@ static bool LoadReal()
         strncat(path, "\\d3d9.dll", MAX_PATH - strlen(path) - 1);
         g_real = LoadLibraryA(path);
         Log("system d3d9 '%s' -> %p", path, g_real);
+    }
+    if (g_real && g_real == g_self) {   // Wine can hand our own module back for "d3d9.dll"
+        Log("chain: '%s' resolved to APRenewal itself - set RealD3D9 to a DXVK d3d9 (e.g. d3d9_dxvk.dll)", path);
+        g_real = nullptr;
     }
     return g_real != nullptr;
 }
@@ -3526,9 +3563,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.9.7 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.9.8 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
+        DetectCompat();
         ApplySavedToggles();
         InstallInputHooks();   // DirectInput / XInput imports, so the menu can capture input
         InstallSupersampling(); // must run before the game reads its command line
