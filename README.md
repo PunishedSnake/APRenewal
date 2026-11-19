@@ -3,9 +3,9 @@
 A `d3d9.dll` mod for **Alpha Protocol** (2010, Unreal Engine 3): modern rendering, widescreen,
 controller support, HRTF audio and quality-of-life fixes, all switchable live from an in-game menu.
 
-> Patches inside the game's code (FOV/HUD, intro skip, console, gamepad/keyboard switching) currently target
-> the **GOG** `APGame.exe`. Every patch checks the exe's bytes first and switches itself off (with a
-> log line) on any other build. Steam support is in progress.
+Works with both the **GOG** and the **Steam** release. Patches inside the game's code (FOV/HUD, intro
+skip, console, gamepad/keyboard switching) find their spots by name or byte pattern and check them
+before writing; on an unknown build a feature switches itself off with a log line instead.
 
 ## Install
 1. Copy into `Alpha Protocol\Binaries\`:
@@ -45,8 +45,9 @@ Steam Input handles the controller.
   carpet, concrete…) never reflect.
 - **Skin:** subsurface scattering and tighter, glossier highlights.
 - **Weapons and metal:** glossier highlights and metal reflections.
-- **Window glass:** clearer, angle-dependent (Fresnel) reflections, screen-space reflections from the
-  previous frame, refraction control.
+- **Window glass:** clearer, angle-dependent (Fresnel) reflections, screen-space reflections of the
+  surrounding environment from the current frame (characters are left out; cubemaps fill in where the
+  screen has nothing to show), refraction control.
 - **Character lighting:** fill and evenness controls for the game's light probes.
 
 ### Post-processing
@@ -66,6 +67,8 @@ Steam Input handles the controller.
 - **Skips the intro logo movies.**
 - **No pop-in:** occlusion culling turned off, longer draw and detail distances.
 - **Developer console** in the menu, including Alpha Protocol's own rendering commands.
+- **Raw mouse:** Unreal's mouse smoothing switched off for direct 1:1 aiming.
+- **UI text scale:** bigger subtitles, HUD and menu text at high resolutions.
 - **Pause on focus loss:** game and dialogue timers stop while you alt-tab. Also keeps the cursor
   inside the window.
 
@@ -76,6 +79,8 @@ Steam Input handles the controller.
   - Other **DirectInput** pads: Switch Pro, DualShock 3, Logitech, PS2 adapters, generic, with your own
     maps in the ini
 - **Switches automatically** between gamepad and keyboard + mouse, depending on what you touched last.
+- **PlayStation button prompts** while a DualSense / DualShock 4 is in use, using the PS3 prompt art the game
+  itself ships (Xbox prompts come back the moment the Xbox pad is used).
 - Rumble strength, extra dead zone, Swap A/B and free button remapping.
 
 ### Audio
@@ -83,7 +88,9 @@ Steam Input handles the controller.
   1.25.2. It can be switched live.
 
 ### Tools
-- In-game menu (Insert) with every option live, plus Save / Reload.
+- In-game menu (Insert) with every option live, plus Save / Reload and **quality presets**
+  (Performance / Balanced / Quality / Ultra).
+- **Shader disk cache:** APRenewal's shaders compile once and load instantly on later launches.
 - F11 toggles all post-processing; F10 cycles AO between on, off and a debug view.
 - Ctrl+F11 logs a one-frame render trace. Ctrl+Shift+F11 also saves every render target of that frame.
 - A shader census: each pixel shader of a frame, with its hash and constants.

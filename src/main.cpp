@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <initializer_list>
 #include <vector>
+#include <unordered_set>
 #include <string>
 #include <unordered_map>
 #ifndef DI_OK
@@ -32,6 +33,7 @@
 #include "matclass.h"
 #include "smaa.h"
 #include "specregs.h"
+#include "buttonicons.h"
 #include <cctype>
 #include "imgui/imgui_impl_dx9.h"
 
@@ -87,8 +89,16 @@ static IDirect3DSurface9* g_prevHdrSurf = nullptr;
 static unsigned g_prevHdrFrame = ~0u;
 static float g_vpPrev[4][4];
 static bool g_glassSsrBound = false;
+// this frame's HDR scene as it stands when the first glass pane is drawn (opaque world, no glass yet):
+// the glass reflections read it with this frame's matrix - no lag, no glass reflecting its own reflection
+static IDirect3DTexture9* g_glassSrc = nullptr;
+static IDirect3DSurface9* g_glassSrcSurf = nullptr;
+static unsigned g_glassSrcKey = ~0u;
 static void GlassMaskRelease()
 {
+    if (g_glassSrcSurf) { g_glassSrcSurf->Release(); g_glassSrcSurf = nullptr; }
+    if (g_glassSrc) { g_glassSrc->Release(); g_glassSrc = nullptr; }
+    g_glassSrcKey = ~0u;
     if (g_matMaskSurf) { g_matMaskSurf->Release(); g_matMaskSurf = nullptr; }
     if (g_matMask) { g_matMask->Release(); g_matMask = nullptr; }
     g_matMaskFrame = ~0u;
@@ -123,6 +133,10 @@ struct Config {
     int  shLog      = 1;
     int  shDump     = 0;
     int  shOverride = 1;
+    int  shaderCache = 1;    // compiled shaders cached on disk (APRenewal\shadercache)
+    int  rawMouse   = 1;     // turn off UE3's mouse smoothing (1:1 aim)
+    int  uiTextScale = 100;  // % scale of all UI text (UIStyle_Text.Scale; HUD, subtitles, menus)
+    int  btnIcons   = 0;     // gamepad prompts: 0 auto (PlayStation art while a Sony pad is in use), 1 Xbox, 2 PlayStation
     int  compiler   = 0;     // our shaders: 0 auto (Windows' d3dcompiler_47, else the game's), 1 d3dcompiler_47, 2 the game's D3DX
     int  verbose    = 0;
     int  captureFloatDDS = 1;   // save float/16-bit targets losslessly as .dds
@@ -272,6 +286,10 @@ static void LoadConfig()
     cfg.vsync      = (int)GetPrivateProfileIntA("Display", "VSync", -1, g_ini);
     cfg.fpsLimit   = GetPrivateProfileIntA("Display", "FPSLimit", 0, g_ini);
     cfg.shLog      = GetPrivateProfileIntA("Shaders", "LogCompiles", 1, g_ini);
+    cfg.shaderCache = GetPrivateProfileIntA("Shaders", "DiskCache", 1, g_ini) ? 1 : 0;
+    cfg.rawMouse   = GetPrivateProfileIntA("Game", "RawMouse", 1, g_ini) ? 1 : 0;
+    cfg.uiTextScale = std::min(std::max((int)GetPrivateProfileIntA("Game", "UITextScale", 100, g_ini), 50), 250);
+    cfg.btnIcons   = std::min(std::max((int)GetPrivateProfileIntA("Controller", "ButtonIcons", 0, g_ini), 0), 2);
     cfg.shDump     = GetPrivateProfileIntA("Shaders", "DumpSource", 0, g_ini);
     cfg.shOverride = GetPrivateProfileIntA("Shaders", "Override", 1, g_ini);
     {
@@ -467,7 +485,7 @@ static void* PatchIAT(void** slot, void* hook)
 struct HookRegs { DWORD edi, esi, ebp, esp, ebx, edx, ecx, eax; };   // pushad layout
 typedef void (__cdecl *HookFn)(HookRegs*);
 
-static BYTE* FindPattern(const char* pat)
+static BYTE* FindPattern(const char* pat, BYTE* from = nullptr)
 {
     HMODULE exe = GetModuleHandleA(nullptr);
     auto nt = (IMAGE_NT_HEADERS*)((BYTE*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
@@ -476,19 +494,75 @@ static BYTE* FindPattern(const char* pat)
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
         if (!memcmp(sec[i].Name, ".text", 5)) { start = (BYTE*)exe + sec[i].VirtualAddress; size = sec[i].Misc.VirtualSize; }
     if (!start) return nullptr;
-    int bytes[64], n = 0;
-    for (const char* p = pat; *p && n < 64; ) {
+    int bytes[192], n = 0;
+    for (const char* p = pat; *p && n < 192; ) {
         while (*p == ' ') p++;
         if (!*p) break;
         if (*p == '?') { bytes[n++] = -1; while (*p == '?') p++; }
         else { bytes[n++] = (int)strtoul(p, (char**)&p, 16); }
     }
-    for (size_t i = 0; i + n <= size; i++) {
+    const size_t i0 = from && from >= start && from < start + size ? (size_t)(from - start) : 0;
+    for (size_t i = i0; i + n <= size; i++) {
         int k = 0;
         while (k < n && (bytes[k] < 0 || start[i + k] == bytes[k])) k++;
         if (k == n) return start + i;
     }
     return nullptr;
+}
+// Exactly one match, or nullptr (a pattern that matches twice is not trusted)
+static BYTE* FindUnique(const char* pat)
+{
+    BYTE* a = FindPattern(pat);
+    if (!a) return nullptr;
+    return FindPattern(pat, a + 1) ? nullptr : a;
+}
+
+// Exe sections, for the lookups below (works for any build: GOG and Steam differ in addresses only)
+static bool ExeSection(const char* name, BYTE** start, size_t* size)
+{
+    HMODULE exe = GetModuleHandleA(nullptr);
+    auto nt = (IMAGE_NT_HEADERS*)((BYTE*)exe + ((IMAGE_DOS_HEADER*)exe)->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if (!strncmp((const char*)sec[i].Name, name, 8)) { *start = (BYTE*)exe + sec[i].VirtualAddress; *size = sec[i].Misc.VirtualSize; return true; }
+    return false;
+}
+// A UE3 native function by name. Every native is registered as { L"int<Class>exec<Func>", function }
+// in the exe's data, so this finds the same function in any build without fixed addresses.
+static BYTE* FindNative(const wchar_t* cls, const wchar_t* func)
+{
+    wchar_t want[128];
+    swprintf(want, 128, L"int%lsexec%ls", cls, func);
+    const size_t wlen = (wcslen(want) + 1) * sizeof(wchar_t);     // including the terminator
+    BYTE *rd, *dt, *tx; size_t rds, dts, txs;
+    if (!ExeSection(".rdata", &rd, &rds) || !ExeSection(".data", &dt, &dts) || !ExeSection(".text", &tx, &txs)) return nullptr;
+    for (int pass = 0; pass < 2; pass++) {
+        BYTE* sb = pass ? dt : rd; const size_t ss = pass ? dts : rds;
+        for (size_t i = 0; i + wlen <= ss; i += 2) {
+            if (sb[i] != 'i' || memcmp(sb + i, want, wlen)) continue;
+            if (i >= 2 && sb[i - 2] != 0) continue;                  // must start a string
+            const DWORD nameAddr = (DWORD)(sb + i);
+            for (int tp = 0; tp < 2; tp++) {                         // the { name, function } table
+                BYTE* tb = tp ? rd : dt; const size_t ts = tp ? rds : dts;
+                for (size_t j = 0; j + 8 <= ts; j += 4)
+                    if (*(DWORD*)(tb + j) == nameAddr) {
+                        BYTE* f = *(BYTE**)(tb + j + 4);
+                        if (f >= tx && f < tx + txs) return f;
+                    }
+            }
+        }
+    }
+    return nullptr;
+}
+// The (single) vtable slot in .rdata that points at fn
+static void** FindVtableSlot(const void* fn)
+{
+    BYTE* rd; size_t rds;
+    if (!ExeSection(".rdata", &rd, &rds)) return nullptr;
+    void** hit = nullptr;
+    for (size_t j = 0; j + 4 <= rds; j += 4)
+        if (*(const void**)(rd + j) == fn) { if (hit) return nullptr; hit = (void**)(rd + j); }
+    return hit;
 }
 
 // Mid-function hook: `len` bytes at `site` (whole instructions, no relative operands) are replaced
@@ -596,7 +670,7 @@ static void InstallViewHooks()
     }
     // FOV: per camera module, non-destructive
     static const BYTE fovOrig[8] = { 0xF3, 0x0F, 0x59, 0x80, 0x0C, 0x01, 0x00, 0x00 };   // mulss xmm0,[eax+10Ch]
-    BYTE* fov = FindPattern("F3 0F 59 80 0C 01 00 00 09 98 10 01 00 00");
+    BYTE* fov = FindUnique("F3 0F 59 80 0C 01 00 00 09 98 10 01 00 00");
     BYTE repl[8] = { 0xF3, 0x0F, 0x59, 0x05 };                                            // mulss xmm0,[g_fovScratch]
     *(float**)(repl + 4) = &g_fovScratch;
     if (MidHook(fov, 8, fovOrig, View_ModuleFov, repl, 8)) g_viewSites |= 1;
@@ -609,11 +683,13 @@ static void InstallViewHooks()
     }
     // HUD canvas
     static const BYTE hudOrig[6] = { 0x89, 0x4B, 0x64, 0x89, 0x43, 0x68 };
-    BYTE* hud = FindPattern("89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50");
+    BYTE* hud = FindUnique("89 53 70 8B 15 ? ? ? ? 89 4B 64 89 43 68 8B 52 50");
     if (MidHook(hud ? hud + 9 : nullptr, 6, hudOrig, View_Hud)) g_viewSites |= 4;
     // menu viewport
     static const BYTE menuOrig[6] = { 0x85, 0xC0, 0x89, 0x44, 0x24, 0x08 };
-    BYTE* menu = FindPattern("FF D2 85 C0 89 44 24 08 DB 44 24 08");
+    // (the pattern alone matches 3 functions; with its prologue it is unique in GOG and Steam builds)
+    BYTE* menu = FindUnique("51 56 8B F1 33 C0 39 46 44 57 74 ? 8B 4E 44 8B 01 8B 50 08 FF D2 85 C0 89 44 24 08 DB 44 24 08");
+    if (menu) menu += 20;
     if (MidHook(menu ? menu + 2 : nullptr, 6, menuOrig, View_Menu)) g_viewSites |= 8;
     g_viewHooks = g_viewSites != 0;
     Log("view: hooks - module FOV %s, FOV readback %s, HUD %s, menu %s (FOV %d deg at 16:9)",
@@ -622,7 +698,8 @@ static void InstallViewHooks()
 }
 
 // --------------------------------------------------------------------------
-// Game module: intro skip and developer console (GOG APGame.exe addresses, verified before use)
+// Game module: intro skip and developer console. Everything is located by UE3 native names or byte
+// signatures (GOG and Steam builds differ only in addresses) and verified before use.
 // --------------------------------------------------------------------------
 static bool Readable(const void* p, size_t n)
 {
@@ -658,12 +735,17 @@ static int __thiscall hk_PlayMovie(void* self, int mode, const wchar_t* name, in
 }
 static void InstallMovieHook()
 {
-    const DWORD slot = 0x12173B0, fn = 0x4E49F0;
-    if (!Readable((void*)slot, 4) || *(DWORD*)slot != fn ||
-        !CodeIs(fn, "\x55\x8B\xEC\x83\xE4\xF8\x6A\xFF", 8) || !CodeIs(0x4E4A68, "\x68\xE0\x9E\x1D\x01", 5)) {
-        Log("movie: movie player not found (different exe build) - intro skip unavailable");
+    // GameThreadPlayMovie (GOG 0x4E49F0 / Steam 0x4E4410), found by its first 100 bytes, and the one
+    // vtable slot that points at it
+    BYTE* fn = FindUnique("55 8B EC 83 E4 F8 6A FF 68 ? ? ? ? 64 A1 00 00 00 00 50 81 EC 00 02 00 00 A1 ? ? ? ? 33 C4 "
+                          "89 84 24 F8 01 00 00 53 56 57 A1 ? ? ? ? 33 C4 50 8D 84 24 10 02 00 00 64 A3 00 00 00 00 "
+                          "8B 7D 0C 8B D9 83 7B 24 00 89 7C 24 10 75 ? C7 43 24 01 00 00 00 8B 45 08 89 43 08 A1");
+    void** slot = fn ? FindVtableSlot(fn) : nullptr;
+    if (!slot) {
+        Log("movie: movie player not found (unknown exe build) - intro skip unavailable");
         return;
     }
+    Log("movie: player at %p, vtable slot %p", fn, slot);
     o_PlayMovie = (PFN_PlayMovie)fn;
     DWORD old;
     VirtualProtect((void*)slot, 4, PAGE_READWRITE, &old);
@@ -676,6 +758,7 @@ static void InstallMovieHook()
 // ConsoleCommand() calls. The player controller pointer comes from AAPPlayerController natives
 // the game calls on it; commands run on the main thread between frames (our PeekMessageW hook).
 struct FStr { wchar_t* data; int num; int max; };
+static void** g_gmallocPtr = nullptr;    // &GMalloc, read from execConsoleCommand
 typedef FStr* (__thiscall *PFN_ConsoleCmd)(void* self, FStr* ret, const FStr* cmd, int writeToLog);
 static void* volatile g_pc = nullptr;
 static void* g_pcVtbl = nullptr;
@@ -702,6 +785,25 @@ static void ApplyDrawDistance()
     char c[96]; snprintf(c, sizeof c, "set PlayerController LODDistanceFactor %.4f", 100.0f / pct);
     ConQueue(c, false);
 }
+// Raw mouse: UE3's PlayerInput averages mouse movement over recent frames (bEnableMouseSmoothing), which
+// makes aiming feel floaty. SET reaches every PlayerInput (APPlayerInput too) and the class default.
+static void ApplyMouseSmoothing()
+{
+    if (!cfg.console) return;
+    ConQueue(cfg.rawMouse ? "set PlayerInput bEnableMouseSmoothing False" : "set PlayerInput bEnableMouseSmoothing True", false);
+}
+// UI text scale: AP's UI (UE3 UIScenes) uses fixed-size bitmap fonts made for 720p/1080p and no
+// resolution-based text scaling, so subtitles and HUD text get small at 1440p and up. Every text style's
+// Scale is raised through SET (styles live in the loaded UI skin; screens opened afterwards use it).
+static bool g_uiScaleTouched = false;
+static void ApplyUiTextScale()
+{
+    if (!cfg.console || (cfg.uiTextScale == 100 && !g_uiScaleTouched)) return;
+    g_uiScaleTouched = true;
+    char c[96]; const float k = std::min(std::max(cfg.uiTextScale, 50), 250) / 100.0f;
+    snprintf(c, sizeof c, "set UIStyle_Text Scale (X=%.3f,Y=%.3f)", k, k);
+    ConQueue(c, false);
+}
 static void __cdecl Con_CapturePC(HookRegs* r)
 {
     void* pc = (void*)r->ecx;
@@ -712,7 +814,7 @@ static void __cdecl Con_CapturePC(HookRegs* r)
     const bool fresh = g_pc != pc;
     if (fresh) Log("console: player controller %p (vtable %p)", pc, vt);
     g_pc = pc; g_pcTick = GetTickCount();
-    if (fresh) ApplyDrawDistance();    // a new level / controller starts with the default factor
+    if (fresh) { ApplyDrawDistance(); ApplyMouseSmoothing(); ApplyUiTextScale(); }   // a new level / controller starts with the defaults
 }
 static void ConRunOne(const char* cmd);
 static void ConRunQueued()
@@ -754,27 +856,29 @@ static void ConRunOne(const char* cmd)
         Log("console:   %s", r);
     } else ConAddLine("  (done)");
     // the returned string was allocated by the game's GMalloc - give it back
-    void* gm = *(void**)0x16E8030;
+    void* gm = g_gmallocPtr ? *g_gmallocPtr : nullptr;
     if (out.data && gm) ((void (__thiscall*)(void*, void*))((*(void***)gm)[3]))(gm, out.data);
 }
 static void InstallConsole()
 {
     InitializeCriticalSection(&g_conCs);
     if (!cfg.console) { Log("console: off (Console=0)"); return; }
-    // ConsoleCommand thunk: vtable +0x110 call, and GMalloc->Free at +0xC
-    if (!CodeIs(0x4DB7E7, "\x8B\x17\x8B\x92\x10\x01\x00\x00", 8) || !CodeIs(0x4DB821, "\x8B\x0D\x30\x80\x6E\x01", 6) ||
-        !CodeIs(0x4DB838, "\x8B\x01\x8B\x50\x0C", 5)) {
-        Log("console: ConsoleCommand not found (different exe build) - console unavailable");
+    // execConsoleCommand: vtable +0x110 call at +0xB7, `mov ecx,[GMalloc]` at +0xF1, GMalloc->Free (+0xC) at +0x108
+    BYTE* cc = FindNative(L"APlayerController", L"ConsoleCommand");
+    if (!cc || !CodeIs((DWORD)cc + 0xB7, "\x8B\x17\x8B\x92\x10\x01\x00\x00", 8) || !CodeIs((DWORD)cc + 0xF1, "\x8B\x0D", 2) ||
+        !CodeIs((DWORD)cc + 0x108, "\x8B\x01\x8B\x50\x0C", 5)) {
+        Log("console: ConsoleCommand not found (unknown exe build) - console unavailable");
         return;
     }
+    g_gmallocPtr = *(void***)(cc + 0xF3);
     static const BYTE thunk[8] = { 0x8B, 0x44, 0x24, 0x04, 0x83, 0x40, 0x0C, 0x01 };   // mov eax,[esp+4]; add [eax+0Ch],1
     static const BYTE ai[5] = { 0x51, 0x0F, 0x57, 0xC0, 0x56 };                        // push ecx; xorps xmm0,xmm0; push esi
     int n = 0;
     // AAPPlayerController-only thunks (InPDAMenu is shared with the AI controller - not usable):
     // ShouldAllowPauseMenu, ShouldAllowPDAMenu, IsPlayerPastTitleScreen, UpdateAIData
-    for (DWORD a : { 0xA50230u, 0xA50270u, 0xA50490u })
-        if (MidHook((BYTE*)a, 8, thunk, Con_CapturePC)) n++;
-    if (MidHook((BYTE*)0xA50970, 5, ai, Con_CapturePC)) n++;
+    for (const wchar_t* f : { L"ShouldAllowPauseMenu", L"ShouldAllowPDAMenu", L"IsPlayerPastTitleScreen" })
+        if (MidHook(FindNative(L"AAPPlayerController", f), 8, thunk, Con_CapturePC)) n++;
+    if (MidHook(FindNative(L"AAPPlayerController", L"UpdateAIData"), 5, ai, Con_CapturePC)) n++;
     g_conOk = n > 0;
     Log("console: %d/4 player-controller probes installed%s", n, g_conOk ? "" : " - console unavailable");
 }
@@ -2071,6 +2175,54 @@ typedef HRESULT (WINAPI *PFN_D3DCompile)(const void*, SIZE_T, const char*, const
 static PFN_D3DCompile g_d3dCompile = nullptr;
 static int g_compilerUsed = -1;                    // 1 = d3dcompiler_47, 2 = the game's D3DX
 static CRITICAL_SECTION g_compileCs;
+// Compiled-shader cache on disk (Binaries\APRenewal\shadercache): APRenewal's own shaders and the
+// rebuilt game shaders compile once, then load instantly on every later launch (no first-frame hitch,
+// no compile during level loads). Keyed by source + profile + compiler, so any change recompiles.
+struct DiskBlob {   // minimal ID3DBlob / ID3DXBuffer look-alike (IUnknown + GetBufferPointer + GetBufferSize)
+    void** vt; LONG refs; std::vector<BYTE> data;
+    static HRESULT WINAPI QI(DiskBlob*, REFIID, void** o) { if (o) *o = nullptr; return E_NOINTERFACE; }
+    static ULONG WINAPI AddRef(DiskBlob* b) { return InterlockedIncrement(&b->refs); }
+    static ULONG WINAPI Release(DiskBlob* b) { const LONG r = InterlockedDecrement(&b->refs); if (!r) delete b; return r; }
+    static void* WINAPI Ptr(DiskBlob* b) { return b->data.data(); }
+    static SIZE_T WINAPI Size(DiskBlob* b) { return b->data.size(); }
+};
+static void* g_diskBlobVt[5] = { (void*)DiskBlob::QI, (void*)DiskBlob::AddRef, (void*)DiskBlob::Release, (void*)DiskBlob::Ptr, (void*)DiskBlob::Size };
+static size_t BufSize(void* b) { return ((SIZE_T(WINAPI*)(void*))(*(void***)b)[4])(b); }
+static long g_cacheHits = 0, g_cacheStores = 0;
+static bool ShaderCachePath(const char* src, const char* profile, int compiler, char* out)
+{
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const char* t) { for (; *t; t++) { h ^= (BYTE)*t; h *= 1099511628211ull; } h ^= 0xFF; h *= 1099511628211ull; };
+    mix(src); mix(profile); mix(compiler == 1 ? "47" : "d3dx42"); mix("v1");
+    char dir[MAX_PATH]; PathJoin(dir, g_dir, "APRenewal\\shadercache");
+    CreateDirectoryA(dir, nullptr);
+    snprintf(out, MAX_PATH, "%s\\%016llx.cso", dir, (unsigned long long)h);
+    return true;
+}
+static void* LoadCachedBlob(const char* path)
+{
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    DWORD n = GetFileSize(f, nullptr), got = 0;
+    DiskBlob* b = nullptr;
+    if (n >= 8 && n < (1u << 22) && n % 4 == 0) {
+        b = new DiskBlob{ g_diskBlobVt, 1, std::vector<BYTE>(n) };
+        if (!ReadFile(f, b->data.data(), n, &got, nullptr) || got != n ||
+            (((const DWORD*)b->data.data())[n / 4 - 1]) != 0x0000FFFF) { delete b; b = nullptr; }   // ends with the end token
+    }
+    CloseHandle(f);
+    return b;
+}
+static void StoreCachedBlob(const char* path, void* blob)
+{
+    char tmp[MAX_PATH]; snprintf(tmp, MAX_PATH, "%s.tmp", path);
+    HANDLE f = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0; const DWORD n = (DWORD)BufSize(blob);
+    const bool ok = WriteFile(f, BufPtr(blob), n, &w, nullptr) && w == n;
+    CloseHandle(f);
+    if (ok && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) g_cacheStores++; else DeleteFileA(tmp);
+}
 static void* CompileBlob(const char* src, const char* profile, const char* name)
 {
     static bool init = false;
@@ -2087,6 +2239,15 @@ static void* CompileBlob(const char* src, const char* profile, const char* name)
     EnterCriticalSection(&g_compileCs);
     void* code = nullptr; void* err = nullptr;
     HRESULT hr = E_FAIL;
+    char cpath[MAX_PATH] = "";
+    if (cfg.shaderCache) {
+        ShaderCachePath(src, profile, g_d3dCompile ? 1 : 2, cpath);
+        if ((code = LoadCachedBlob(cpath))) {
+            if (!g_cacheHits++) Log("compiler: loading APRenewal's shaders from the disk cache (APRenewal\\shadercache)");
+            LeaveCriticalSection(&g_compileCs);
+            return code;
+        }
+    }
     if (g_d3dCompile) {
         // backwards compatibility: accept the legacy D3D9 syntax our sources were written for
         hr = g_d3dCompile(src, strlen(src), name, nullptr, nullptr, "main", profile, 1u << 12, 0, &code, &err);
@@ -2110,6 +2271,7 @@ static void* CompileBlob(const char* src, const char* profile, const char* name)
         } else if (g_compilerUsed < 0) g_compilerUsed = 2;
     }
     if (err) BufRelease(err);
+    if (code && cpath[0]) StoreCachedBlob(cpath, code);
     LeaveCriticalSection(&g_compileCs);
     return code;
 }
@@ -4097,7 +4259,7 @@ void main(float4 ScreenPosition : TEXCOORD0, float2 vp : VPOS, out float4 OutCol
     float4 sp = apMul(p, ScreenToShadowMatrix[0], ScreenToShadowMatrix[1], ScreenToShadowMatrix[2], ScreenToShadowMatrix[3]);
     sp.xy /= sp.w;
     sp.z = min(sp.z, 0.999);
-    float rot = apIGN(vp) * 6.2831853;
+    float rot = apIGN(vp + apTM.z * 5.588238) * 6.2831853;    // apTM.z = frame: the TAA averages the pattern
     float sum = 0;
     [unroll] for (int i = 0; i < NTAPS; i++) {
         float r = sqrt((i + 0.5) / NTAPS);
@@ -4123,7 +4285,7 @@ void main(float4 ScreenPosition : TEXCOORD0, float2 vp : VPOS, out float4 OutCol
         qe /= qe.w;
         float3 dv = float3((qe.x - p.x) / apX[4].x, (qe.y - p.y) / apX[4].y, qe.z - p.z);
         float dz = eps * apX[4].w / max(length(dv), 1e-4) / 8.0;
-        float cj = apIGN(vp + float2(17, 31));
+        float cj = apIGN(vp + float2(17, 31) + apTM.z * 5.588238);
         float occ = 0;
         [unroll] for (int ci = 0; ci < 8; ci++) {
             float4 q = apMul(h0 - float4(0, 0, dz * (ci + cj), 0), apX[0], apX[1], apX[2], apX[3]);
@@ -4131,7 +4293,7 @@ void main(float4 ScreenPosition : TEXCOORD0, float2 vp : VPOS, out float4 OutCol
             float2 cuv = q.xy / max(q.z, 1) * ScreenPositionScaleBias.xy + ScreenPositionScaleBias.wz;
             float sd = tex2Dlod(SceneColorTexture, float4(cuv, 0, 0)).a;
             float df = q.z - sd;
-            occ = max(occ, step(1.0, df) * step(df, apX[5].x) * step(1, q.z) * (1 - ci / 12.0));
+            occ = max(occ, step(1.0 + 0.004 * q.z, df) * step(df, apX[5].x) * step(1, q.z) * (1 - ci / 12.0));
         }
         cov *= 1 - occ * apX[4].z;
     }
@@ -4214,14 +4376,17 @@ static IDirect3DPixelShader9* BuildSoftShadow(IDirect3DDevice9* dev, GameShader&
 // apTM: x opacity scale, y reflection strength, z our Fresnel amount, w game's luminance weighting
 // apTM2: x normal-map strength
 static const char* kGlassBodyHLSL = R"HLSL(
-// GLASSSSR: screen-space reflections from the previous frame. apX[0..3] this frame's view-projection
-// rows, apX[4..7] the previous frame's, apX[8] camera xyz + strength, apX[9] (depth fit A, B, max
-// distance), apX[10] x thickness. s12 = this frame's 24-bit depth snapshot, s13 = last frame's HDR scene.
+// GLASSSSR: screen-space reflections. apX[0..3] this frame's view-projection rows; apX[4..7] the
+// previous frame's (s13 = previous frame), or with apX[11].x = 1 (s13 = this frame's scene) the inverse
+// rows + camera for a back-face test at the hit; apX[8]
+// camera xyz + strength, apX[9] (depth fit A, B, max distance), apX[10] x thickness, y frame (jitter),
+// zw screen size. s12 = this frame's 24-bit depth snapshot, s13 = the HDR scene to reflect.
 // Written without flow control or helper functions (fixed unrolled steps, masks instead of breaks):
 // 0.16.0's version with loops/breaks/early returns crashed the game's D3DX compiler.
 #if GLASSSSR
 sampler2D apZTex : register(s12);
 sampler2D apPrevTex : register(s13);
+sampler2D apMatTex : register(s14);     // material mask: alpha = character
 #endif
 void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 fog : TEXCOORD4, float3 camv : TEXCOORD6,
           out float4 OutColor : COLOR0, out float4 OutMask : COLOR1)
@@ -4268,7 +4433,8 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
         // per-pixel jitter from the glass pixel's screen position (apX[10].zw = screen size)
         float4 gc = gwp.x * apX[0] + gwp.y * apX[1] + gwp.z * apX[2] + apX[3];
         float2 gpx = float2(gc.x / max(gc.w, 1) * 0.5 + 0.5, 0.5 - gc.y / max(gc.w, 1) * 0.5) * apX[10].zw;
-        float jit = frac(52.9829189 * frac(dot(floor(gpx), float2(0.06711056, 0.00583715))));
+        // changes every frame, so the temporal AA averages the step pattern away instead of freezing it as dots
+        float jit = frac(52.9829189 * frac(dot(floor(gpx) + apX[10].y * 5.588238, float2(0.06711056, 0.00583715))));
         // start a little off the glass (more for distant glass): at grazing angles the ray otherwise
         // touches the window frame / wall right next to the pane
         float tMin = 8 + 0.02 * length(wcv);
@@ -4306,14 +4472,56 @@ void main(float4 tx : COLOR0, float3 tz : COLOR1, float2 uv : TEXCOORD0, float4 
         }
         hitT = lerp(hitT, rhi, found);
         float3 hp = gwp + Rw * hitT;
-        float4 pc = hp.x * apX[4] + hp.y * apX[5] + hp.z * apX[6] + apX[7];
+        // apX[11].x = 1: the colour source is this frame's scene, so project with this frame's matrix
+        // (apX[0..3]) - apX[4..6] then hold its inverse and apX[7] the camera, for the back-face test below
+        float curSrc = step(0.5, apX[11].x);
+        float4 pcCur = hp.x * apX[0] + hp.y * apX[1] + hp.z * apX[2] + apX[3];
+        float4 pcPrev = hp.x * apX[4] + hp.y * apX[5] + hp.z * apX[6] + apX[7];
+        float4 pc = lerp(pcPrev, pcCur, curSrc);
         float pw = max(pc.w, 1);
         float2 puv = float2(pc.x / pw * 0.5 + 0.5, 0.5 - pc.y / pw * 0.5);
         float2 pe = saturate(min(puv, 1 - puv) * 10);
         float conf = found * step(1, pc.w) * min(pe.x, pe.y) * saturate(1 - (hitT - tMin) / apX[9].z) * step(0.001, apX[8].w);
         // fade out at grazing angles, where the reconstructed position is least reliable
         conf *= saturate(abs(ndv) * 6);
-        float3 srgb = tex2Dlod(apPrevTex, float4(saturate(puv), 0, 0)).rgb;
+        // back-face test: the surface the ray "hit" must face the ray. A ray from a window back toward
+        // Mike lands on his back (the side the camera sees) from behind - that was the dark ghost.
+        // Normal from this frame's depth around the hit (the neighbour with the smaller step per axis).
+        {
+            float2 tx = 1.0 / apX[10].zw;
+            float2 huv = saturate(puv);
+            float d0 = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(huv, 0, 0)).r, 1e-6);
+            float dxp = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(huv + float2(tx.x, 0), 0, 0)).r, 1e-6);
+            float dxm = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(huv - float2(tx.x, 0), 0, 0)).r, 1e-6);
+            float dyp = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(huv + float2(0, tx.y), 0, 0)).r, 1e-6);
+            float dym = 1.0 / max(apX[9].x + apX[9].y * tex2Dlod(apZTex, float4(huv - float2(0, tx.y), 0, 0)).r, 1e-6);
+            float ux = step(abs(dxp - d0), abs(dxm - d0)), uy = step(abs(dyp - d0), abs(dym - d0));
+            float2 ox = float2(lerp(-tx.x, tx.x, ux), 0), oy = float2(0, lerp(-tx.y, tx.y, uy));
+            float dX = lerp(dxm, dxp, ux), dY = lerp(dym, dyp, uy);
+            float2 s0 = float2(huv.x * 2 - 1, 1 - huv.y * 2);
+            float2 sX = float2((huv.x + ox.x) * 2 - 1, 1 - huv.y * 2);
+            float2 sY = float2(huv.x * 2 - 1, 1 - (huv.y + oy.y) * 2);
+            float3 p0 = (s0.x * d0) * apX[4].xyz + (s0.y * d0) * apX[5].xyz + d0 * apX[6].xyz + apX[7].xyz;
+            float3 pX = (sX.x * dX) * apX[4].xyz + (sX.y * dX) * apX[5].xyz + dX * apX[6].xyz + apX[7].xyz;
+            float3 pY = (sY.x * dY) * apX[4].xyz + (sY.y * dY) * apX[5].xyz + dY * apX[6].xyz + apX[7].xyz;
+            float3 hn = cross(pX - p0, pY - p0);
+            hn *= sign(dot(hn, apX[7].xyz - p0) + 1e-6);          // the visible side faces the camera
+            hn /= max(length(hn), 1e-6);
+            float frontHit = saturate(-dot(hn, Rw) * 5 + 0.1);
+            conf *= lerp(1, frontHit, curSrc);
+        }
+        // characters are left out (apX[11].y = mask valid): only the environment is reflected
+        conf *= 1 - step(0.5, apX[11].y) * step(0.5, tex2Dlod(apMatTex, float4(saturate(puv), 0, 0)).a);
+        // and rays turning almost straight back toward the camera have nothing on screen to hit
+        float facing = dot(Rw, -wcv / max(length(wcv), 1e-3));
+        conf *= saturate(1.0 + 1.5 * facing);
+        // small cross filter: half-res source, softens the hit edges
+        float2 ht = 0.75 / apX[10].zw * 2;
+        float3 srgb = (tex2Dlod(apPrevTex, float4(saturate(puv), 0, 0)).rgb * 2 +
+                       tex2Dlod(apPrevTex, float4(saturate(puv + float2(ht.x, 0)), 0, 0)).rgb +
+                       tex2Dlod(apPrevTex, float4(saturate(puv - float2(ht.x, 0)), 0, 0)).rgb +
+                       tex2Dlod(apPrevTex, float4(saturate(puv + float2(0, ht.y)), 0, 0)).rgb +
+                       tex2Dlod(apPrevTex, float4(saturate(puv - float2(0, ht.y)), 0, 0)).rgb) / 6;
         float fre = 0.04 + 0.96 * pow(saturate(1 - abs(ndv)), 5);
         refl = lerp(refl, srgb * apTM.y * apX[8].w * lerp(0.5, 2.0, fre), conf * lerp(0.4, 1.0, saturate(fre * 4)));
     }
@@ -4360,7 +4568,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.20.3") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.24.1") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4369,13 +4577,14 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.20.3", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.24.1", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
 // Material mask: the game's own bytecode with two extra instructions - "def cK, tag" after the
 // header and "mov oC1, cK" before the end token - so the base pass also writes which pixels are skin
 // or metal to a second render target. cK is above every constant the shader uses (CTAB and defs).
+// tag: 1 skin, 2 metal, 3 rough (rgb); + 8 = drawn with a skinned (character) vertex shader (alpha)
 static IDirect3DPixelShader9* BuildTaggedShader(IDirect3DDevice9* dev, const DWORD* fn, const std::vector<CtabConst>& ct, int tag)
 {
     if ((fn[0] & 0xFFFF0000) != 0xFFFF0000 || (fn[0] & 0xFFFF) < 0x0300) return nullptr;   // ps_3_0 only
@@ -4405,7 +4614,8 @@ static IDirect3DPixelShader9* BuildTaggedShader(IDirect3DDevice9* dev, const DWO
     const int K = maxC + 1;
     if (!first || !end || K > 223) return nullptr;
     std::vector<DWORD> v(fn, fn + first);
-    const float val[4] = { tag == 1 ? 1.0f : 0.0f, tag == 2 ? 1.0f : 0.0f, tag == 3 ? 1.0f : 0.0f, 1.0f };
+    const int mt = tag & 7;
+    const float val[4] = { mt == 1 ? 1.0f : 0.0f, mt == 2 ? 1.0f : 0.0f, mt == 3 ? 1.0f : 0.0f, (tag & 8) ? 1.0f : 0.0f };
     v.push_back(0x05000051); v.push_back(0xA00F0000u | (DWORD)K);
     for (int i = 0; i < 4; i++) { DWORD w; memcpy(&w, &val[i], 4); v.push_back(w); }
     v.insert(v.end(), fn + first, fn + end);
@@ -4623,14 +4833,22 @@ static PFN_CreateVS o_CreateVS = nullptr;
 static PFN_SetVS o_SetVS = nullptr;
 static PFN_SetVSConstF o_SetVSConstF = nullptr;
 static std::unordered_map<IDirect3DVertexShader9*, int> g_vsVP;
+// GPU-skinned vertex shaders (characters): their CTAB has BoneMatrices
+static std::unordered_set<IDirect3DVertexShader9*> g_vsSkinned;
+static bool g_curVSSkinned = false;
 static HRESULT STDMETHODCALLTYPE hk_CreateVS(IDirect3DDevice9* d, const DWORD* fn, IDirect3DVertexShader9** out)
 {
     HRESULT hr = o_CreateVS(d, fn, out);
     if (SUCCEEDED(hr) && out && *out && !g_inPostFX && !g_ownShaderCreate) {
         std::vector<CtabConst> ct;
-        if (ParseCtab(fn, ct))
+        if (ParseCtab(fn, ct)) {
             if (const CtabConst* k = CtabFind(ct, "ViewProjectionMatrix"))
                 if (k->set == 2 && k->count == 4) { (*out)->AddRef(); g_vsVP[*out] = k->reg; }
+            if (CtabFind(ct, "BoneMatrices")) {
+                (*out)->AddRef(); g_vsSkinned.insert(*out);
+                if (g_vsSkinned.size() == 1) Log("materials: skinned (character) vertex shaders recognised");
+            }
+        }
     }
     return hr;
 }
@@ -4639,6 +4857,7 @@ static HRESULT STDMETHODCALLTYPE hk_SetVS(IDirect3DDevice9* d, IDirect3DVertexSh
     if (!g_inPostFX) {
         auto it = vs ? g_vsVP.find(vs) : g_vsVP.end();
         g_curVSvp = it != g_vsVP.end() ? it->second : -1;
+        g_curVSSkinned = vs && g_vsSkinned.count(vs) != 0;
     }
     return o_SetVS(d, vs);
 }
@@ -4766,6 +4985,37 @@ static bool BindMaskRT(IDirect3DDevice9* d, IDirect3DTexture9** tex, IDirect3DSu
     o_SetRT(d, 1, *surf);
     return true;
 }
+// pixel shader -> its "character" copy (nullptr = can't be patched); built from GetFunction on first use
+static std::unordered_map<IDirect3DPixelShader9*, IDirect3DPixelShader9*> g_charPS;
+static bool g_charPSBound = false;
+static long g_charDraws = 0;
+static IDirect3DPixelShader9* CharVariant(IDirect3DDevice9* d, IDirect3DPixelShader9* ps)
+{
+    auto it = g_charPS.find(ps);
+    if (it != g_charPS.end()) return it->second;
+    IDirect3DPixelShader9* v = nullptr;
+    UINT n = 0;
+    if (SUCCEEDED(ps->GetFunction(nullptr, &n)) && n >= 8 && n < (1u << 20)) {
+        std::vector<DWORD> code((n + 3) / 4);
+        if (SUCCEEDED(ps->GetFunction(code.data(), &n))) {
+            std::vector<CtabConst> ct;
+            ParseCtab(code.data(), ct);
+            const int mt = MaterialTag(ShaderHash(code.data()));
+            v = BuildTaggedShader(d, code.data(), ct, mt | 8);
+        }
+    }
+    g_charPS[ps] = v;
+    static int fails = 0;
+    if (!v && fails++ < 3) Log("materials: a character shader could not be marked (%p)", (void*)ps);
+    return v;
+}
+// what hk_SetPS bound for the game's current shader
+static IDirect3DPixelShader9* GameBoundPS()
+{
+    if (g_curGS && ReplActive(g_curGS)) return g_curGS->replSsr && cfg.glassSsr > 0 ? g_curGS->replSsr : g_curGS->repl;
+    if (g_curGS && g_curGS->tagged && cfg.matEnable) return g_curGS->tagged;
+    return g_curGamePS;
+}
 static void PreDraw(IDirect3DDevice9* d)
 {
     if (g_inPostFX) return;                       // our own passes (they may run inside a game draw)
@@ -4783,6 +5033,20 @@ static void PreDraw(IDirect3DDevice9* d)
     if (g_curGS && g_curGS->tagged && cfg.matEnable && g_curRTIsHDR) {
         g_matMaskBound = BindMaskRT(d, &g_matMask, &g_matMaskSurf, &g_matMaskFrame, 0, "material");
         if (g_matMaskBound && !g_matTaggedDraws++) Log("materials: first skin/metal draw tagged");
+    }
+    // characters (skinned meshes) in the opaque base pass: the same pixel shader, patched to also write
+    // "character" into the material mask's alpha - window reflections leave characters out
+    if (g_curVSSkinned && cfg.matEnable && g_curRTIsHDR && g_curGamePS && !(g_curGS && ReplActive(g_curGS))) {
+        DWORD blend = TRUE;
+        d->GetRenderState(D3DRS_ALPHABLENDENABLE, &blend);
+        if (!blend) {
+            IDirect3DPixelShader9* v = CharVariant(d, g_curGamePS);
+            if (v && (g_matMaskBound || (g_matMaskBound = BindMaskRT(d, &g_matMask, &g_matMaskSurf, &g_matMaskFrame, 0, "material")))) {
+                o_SetPS(d, v);
+                g_charPSBound = true;
+                if (!g_charDraws++) Log("materials: first character draw marked");
+            }
+        }
     }
     GameShader* gs = g_curGS;
     if (!gs || g_inPostFX || !o_SetPSConstF) return;
@@ -4860,7 +5124,9 @@ static void PreDraw(IDirect3DDevice9* d)
                 o_SetPS(d, ps);     // re-bound before every draw: the game believes its own shader is set
                 const float mapPx = (float)(g_shadowBig ? g_shadowBig : (g_shadowSize ? g_shadowSize : 2048));
                 const float base  = (float)(g_shadowSize ? g_shadowSize : 2048);
-                const float r[4] = { std::max(cfg.shadowRadius, 1) / 10.0f / base, mapPx, 0, 0 };
+                static unsigned shFrame = 0; static unsigned shLastFrame = ~0u;
+                if (shLastFrame != g_frameNo) { shLastFrame = g_frameNo; shFrame = (shFrame + 1) % 64; }
+                const float r[4] = { std::max(cfg.shadowRadius, 1) / 10.0f / base, mapPx, (float)shFrame, 0 };
                 o_SetPSConstF(d, gs->paramReg, r, 1);
                 if (gs->paramReg + 16 <= 224) {
                     float x[6][4] = {};
@@ -4970,27 +5236,64 @@ static void PreDraw(IDirect3DDevice9* d)
         if (gs->paramReg + 16 <= 224) {
             float x[12][4] = {};
             float M[3][3], A[3][3], t[3], cam[3];
-            const bool ok = cfg.glassSsr > 0 && g_prevHdr && g_prevHdrFrame + 1 == g_frameNo && g_vpKey / 64u == g_frameNo &&
-                            g_fx.zcopy && g_fx.zValid && g_fx.fitValid && VpInverse(g_vp, M, A, t, cam);
+            const bool base = cfg.glassSsr > 0 && g_vpKey / 64u == g_frameNo &&
+                              g_fx.zcopy && g_fx.zValid && g_fx.fitValid && VpInverse(g_vp, M, A, t, cam);
+            // colour source: this frame's scene copied just before the first glass draw (preferred), else
+            // the previous frame's finished scene reprojected with its own matrix
+            bool cur = false;
+            if (base && g_curRT && g_curRT == g_hdrSceneSurf) {
+                if (g_glassSrcKey != g_vpKey) {
+                    D3DSURFACE_DESC hd; g_curRT->GetDesc(&hd);
+                    D3DSURFACE_DESC sd = {};
+                    if (g_glassSrcSurf) g_glassSrcSurf->GetDesc(&sd);
+                    const UINT w = std::max(hd.Width / 2, 1u), h = std::max(hd.Height / 2, 1u);
+                    if (!g_glassSrc || sd.Width != w || sd.Height != h || sd.Format != hd.Format) {
+                        if (g_glassSrcSurf) { g_glassSrcSurf->Release(); g_glassSrcSurf = nullptr; }
+                        if (g_glassSrc) { g_glassSrc->Release(); g_glassSrc = nullptr; }
+                        if (SUCCEEDED(d->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, hd.Format, D3DPOOL_DEFAULT, &g_glassSrc, nullptr)))
+                            g_glassSrc->GetSurfaceLevel(0, &g_glassSrcSurf);
+                        else g_glassSrc = nullptr;
+                        Log("glass: same-frame reflection source %ux%u %s", w, h, g_glassSrc ? "created" : "could not be created - previous frame used");
+                    }
+                    g_glassSrcKey = g_vpKey;
+                    if (!g_glassSrcSurf || FAILED(d->StretchRect(g_curRT, nullptr, g_glassSrcSurf, nullptr, D3DTEXF_LINEAR)))
+                        g_glassSrcKey = ~0u - 1;   // failed this frame: fall back
+                }
+                cur = g_glassSrcKey == g_vpKey;
+            }
+            const bool prev = !cur && g_prevHdr && g_prevHdrFrame + 1 == g_frameNo;
+            const bool ok = base && (cur || prev);
             if (ok) {
                 memcpy(x[0], g_vp, sizeof g_vp);
-                memcpy(x[4], g_vpPrev, sizeof g_vpPrev);
+                if (cur) {
+                    // inverse for the back-face test (world = (sx·w, sy·w, w)·A + camera)
+                    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) x[4 + i][j] = A[i][j];
+                    x[7][0] = cam[0]; x[7][1] = cam[1]; x[7][2] = cam[2];
+                    x[11][0] = 1.0f;
+                } else memcpy(x[4], g_vpPrev, sizeof g_vpPrev);
                 x[8][0] = cam[0]; x[8][1] = cam[1]; x[8][2] = cam[2]; x[8][3] = cfg.glassSsr / 100.0f;
                 x[9][0] = g_fx.fitA; x[9][1] = g_fx.fitB; x[9][2] = 2000.0f;
-                x[10][0] = 30.0f; x[10][2] = (float)(g_ppW ? g_ppW : g_bbW); x[10][3] = (float)(g_ppH ? g_ppH : g_bbH);
+                static unsigned jf = 0;
+                x[10][0] = 30.0f; x[10][1] = (float)(jf++ % 64); x[10][2] = (float)(g_ppW ? g_ppW : g_bbW); x[10][3] = (float)(g_ppH ? g_ppH : g_bbH);
                 d->SetTexture(12, g_fx.zcopy);
-                d->SetTexture(13, g_prevHdr);
-                for (DWORD sm = 12; sm <= 13; sm++) {
+                d->SetTexture(13, cur ? g_glassSrc : g_prevHdr);
+                // characters (material mask alpha) are left out of the reflections
+                const bool chars = cur && MatMaskValid() && g_charDraws > 0;
+                d->SetTexture(14, chars ? (IDirect3DBaseTexture9*)g_matMask : nullptr);
+                x[11][1] = chars ? 1.0f : 0.0f;
+                for (DWORD sm = 12; sm <= 14; sm++) {
                     d->SetSamplerState(sm, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
                     d->SetSamplerState(sm, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
                     d->SetSamplerState(sm, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-                    d->SetSamplerState(sm, D3DSAMP_MINFILTER, sm == 12 ? D3DTEXF_POINT : D3DTEXF_LINEAR);
-                    d->SetSamplerState(sm, D3DSAMP_MAGFILTER, sm == 12 ? D3DTEXF_POINT : D3DTEXF_LINEAR);
+                    d->SetSamplerState(sm, D3DSAMP_MINFILTER, sm == 13 ? D3DTEXF_LINEAR : D3DTEXF_POINT);
+                    d->SetSamplerState(sm, D3DSAMP_MAGFILTER, sm == 13 ? D3DTEXF_LINEAR : D3DTEXF_POINT);
                     d->SetSamplerState(sm, D3DSAMP_SRGBTEXTURE, FALSE);
                 }
                 g_glassSsrBound = true;
                 static bool logged = false;
-                if (!logged) { logged = true; Log("glass: screen-space reflections from the previous frame running"); }
+                static int lastSrc = -1;
+                if (lastSrc != (int)cur) { lastSrc = (int)cur; Log("glass: screen-space reflections running (%s)", cur ? "this frame's scene" : "previous frame, reprojected"); }
+                (void)logged;
             }
             o_SetPSConstF(d, gs->paramReg + 4, &x[0][0], 12);
         }
@@ -5020,7 +5323,8 @@ static void PostDrawRestore(IDirect3DDevice9* d)
     if (g_inPostFX) return;
     if (g_glassMaskBound) { o_SetRT(d, 1, nullptr); g_glassMaskBound = false; }
     if (g_matMaskBound) { o_SetRT(d, 1, nullptr); g_matMaskBound = false; }
-    if (g_glassSsrBound) { d->SetTexture(12, nullptr); d->SetTexture(13, nullptr); g_glassSsrBound = false; }
+    if (g_charPSBound) { o_SetPS(d, GameBoundPS()); g_charPSBound = false; }
+    if (g_glassSsrBound) { d->SetTexture(12, nullptr); d->SetTexture(13, nullptr); d->SetTexture(14, nullptr); g_glassSsrBound = false; }
     if (g_fogMaskBound) { o_SetRT(d, 1, nullptr); g_fogMaskBound = false; }
     if (g_bloomBound) { d->SetTexture(10, nullptr); g_bloomBound = false; }
     if (g_preDrawLo < 0) return;
@@ -5094,8 +5398,172 @@ static void ApplyFilter(IDirect3DDevice9* d, DWORD st)
     DWORD b; memcpy(&b, &bias, 4);
     o_SetSamplerState(d, st, D3DSAMP_MIPMAPLODBIAS, b);
 }
+// ---- PlayStation button prompts
+// The game ships the PS3 prompt art next to the Xbox one (UI_ButtonIcons: Callouts.* vs Generic.gp_* /
+// PDA.gp_*), but the PC build only ever binds the Xbox textures. Both are recognised when the game uploads
+// them (FNV-1a of the top mip at UnlockRect - src/buttonicons.h); for each Xbox icon a texture with the
+// PS art placed where the Xbox art sits is drawn once, and SetTexture swaps it in while a Sony pad is in use.
+static bool PadIconsPS();
+typedef HRESULT (STDMETHODCALLTYPE *PFN_TexLock)(IDirect3DTexture9*, UINT, D3DLOCKED_RECT*, const RECT*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_TexUnlock)(IDirect3DTexture9*, UINT);
+static PFN_TexLock o_TexLock = nullptr;
+static PFN_TexUnlock o_TexUnlock = nullptr;
+static const int kBtnN = sizeof kBtnIcons / sizeof kBtnIcons[0];
+static SRWLOCK g_btnLock = SRWLOCK_INIT;
+struct BtnLockSlot { IDirect3DTexture9* t; BYTE* bits; INT pitch; UINT w, h; };
+static BtnLockSlot g_btnSlots[8];
+static std::unordered_map<IDirect3DTexture9*, int> g_btnXbox;     // game texture -> icon
+static IDirect3DTexture9* g_btnPs[kBtnN] = {};                    // the game's PS art for each icon
+static IDirect3DTexture9* g_btnRepl[kBtnN] = {};                  // built replacement (default pool)
+static bool g_btnFailed[kBtnN] = {};
+static volatile bool g_btnAny = false;
+static IDirect3DPixelShader9* g_btnPS = nullptr;
+static IDirect3DVertexShader9* g_btnVS = nullptr;
+static IDirect3DStateBlock9* g_btnSb = nullptr;
+static const char* kBtnBlitPS = R"HLSL(
+sampler2D s0 : register(s0);
+float4 src : register(c0);   // xy offset, zw size (uv) of the PS art
+float4 main(float2 uv : TEXCOORD0) : COLOR0 { return tex2D(s0, src.xy + uv * src.zw); }
+)HLSL";
+static HRESULT STDMETHODCALLTYPE hk_TexLock(IDirect3DTexture9* t, UINT lvl, D3DLOCKED_RECT* lr, const RECT* rc, DWORD fl)
+{
+    HRESULT hr = o_TexLock(t, lvl, lr, rc, fl);
+    if (SUCCEEDED(hr) && lvl == 0 && !rc && lr && !(fl & D3DLOCK_READONLY) && !g_inPostFX && cfg.btnIcons != 1) {
+        D3DSURFACE_DESC sd;
+        if (SUCCEEDED(t->GetLevelDesc(0, &sd)) && sd.Format == D3DFMT_DXT5 && sd.Width <= 64 && sd.Height <= 64 && sd.Width >= 16 && sd.Height >= 16) {
+            AcquireSRWLockExclusive(&g_btnLock);
+            for (auto& sl : g_btnSlots) if (!sl.t) { sl = { t, (BYTE*)lr->pBits, lr->Pitch, sd.Width, sd.Height }; break; }
+            ReleaseSRWLockExclusive(&g_btnLock);
+        }
+    }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hk_TexUnlock(IDirect3DTexture9* t, UINT lvl)
+{
+    if (lvl == 0) {
+        BtnLockSlot sl = {};
+        AcquireSRWLockExclusive(&g_btnLock);
+        for (auto& x : g_btnSlots) if (x.t == t) { sl = x; x = {}; break; }
+        ReleaseSRWLockExclusive(&g_btnLock);
+        if (sl.t && sl.bits) {
+            uint32_t h = 0x811C9DC5u;
+            const UINT rowBytes = (sl.w / 4) * 16;
+            for (UINT r = 0; r < sl.h / 4; r++) {
+                const BYTE* row = sl.bits + (size_t)r * sl.pitch;
+                for (UINT k = 0; k < rowBytes; k++) { h ^= row[k]; h *= 0x01000193u; }
+            }
+            int hits = 0;
+            AcquireSRWLockExclusive(&g_btnLock);
+            for (int i = 0; i < kBtnN; i++) {
+                if (kBtnIcons[i].xbox == h && !g_btnXbox.count(t)) { t->AddRef(); g_btnXbox[t] = i; hits++; }
+                if (kBtnIcons[i].ps == h && g_btnPs[i] != t) { t->AddRef(); if (g_btnPs[i]) g_btnPs[i]->Release(); g_btnPs[i] = t; hits++; }
+            }
+            if (hits) g_btnAny = true;
+            ReleaseSRWLockExclusive(&g_btnLock);
+            static int logged = 0;
+            if (hits && logged++ < 2) Log("buttons: game prompt textures recognised (%d so far)", (int)g_btnXbox.size());
+        }
+    }
+    return o_TexUnlock(t, lvl);
+}
+static void BtnInstall(IDirect3DDevice9* dev)
+{
+    IDirect3DTexture9* t = nullptr;
+    if (FAILED(dev->CreateTexture(16, 16, 1, 0, D3DFMT_DXT5, D3DPOOL_MANAGED, &t, nullptr)) || !t) {
+        Log("buttons: can't watch texture uploads - PlayStation prompts unavailable"); return;
+    }
+    void* p;
+    if ((p = PatchVtbl(t, 19, (void*)hk_TexLock))) o_TexLock = (PFN_TexLock)p;
+    if ((p = PatchVtbl(t, 20, (void*)hk_TexUnlock))) o_TexUnlock = (PFN_TexUnlock)p;
+    t->Release();
+    Log("buttons: watching texture uploads for the game's prompt icons (%d known)", kBtnN);
+}
+static void BtnReleaseDefault()
+{
+    for (auto& r : g_btnRepl) if (r) { r->Release(); r = nullptr; }
+    for (auto& f : g_btnFailed) f = false;
+    if (g_btnSb) { g_btnSb->Release(); g_btnSb = nullptr; }
+}
+// Draws the missing replacements (a few per frame at most) - called at Present, outside the game's drawing
+static void BtnBuild(IDirect3DDevice9* dev)
+{
+    if (!g_btnAny || !PadIconsPS()) return;
+    int todo[4], n = 0;
+    AcquireSRWLockShared(&g_btnLock);
+    for (auto& kv : g_btnXbox) {
+        const int i = kv.second;
+        if (!g_btnRepl[i] && !g_btnFailed[i] && g_btnPs[i] && n < 4) { bool dup = false; for (int k = 0; k < n; k++) dup |= todo[k] == i; if (!dup) todo[n++] = i; }
+    }
+    ReleaseSRWLockShared(&g_btnLock);
+    if (!n) return;
+    if (!g_btnPS) g_btnPS = CompilePS(dev, kBtnBlitPS, "PlayStation prompt blit");
+    if (!g_btnVS) g_btnVS = CompileVS(dev, kQuadVS, "PlayStation prompt quad");
+    if (!g_btnPS || !g_btnVS) { for (auto& f : g_btnFailed) f = true; return; }
+    if (!g_btnSb && FAILED(dev->CreateStateBlock(D3DSBT_ALL, &g_btnSb))) return;
+    g_inPostFX = true;
+    g_btnSb->Capture();
+    IDirect3DSurface9 *oldRT = nullptr, *oldDS = nullptr;
+    dev->GetRenderTarget(0, &oldRT);
+    dev->GetDepthStencilSurface(&oldDS);
+    dev->SetDepthStencilSurface(nullptr);
+    dev->SetVertexShader(g_btnVS);
+    dev->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
+    const DWORD rs[][2] = { { D3DRS_ZENABLE, FALSE }, { D3DRS_ZWRITEENABLE, FALSE }, { D3DRS_STENCILENABLE, FALSE },
+        { D3DRS_ALPHABLENDENABLE, FALSE }, { D3DRS_ALPHATESTENABLE, FALSE }, { D3DRS_CULLMODE, D3DCULL_NONE },
+        { D3DRS_SCISSORTESTENABLE, FALSE }, { D3DRS_SRGBWRITEENABLE, FALSE }, { D3DRS_COLORWRITEENABLE, 0xF } };
+    for (auto& r : rs) dev->SetRenderState((D3DRENDERSTATETYPE)r[0], r[1]);
+    for (DWORD st = 1; st < 8; st++) dev->SetTexture(st, nullptr);
+    dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+    int built = 0;
+    for (int k = 0; k < n; k++) {
+        const int i = todo[k];
+        const BtnIcon& ic = kBtnIcons[i];
+        IDirect3DTexture9* xt = nullptr;
+        for (auto& kv : g_btnXbox) if (kv.second == i) { xt = kv.first; break; }
+        D3DSURFACE_DESC xd;
+        if (!xt || FAILED(xt->GetLevelDesc(0, &xd))) { g_btnFailed[i] = true; continue; }
+        const UINT W = xd.Width * 2, H = xd.Height * 2;          // a little extra resolution for the PS art
+        IDirect3DTexture9* rt = nullptr; IDirect3DSurface9* s = nullptr;
+        if (FAILED(dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &rt, nullptr)) ||
+            FAILED(rt->GetSurfaceLevel(0, &s))) { if (rt) rt->Release(); g_btnFailed[i] = true; continue; }
+        dev->ColorFill(s, nullptr, 0);                            // transparent
+        const DWORD vx = (DWORD)(ic.dst[0] * W + 0.5f), vy = (DWORD)(ic.dst[1] * H + 0.5f);
+        const DWORD vw = std::max<DWORD>((DWORD)(ic.dst[2] * W + 0.5f), 1), vh = std::max<DWORD>((DWORD)(ic.dst[3] * H + 0.5f), 1);
+        dev->SetRenderTarget(0, s);
+        D3DVIEWPORT9 vp = { vx, vy, std::min(vw, W - vx), std::min(vh, H - vy), 0.0f, 1.0f };
+        dev->SetViewport(&vp);
+        const float hp[4] = { -1.0f / vp.Width, 1.0f / vp.Height, 0, 0 };
+        dev->SetVertexShaderConstantF(0, hp, 1);
+        dev->SetPixelShaderConstantF(0, ic.src, 1);
+        DrawFullscreen(dev, g_btnPs[i], s, g_btnPS);
+        s->Release();
+        g_btnRepl[i] = rt;
+        built++;
+    }
+    dev->SetTexture(0, nullptr);
+    dev->SetRenderTarget(0, oldRT);
+    dev->SetDepthStencilSurface(oldDS);
+    g_btnSb->Apply();
+    if (oldRT) oldRT->Release();
+    if (oldDS) oldDS->Release();
+    g_inPostFX = false;
+    static int total = 0;
+    total += built;
+    if (built && total == built) Log("buttons: PlayStation prompts in use");
+}
 static HRESULT STDMETHODCALLTYPE hk_SetTexture(IDirect3DDevice9* d, DWORD st, IDirect3DBaseTexture9* t)
 {
+    if (g_btnAny && t && !g_inPostFX && PadIconsPS()) {
+        AcquireSRWLockShared(&g_btnLock);
+        auto it = g_btnXbox.find((IDirect3DTexture9*)t);
+        if (it != g_btnXbox.end() && g_btnRepl[it->second]) t = g_btnRepl[it->second];
+        ReleaseSRWLockShared(&g_btnLock);
+    }
     HRESULT hr = o_SetTexture(d, st, t);
     if (st < 16 && !g_inPostFX && AnisoOn()) {
         const bool plain = TexIsPlain(t);
@@ -5419,6 +5887,7 @@ static void CalibrateDepth(IDirect3DDevice9* dev)
 // ==========================================================================
 static volatile bool g_menuOpen = false;
 static void MenuInputReport();
+static void ApplyPreset(int p);
 
 // ---- events from the main thread -> render thread
 struct MenuEv { int type, a, b; };              // 0 = key(vk, down), 1 = char, 2 = wheel(delta)
@@ -5561,12 +6030,36 @@ static BOOL WINAPI hk_SetCursorPos(int x, int y)
     return o_SetCursorPos(x, y);
 }
 
+// What kind of device an IDirectInputDevice8 is (GetCapabilities, vtable 3): the game doesn't necessarily
+// create its mouse with GUID_SysMouse (it can use the instance GUID from an enumeration), so the menu's
+// blocking goes by type. 0x12 = DI8DEVTYPE_MOUSE, 0x13 = DI8DEVTYPE_KEYBOARD.
+static std::unordered_map<void*, BYTE> g_diType;
+static SRWLOCK g_diTypeLock = SRWLOCK_INIT;
+static BYTE DIDevType(void* dev)
+{
+    AcquireSRWLockShared(&g_diTypeLock);
+    auto it = g_diType.find(dev);
+    const int known = it != g_diType.end() ? it->second : -1;
+    ReleaseSRWLockShared(&g_diTypeLock);
+    if (known >= 0) return (BYTE)known;
+    struct { DWORD dwSize, dwFlags, dwDevType, dwAxes, dwButtons, dwPOVs, a, b, c, d, e; } caps = {};
+    caps.dwSize = sizeof caps;
+    BYTE t = 0;
+    if (SUCCEEDED(((HRESULT(STDMETHODCALLTYPE*)(void*, void*))(*(void***)dev)[3])(dev, &caps))) t = (BYTE)(caps.dwDevType & 0xFF);
+    AcquireSRWLockExclusive(&g_diTypeLock);
+    g_diType[dev] = t;
+    ReleaseSRWLockExclusive(&g_diTypeLock);
+    return t;
+}
+static bool DIIsMouse(void* dev) { return dev == g_diMouse || DIDevType(dev) == 0x12; }
+static bool DIIsKeyboard(void* dev) { return dev == g_diKeyboard || DIDevType(dev) == 0x13; }
 static HRESULT STDMETHODCALLTYPE hk_DIGetState(void* self, DWORD cb, void* data)
 {
     auto orig = (PFN_DIGetState)FindOrig(g_vtState, 8, self);
     HRESULT hr = orig ? orig(self, cb, data) : E_FAIL;
     if (SUCCEEDED(hr) && data) {
-        if (self == g_diMouse && cb >= 12) {
+        const bool mouse = DIIsMouse(self), kbd = !mouse && DIIsKeyboard(self);
+        if (mouse && cb >= 12) {
             const LONG* st = (const LONG*)data;
             InterlockedExchangeAdd(&g_miceX, st[0]);
             InterlockedExchangeAdd(&g_miceY, st[1]);
@@ -5576,13 +6069,13 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetState(void* self, DWORD cb, void* data)
             g_haveDIMouse = true;
         }
         if (g_menuOpen) {
-            if (self == g_diMouse) InterlockedIncrement(&g_mdStateMouse);
-            else if (self != g_diKeyboard) {
+            if (mouse) InterlockedIncrement(&g_mdStateMouse);
+            else if (!kbd) {
                 InterlockedIncrement(&g_mdOther);
                 if (cb >= 8 && (((const LONG*)data)[0] || ((const LONG*)data)[1])) InterlockedIncrement(&g_mdOtherMove);
             }
         }
-        if (g_menuOpen && (self == g_diMouse || self == g_diKeyboard)) memset(data, 0, cb);
+        if (g_menuOpen && (mouse || kbd)) memset(data, 0, cb);
     }
     return hr;
 }
@@ -5607,8 +6100,9 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetData(void* self, DWORD cbObj, void* rgd
     if (!orig) return E_FAIL;
     // Menu open: the game reads the mouse buffer in small chunks and stops when it gets nothing back,
     // so a fast mouse would pile up events (slow, laggy cursor). Drain the whole buffer here instead.
-    if (g_menuOpen && self == g_diMouse) InterlockedIncrement(&g_mdDataMouse);
-    if (g_menuOpen && self == g_diMouse && inout && cbObj >= 8 && cbObj <= 64 && !(flags & 1 /*DIGDD_PEEK*/)) {
+    const bool mouse = DIIsMouse(self), kbd = !mouse && DIIsKeyboard(self);
+    if (g_menuOpen && mouse) InterlockedIncrement(&g_mdDataMouse);
+    if (g_menuOpen && mouse && inout && cbObj >= 8 && cbObj <= 64 && !(flags & 1 /*DIGDD_PEEK*/)) {
         BYTE buf[64 * 64];
         for (int guard = 0; guard < 64; guard++) {
             DWORD n = sizeof(buf) / cbObj;
@@ -5622,21 +6116,37 @@ static HRESULT STDMETHODCALLTYPE hk_DIGetData(void* self, DWORD cbObj, void* rgd
     }
     HRESULT hr = orig(self, cbObj, rgdod, inout, flags);
     if (SUCCEEDED(hr) && inout) {
-        if (self == g_diMouse && rgdod && cbObj >= 8) AccumulateMouseData(rgdod, cbObj, *inout);
-        if (g_menuOpen && self != g_diMouse && self != g_diKeyboard && *inout) { InterlockedIncrement(&g_mdOther); InterlockedIncrement(&g_mdOtherMove); }
-        if (g_menuOpen && (self == g_diMouse || self == g_diKeyboard)) *inout = 0;
+        if (mouse && rgdod && cbObj >= 8) AccumulateMouseData(rgdod, cbObj, *inout);
+        if (g_menuOpen && !mouse && !kbd && *inout) { InterlockedIncrement(&g_mdOther); InterlockedIncrement(&g_mdOtherMove); }
+        if (g_menuOpen && (mouse || kbd)) *inout = 0;
     }
     return hr;
 }
 
+static volatile DWORD g_padThreadId = 0;   // pad.h's DirectInput scan thread
 static HRESULT STDMETHODCALLTYPE hk_DICreateDevice(void* self, REFGUID guid, void** dev, void* outer)
 {
     auto orig = (PFN_DICreateDevice)FindOrig(g_vtCreate, 4, self);
     HRESULT hr = orig ? orig(self, guid, dev, outer) : E_FAIL;
+    // our controller scan shares DirectInput's vtables: its devices (and the mouse / keyboard objects
+    // DirectInput creates while enumerating) must not replace the game's mouse - that broke the menu's
+    // mouse blocking (camera moved with the menu open) and flooded the log every 2 s
+    if (SUCCEEDED(hr) && dev && *dev) {
+        AcquireSRWLockExclusive(&g_diTypeLock);
+        g_diType.erase(*dev);
+        ReleaseSRWLockExclusive(&g_diTypeLock);
+    }
+    if (GetCurrentThreadId() == g_padThreadId) return hr;
     if (SUCCEEDED(hr) && dev && *dev) {
         const char* kind = "other";
-        if (IsEqualGUID(guid, kGUID_SysMouse))    { if (g_diMouse && g_diMouse != *dev) Log("menu: the game made a new mouse device (old %p)", g_diMouse); g_diMouse = *dev; kind = "mouse"; }
-        if (IsEqualGUID(guid, kGUID_SysKeyboard)) { g_diKeyboard = *dev; kind = "keyboard"; }
+        // once the game has its mouse / keyboard, only its own (main) thread may replace them
+        const bool mayReplace = !g_mainThread || GetCurrentThreadId() == g_mainThread;
+        if (IsEqualGUID(guid, kGUID_SysMouse) && (!g_diMouse || mayReplace)) {
+            if (g_diMouse && g_diMouse != *dev) Log("menu: the game made a new mouse device (old %p)", g_diMouse);
+            g_diMouse = *dev; kind = "mouse";
+        }
+        if (IsEqualGUID(guid, kGUID_SysKeyboard) && (!g_diKeyboard || mayReplace)) { g_diKeyboard = *dev; kind = "keyboard"; }
+        if (!strcmp(kind, "other") && !mayReplace) { HookSlot(g_vtState, 8, *dev, 9, (void*)hk_DIGetState); HookSlot(g_vtData, 8, *dev, 10, (void*)hk_DIGetData); return hr; }
         HookSlot(g_vtState, 8, *dev, 9, (void*)hk_DIGetState);   // IDirectInputDevice8::GetDeviceState
         HookSlot(g_vtData, 8, *dev, 10, (void*)hk_DIGetData);    // IDirectInputDevice8::GetDeviceData
         Log("menu: DirectInput %s device %p hooked", kind, *dev);
@@ -5768,6 +6278,10 @@ static bool SaveConfig()
     WriteIniInt("Textures", "Anisotropy", cfg.anisotropy);
     WriteIniInt("Shadows", "ContactShadows", cfg.contactShadows);
     WriteIniInt("Textures", "LodBias", cfg.lodBias);
+    WriteIniInt("Shaders", "DiskCache", cfg.shaderCache);
+    WriteIniInt("Game", "RawMouse", cfg.rawMouse);
+    WriteIniInt("Controller", "ButtonIcons", cfg.btnIcons);
+    WriteIniInt("Game", "UITextScale", cfg.uiTextScale);
     WritePrivateProfileStringA("Shaders", "Compiler", cfg.compiler == 2 ? "game" : cfg.compiler == 1 ? "47" : "auto", g_ini);
     WriteIniInt("Shadows", "Scale", cfg.shadowScale);
     WriteIniInt("Shadows", "Softness", cfg.shadowSoft);
@@ -5942,10 +6456,14 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.20.3", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.24.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
+            ImGui::TextUnformatted("Preset:"); ImGui::SameLine();
+            static const char* pn[4] = { "Performance", "Balanced", "Quality", "Ultra" };
+            for (int i = 0; i < 4; i++) { if (i) ImGui::SameLine(); if (ImGui::Button(pn[i])) { ApplyPreset(i); MenuNote("Preset applied - Save to keep it. Shadow resolution changes after a restart."); } }
+            ImGui::TextDisabled("Sets the heavier effects at once; fine-tune below. Quality = the defaults.");
             if (ImGui::BeginTabBar("video")) {
             if (ImGui::BeginTabItem("Image")) {
                 bool en = g_fx.enabled;
@@ -6054,7 +6572,7 @@ static void DrawMenu()
             ImGui::SliderInt("Glass bumpiness", &cfg.glassBump, 0, 300, "%d %%");
             ImGui::SliderInt("Glass refraction", &cfg.glassRefract, 0, 300, "%d %%");
             ImGui::SliderInt("Screen-space glass reflections", &cfg.glassSsr, 0, 200, cfg.glassSsr ? "%d %%" : "off (cubemap only)");
-            ImGui::TextDisabled("Windows reflect the room from the previous frame; the cubemap fills in where it can't.");
+            ImGui::TextDisabled("Windows reflect the surroundings on screen this frame (not characters); the cubemap fills in the rest.");
             if (ImGui::Button("Game's glass")) { cfg.glassClarity = 100; cfg.glassRefl = 100; cfg.glassFresnel = 0; cfg.glassReflContrast = 100; cfg.glassBump = 100; cfg.glassRefract = 100; }
             ImGui::SameLine();
             if (ImGui::Button("APRenewal defaults")) { cfg.glassClarity = 65; cfg.glassRefl = 160; cfg.glassFresnel = 70; cfg.glassReflContrast = 30; cfg.glassBump = 100; cfg.glassRefract = 100; }
@@ -6208,6 +6726,12 @@ static void DrawMenu()
                 ImGui::SliderInt("Rumble", &g_padCfg.rumble, 0, 200, g_padCfg.rumble ? "%d %%" : "off");
                 ImGui::SliderInt("Extra stick dead zone", &g_padCfg.deadzone, 0, 30, g_padCfg.deadzone ? "%d %%" : "game's own");
                 CheckboxInt("Touchpad click = Back", &g_padCfg.touchpadBack);
+                {
+                    static const char* bi[] = { "Automatic (PlayStation while a Sony pad is in use)", "Always Xbox", "Always PlayStation" };
+                    ImGui::Combo("Button prompts", &cfg.btnIcons, bi, 3);
+                    ImGui::TextDisabled("Uses the PS3 prompt art the game ships. %d of the game's prompt textures recognised so far%s.",
+                                        (int)g_btnXbox.size(), PadIconsPS() ? " - PlayStation prompts showing" : "");
+                }
                 bool lightOn = g_padCfg.light >= 0;
                 if (ImGui::Checkbox("Set the Sony light bar colour", &lightOn)) g_padCfg.light = lightOn ? 0x2060FF : -1;
                 if (g_padCfg.light >= 0) {
@@ -6238,6 +6762,13 @@ static void DrawMenu()
             if (ImGui::Button("Apply")) ApplyDrawDistance();
             ImGui::TextDisabled("How far away objects are still drawn and keep their detailed models (100 = game). Applied at");
             ImGui::TextDisabled("every level load; needs the console.");
+            if (CheckboxInt("Raw mouse (no mouse smoothing)", &cfg.rawMouse)) ApplyMouseSmoothing();
+            ImGui::SliderInt("UI text scale", &cfg.uiTextScale, 50, 250, "%d %%");
+            ImGui::SameLine();
+            if (ImGui::Button("Apply##uits")) { g_uiScaleTouched = true; ApplyUiTextScale(); MenuNote("Applied - screens opened from now on use it."); }
+            ImGui::TextDisabled("Subtitles, HUD and menu text (the game's fonts are made for 720p-1080p). Screens already");
+            ImGui::TextDisabled("on screen keep the old size until they reopen. Needs the console. Try 133 at 1440p, 200 at 4K.");
+            ImGui::TextDisabled("Turns off Unreal's mouse smoothing for direct 1:1 aiming. Needs the console.");
             ImGui::SeparatorText("Developer console");
             if (!g_conOk) ImGui::TextDisabled("Unavailable (see the log: console:).");
             else {
@@ -6335,6 +6866,16 @@ static void DrawMenu()
             {
                 static const char* cn[] = { "Auto (Windows' d3dcompiler_47)", "d3dcompiler_47", "Game's D3DX (2009)" };
                 if (ImGui::Combo("Shader compiler", &cfg.compiler, cn, 3)) MenuNote("Applies at next launch.");
+                CheckboxInt("Cache compiled shaders on disk (faster start, no hitches)", &cfg.shaderCache);
+                ImGui::SameLine();
+                if (ImGui::Button("Clear cache")) {
+                    char dir[MAX_PATH], pat[MAX_PATH]; PathJoin(dir, g_dir, "APRenewal\\shadercache");
+                    snprintf(pat, MAX_PATH, "%s\\*.cso", dir);
+                    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd); int n = 0;
+                    if (h != INVALID_HANDLE_VALUE) { do { char f[MAX_PATH]; snprintf(f, MAX_PATH, "%s\\%s", dir, fd.cFileName); if (DeleteFileA(f)) n++; } while (FindNextFileA(h, &fd)); FindClose(h); }
+                    char note[96]; snprintf(note, sizeof note, "Removed %d cached shaders.", n); MenuNote(note);
+                }
+                ImGui::TextDisabled("This session: %ld loaded from the cache, %ld compiled and stored.", g_cacheHits, g_cacheStores);
                 ImGui::TextDisabled("Used for APRenewal's own shaders: %s.", g_compilerUsed == 1 ? "d3dcompiler_47" : g_compilerUsed == 2 ? "the game's D3DX" : "none compiled yet");
             }
             if (ImGui::Button("Shader census (one frame)")) { g_censusArm = true; MenuNote("Shader list written to the log (census:)."); }
@@ -6377,6 +6918,24 @@ static void DrawMenu()
     if (!open || ImGui::IsKeyPressed(ImGuiKey_Escape)) { g_menuOpen = false; MenuInputReport(); }
 }
 
+// Quality presets: set the live effects in one go (shadow map resolution applies after a restart)
+static void ApplyPreset(int p)
+{
+    struct P { int shadowScale, shadowFilter, contact, ssr, metalRefl, glassSsr, shafts, bloomModern, bokeh, aaMode, taa, sss, ao, aniso; };
+    static const P k[4] = {
+        { 1, 1,  0, 0,  0,   0,  0,  0, 0, 1, 0,  0, 1,  8 },   // performance
+        { 2, 1, 40, 1, 25, 100, 40, 35, 0, 2, 1, 40, 1, 16 },   // balanced
+        { 2, 2, 60, 1, 25, 100, 60, 35, 1, 2, 1, 40, 1, 16 },   // quality (the defaults)
+        { 4, 3, 70, 1, 35, 100, 60, 45, 1, 2, 1, 50, 1, 16 },   // ultra
+    };
+    const P& v = k[std::min(std::max(p, 0), 3)];
+    cfg.shadowScale = v.shadowScale; cfg.shadowFilter = v.shadowFilter; cfg.contactShadows = v.contact;
+    cfg.ssr = v.ssr; cfg.metalRefl = v.metalRefl; cfg.glassSsr = v.glassSsr; cfg.shafts = v.shafts;
+    cfg.bloomModern = v.bloomModern; cfg.bokeh = v.bokeh; cfg.aaMode = v.aaMode; cfg.fxaa = 1; cfg.taa = v.taa;
+    cfg.sssStrength = v.sss; cfg.aoEnable = v.ao; cfg.anisotropy = v.aniso;
+    static const char* names[4] = { "Performance", "Balanced", "Quality", "Ultra" };
+    Log("menu: preset %s", names[std::min(std::max(p, 0), 3)]);
+}
 static void MenuInputReport()
 {
     Log("menu closed (while open, the game read: mouse state %ld x, mouse buffer %ld x - both blanked; other devices %ld x, "
@@ -6501,6 +7060,7 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDirect3DDevice9* dev, const RECT* a
 {
     TraceFrameBoundary(dev);
     PostFXHotkey();
+    if (dev->TestCooperativeLevel() == D3D_OK) BtnBuild(dev);
     if (dev->TestCooperativeLevel() == D3D_OK) CalibrateDepth(dev);
     if (dev->TestCooperativeLevel() == D3D_OK) {
         // world target still bound at Present (no switch happened): process it now
@@ -6599,6 +7159,7 @@ static HRESULT STDMETHODCALLTYPE hk_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARA
     g_rt0Scale = 1;
     for (int i = 0; i < 16; i++) { g_gameMin[i] = D3DTEXF_POINT; g_gameAniso[i] = 1; g_gameBias[i] = 0; g_stagePlain[i] = false; }
     GlassMaskRelease();
+    BtnReleaseDefault();
     BloomRelease();
     g_bbPtr = nullptr; g_curRT = nullptr; g_worldRT = nullptr; g_bbW = g_bbH = 0;
     DumpPP("Reset (game)", pp);
@@ -6639,6 +7200,7 @@ static HRESULT STDMETHODCALLTYPE hk_CreateDevice(IDirect3D9* d3d, UINT adapter, 
         if ((p = PatchVtbl(*out, 29, (void*)hk_CreateDS))) o_CreateDS = (PFN_CreateDS)p;
         if ((p = PatchVtbl(*out, 21, (void*)hk_SetGammaRamp))) o_SetGammaRamp = (PFN_SetGammaRamp)p;
         HookTraceVtbl(*out);
+        BtnInstall(*out);
         InstallWndProcHook();
     }
     return hr;
@@ -6761,7 +7323,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.20.3 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.24.1 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

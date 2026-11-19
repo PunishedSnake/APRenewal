@@ -513,11 +513,12 @@ static void DiPoll()
 // ---------------------------------------------------------------- background thread
 static DWORD WINAPI PadThread(LPVOID)
 {
+    g_padThreadId = GetCurrentThreadId();
     DWORD lastScan = 0;
     bool diTried = false;
     while (!g_exiting) {
         const DWORD now = GetTickCount();
-        if (now - lastScan > 2000 || !lastScan) {
+        if (now - lastScan > 3000 || !lastScan) {
             lastScan = now;
             if (g_padCfg.enable && g_padCfg.sony) SonyScan();
             if (g_padCfg.enable && g_padCfg.dinput) {
@@ -597,6 +598,20 @@ static void PadMergeStick(SHORT& dx, SHORT& dy, SHORT sx, SHORT sy)
     if ((int)sx * sx + (int)sy * sy > (int)dx * dx + (int)dy * dy) { dx = sx; dy = sy; }
 }
 
+// for the button prompts: last real input from a Sony pad vs. any other pad
+static volatile DWORD g_lastSonyAct = 0, g_lastOtherAct = 0;
+static volatile bool g_sonyConnected = false;
+static bool g_xiActive = false;
+// PlayStation prompts: forced by [Controller] ButtonIcons=2, never with 1; automatic otherwise - a Sony pad
+// gave the latest input (Steam Input / DS4Windows mirror it as an Xbox pad at the same moment: ties go to Sony)
+static bool PadIconsPS()
+{
+    if (cfg.btnIcons == 1) return false;
+    if (cfg.btnIcons == 2) return true;
+    const DWORD s = g_lastSonyAct, o = g_lastOtherAct;
+    if (!s) return g_sonyConnected && !o;
+    return !o || (LONG)(s - o) >= -500;
+}
 // returns false when nothing is connected
 static bool PadRead(XIGamepad& g)
 {
@@ -608,6 +623,7 @@ static bool PadRead(XIGamepad& g)
         PadMergeStick(m.lx, m.ly, s.lx, s.ly); PadMergeStick(m.rx, m.ry, s.rx, s.ry);
         any = true;
     };
+    g_xiActive = false;
     if (g_xiGet && (g_padCfg.xinput || !g_padCfg.enable)) {
         const DWORD now = GetTickCount();
         for (DWORD i = 0; i < 4; i++) {
@@ -618,6 +634,7 @@ static bool PadRead(XIGamepad& g)
             if (!g_xiConn[i]) { g_xiRetry[i] = now ? now : 1; continue; }
             PadState p = { s.Gamepad.wButtons, s.Gamepad.bLeftTrigger, s.Gamepad.bRightTrigger,
                            s.Gamepad.sThumbLX, s.Gamepad.sThumbLY, s.Gamepad.sThumbRX, s.Gamepad.sThumbRY };
+            if (p.buttons || p.lt > 40 || p.rt > 40 || abs(p.lx) > 8000 || abs(p.ly) > 8000 || abs(p.rx) > 8000 || abs(p.ry) > 8000) g_xiActive = true;
             add(p);
         }
     }
@@ -630,6 +647,18 @@ static bool PadRead(XIGamepad& g)
     }
     if (!any) return false;
     PadApplyRemap(m.buttons);
+    // which kind of pad is in use (button prompts): the last one with real input
+    {
+        auto active = [](const PadState& s) { return s.buttons || s.lt > 40 || s.rt > 40 || abs(s.lx) > 8000 || abs(s.ly) > 8000 || abs(s.rx) > 8000 || abs(s.ry) > 8000; };
+        const DWORD now = GetTickCount();
+        bool sonyConn = false;
+        AcquireSRWLockShared(&g_padLock);
+        for (auto& d : g_sony) if (d.alive) { sonyConn = true; if (d.tick && now - d.tick < 1500 && active(d.st)) g_lastSonyAct = now; }
+        for (int i = 0; i < g_diN; i++) if (g_diDev[i].ok && active(g_diDev[i].st)) g_lastOtherAct = now;
+        ReleaseSRWLockShared(&g_padLock);
+        if (g_xiActive) g_lastOtherAct = now;
+        g_sonyConnected = sonyConn;
+    }
     PadDeadzone(m.lx, m.ly); PadDeadzone(m.rx, m.ry);
     g = { m.buttons, m.lt, m.rt, m.lx, m.ly, m.rx, m.ry };
     return true;
@@ -725,23 +754,22 @@ static void PadDescribe()
 
 // ---------------------------------------------------------------- automatic gamepad <-> keyboard/mouse
 // The game's "Enable gamepad" option (APProfileManager.ProfileSettings.bUsingXboxController, bit 0 at
-// +0x13C of the profile manager, global pointer 0x16F9A00 in the Steam/GOG exe) turns keyboard and mouse
-// off. The game re-reads it every tick (0xAC7B48 / 0xAC9038: "using gamepad" = pad connected && bit),
-// so flipping the bit to whatever was touched last switches modes on the fly, prompts included.
+// +0x13C of the profile manager) turns keyboard and mouse off. The game re-reads it every tick in two
+// places ("using gamepad" = pad connected && bit), so flipping the bit to whatever was touched last
+// switches modes on the fly, prompts included. Both sites are found by signature (GOG and Steam), and
+// the profile manager's global pointer is read from their `mov eax,[global]`.
 static int g_autoSwOk = -1;           // -1 unchecked, 0 exe doesn't match, 1 ok
+static BYTE** g_profileMgr = nullptr;
 static void PadAutoSwitchTick()
 {
     if (!g_padCfg.autoSwitch || g_menuOpen || !g_padStarted) return;
     if (g_autoSwOk < 0) {
-        static const BYTE a[] = { 0xA1, 0x00, 0x9A, 0x6F, 0x01 };                 // mov eax, [0x16F9A00]
-        static const BYTE b[] = { 0xF6, 0x80, 0x3C, 0x01, 0x00, 0x00, 0x01 };     // test byte [eax+0x13C], 1
-        MEMORY_BASIC_INFORMATION mbi = {};
-        const bool mapped = VirtualQuery((const void*)0xAC7B48, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
-                            (BYTE*)mbi.AllocationBase == (BYTE*)GetModuleHandleA(nullptr);
-        g_autoSwOk = mapped && !memcmp((const void*)0xAC7B48, a, 5) && !memcmp((const void*)0xAC7B51, b, 7) &&
-                     !memcmp((const void*)0xAC902F, a, 5) && !memcmp((const void*)0xAC9038, b, 7);
-        Log(g_autoSwOk ? "pad: automatic gamepad / keyboard switching ready" :
-                         "pad: unknown APGame.exe - automatic gamepad / keyboard switching off");
+        BYTE* a = FindUnique("A1 ? ? ? ? 85 C0 74 ? F6 80 3C 01 00 00 01 74 ? 81 A7 FC 01 00 00 FF F7 FF FF");
+        BYTE* b = FindUnique("A1 ? ? ? ? 85 C0 74 ? F6 80 3C 01 00 00 01 74 ? 81 A6 FC 01 00 00 FF F7 FF FF");
+        g_autoSwOk = a && b && *(DWORD*)(a + 1) == *(DWORD*)(b + 1);
+        if (g_autoSwOk) g_profileMgr = *(BYTE***)(a + 1);
+        if (g_autoSwOk) Log("pad: automatic gamepad / keyboard switching ready (profile manager at %p)", (void*)g_profileMgr);
+        else Log("pad: unknown APGame.exe - automatic gamepad / keyboard switching off");
     }
     if (!g_autoSwOk) return;
     // in keyboard mode the game may stop polling the pad: look ourselves so a button press switches back
@@ -759,7 +787,7 @@ static void PadAutoSwitchTick()
     const DWORD pad = g_padTick, kbm = g_kbmTick;
     if (!pad && !kbm) return;
     const bool wantPad = (LONG)(pad - kbm) > 0;
-    BYTE* pm = *(BYTE**)0x16F9A00;
+    BYTE* pm = *g_profileMgr;
     if (!pm) return;
     BYTE& bits = pm[0x13C];
     const bool isPad = bits & 1;
