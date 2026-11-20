@@ -4568,7 +4568,7 @@ static bool GlassSsrBlocked()
         char p[MAX_PATH]; GlassSsrPath(p);
         char buf[64] = "";
         if (FILE* f = fopen(p, "rb")) { fread(buf, 1, sizeof buf - 1, f); fclose(f); }
-        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.24.1") ? 1 : 0;
+        g_glassSsrBlocked = !strcmp(buf, "APRenewal 0.24.2") ? 1 : 0;
         if (g_glassSsrBlocked) Log("glass: the reflection shader crashed the compiler last time - glass reflections stay cubemap-only (delete %s to retry)", p);
         else if (buf[0]) DeleteFileA(p);
     }
@@ -4577,7 +4577,7 @@ static bool GlassSsrBlocked()
 static void GlassSsrMarker(bool on)
 {
     char p[MAX_PATH]; GlassSsrPath(p);
-    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.24.1", f); fclose(f); } }
+    if (on) { if (FILE* f = fopen(p, "wb")) { fputs("APRenewal 0.24.2", f); fclose(f); } }
     else DeleteFileA(p);
 }
 
@@ -5332,19 +5332,21 @@ static void PostDrawRestore(IDirect3DDevice9* d)
     g_preDrawLo = g_preDrawHi = -1;
 }
 
+static volatile bool g_promptCensusOn = false;
+static void PromptCensusDraw(IDirect3DDevice9* d, const void* v, UINT stride, UINT verts);
 static void AfterDraw(IDirect3DDevice9* d)
 {
     PostDrawRestore(d);
     if (g_hdrArm && !g_inPostFX && g_curRT == g_bbPtr) { g_hdrArm = false; HdrExpand(d); }
 }
 static HRESULT STDMETHODCALLTYPE hk_DP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b)
-{ TraceDraw(false); PreDraw(d); HRESULT hr = o_DP(d, t, a, b); AfterDraw(d); return hr; }
+{ if (g_promptCensusOn) PromptCensusDraw(d, nullptr, 0, 0); TraceDraw(false); PreDraw(d); HRESULT hr = o_DP(d, t, a, b); AfterDraw(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hk_DIP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f)
-{ TraceDraw(false); PreDraw(d); HRESULT hr = o_DIP(d, t, a, b, c, e, f); AfterDraw(d); return hr; }
+{ if (g_promptCensusOn) PromptCensusDraw(d, nullptr, 0, 0); TraceDraw(false); PreDraw(d); HRESULT hr = o_DIP(d, t, a, b, c, e, f); AfterDraw(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hk_DPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, const void* v, UINT s)
-{ TraceDraw(true); PreDraw(d); HRESULT hr = o_DPUP(d, t, a, v, s); AfterDraw(d); return hr; }
+{ if (g_promptCensusOn) PromptCensusDraw(d, v, s, t == D3DPT_TRIANGLELIST ? a * 3 : a + 2); TraceDraw(true); PreDraw(d); HRESULT hr = o_DPUP(d, t, a, v, s); AfterDraw(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hk_DIPUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b, UINT c, const void* i, D3DFORMAT fm, const void* v, UINT s)
-{ TraceDraw(true); PreDraw(d); HRESULT hr = o_DIPUP(d, t, a, b, c, i, fm, v, s); AfterDraw(d); return hr; }
+{ if (g_promptCensusOn) PromptCensusDraw(d, (const BYTE*)v + (size_t)a * s, s, b); TraceDraw(true); PreDraw(d); HRESULT hr = o_DIPUP(d, t, a, b, c, i, fm, v, s); AfterDraw(d); return hr; }
 static HRESULT STDMETHODCALLTYPE hk_SetPS(IDirect3DDevice9* d, IDirect3DPixelShader9* ps)
 {
     if (g_inPostFX) return o_SetPS(d, ps);       // our own passes: leave the game's bookkeeping alone
@@ -5416,6 +5418,12 @@ static std::unordered_map<IDirect3DTexture9*, int> g_btnXbox;     // game textur
 static IDirect3DTexture9* g_btnPs[kBtnN] = {};                    // the game's PS art for each icon
 static IDirect3DTexture9* g_btnRepl[kBtnN] = {};                  // built replacement (default pool)
 static bool g_btnFailed[kBtnN] = {};
+static const int kBtnAllN = sizeof kBtnAll / sizeof kBtnAll[0];
+static std::unordered_map<IDirect3DTexture9*, int> g_btnAllTex;  // any UI_ButtonIcons texture -> kBtnAll (census only, not AddRef'd)
+static IDirect3DBaseTexture9* g_stage0Orig = nullptr;             // what the game bound at stage 0 (before our swap)
+static volatile bool g_promptCensusArm = false;
+static DWORD g_promptCensusDelay = 0;
+static int g_promptCensusLines = 0;
 static volatile bool g_btnAny = false;
 static IDirect3DPixelShader9* g_btnPS = nullptr;
 static IDirect3DVertexShader9* g_btnVS = nullptr;
@@ -5458,6 +5466,7 @@ static HRESULT STDMETHODCALLTYPE hk_TexUnlock(IDirect3DTexture9* t, UINT lvl)
                 if (kBtnIcons[i].xbox == h && !g_btnXbox.count(t)) { t->AddRef(); g_btnXbox[t] = i; hits++; }
                 if (kBtnIcons[i].ps == h && g_btnPs[i] != t) { t->AddRef(); if (g_btnPs[i]) g_btnPs[i]->Release(); g_btnPs[i] = t; hits++; }
             }
+            for (int i = 0; i < kBtnAllN; i++) if (kBtnAll[i].hash == h) { g_btnAllTex[t] = i; break; }
             if (hits) g_btnAny = true;
             ReleaseSRWLockExclusive(&g_btnLock);
             static int logged = 0;
@@ -5527,7 +5536,7 @@ static void BtnBuild(IDirect3DDevice9* dev)
         for (auto& kv : g_btnXbox) if (kv.second == i) { xt = kv.first; break; }
         D3DSURFACE_DESC xd;
         if (!xt || FAILED(xt->GetLevelDesc(0, &xd))) { g_btnFailed[i] = true; continue; }
-        const UINT W = xd.Width * 2, H = xd.Height * 2;          // a little extra resolution for the PS art
+        const UINT W = xd.Width, H = xd.Height;   // same size as the game's texture: the UI's texel coordinates follow it (2x showed only the top-left)
         IDirect3DTexture9* rt = nullptr; IDirect3DSurface9* s = nullptr;
         if (FAILED(dev->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &rt, nullptr)) ||
             FAILED(rt->GetSurfaceLevel(0, &s))) { if (rt) rt->Release(); g_btnFailed[i] = true; continue; }
@@ -5544,6 +5553,7 @@ static void BtnBuild(IDirect3DDevice9* dev)
         s->Release();
         g_btnRepl[i] = rt;
         built++;
+        Log("buttons: %s -> PlayStation art, %ux%u, placed at %.0f,%.0f %.0fx%.0f", ic.name, W, H, ic.dst[0] * W, ic.dst[1] * H, ic.dst[2] * W, ic.dst[3] * H);
     }
     dev->SetTexture(0, nullptr);
     dev->SetRenderTarget(0, oldRT);
@@ -5558,6 +5568,7 @@ static void BtnBuild(IDirect3DDevice9* dev)
 }
 static HRESULT STDMETHODCALLTYPE hk_SetTexture(IDirect3DDevice9* d, DWORD st, IDirect3DBaseTexture9* t)
 {
+    if (st == 0 && !g_inPostFX) g_stage0Orig = t;
     if (g_btnAny && t && !g_inPostFX && PadIconsPS()) {
         AcquireSRWLockShared(&g_btnLock);
         auto it = g_btnXbox.find((IDirect3DTexture9*)t);
@@ -5570,6 +5581,36 @@ static HRESULT STDMETHODCALLTYPE hk_SetTexture(IDirect3DDevice9* d, DWORD st, ID
         if (plain != g_stagePlain[st]) { g_stagePlain[st] = plain; ApplyFilter(d, st); }
     }
     return hr;
+}
+// Prompt census (Diagnostics): for one frame, every draw that uses one of UI_ButtonIcons' textures at stage 0 -
+// texture name, render target, viewport and the first vertices (UE3 canvas: float4 pos, float2 uv, ...), so the
+// keyboard prompts' layout (blank PC icon + key name text?) can be worked out from the user's log.
+static void PromptCensusDraw(IDirect3DDevice9* d, const void* v, UINT stride, UINT verts)
+{
+    if (g_inPostFX || !g_stage0Orig || g_promptCensusLines > 200) return;
+    int idx = -1;
+    AcquireSRWLockShared(&g_btnLock);
+    auto it = g_btnAllTex.find((IDirect3DTexture9*)g_stage0Orig);
+    if (it != g_btnAllTex.end()) idx = it->second;
+    ReleaseSRWLockShared(&g_btnLock);
+    if (idx < 0) return;
+    const BtnTex& bt = kBtnAll[idx];
+    int same = 0;
+    for (int i = 0; i < kBtnAllN; i++) same += kBtnAll[i].hash == bt.hash && i != idx;
+    D3DVIEWPORT9 vp = {}; d->GetViewport(&vp);
+    char line[640]; int n = snprintf(line, sizeof line, "census: prompt %s%s (%ux%u, art %u,%u-%u,%u) RT %s vp %lu,%lu %lux%lu stride %u verts %u",
+        bt.name, same ? " (or same-looking)" : "", bt.w, bt.h, bt.bx0, bt.by0, bt.bx1, bt.by1, g_curRT == g_bbPtr ? "backbuffer" : "other",
+        vp.X, vp.Y, vp.Width, vp.Height, stride, verts);
+    if (v && stride >= 24 && stride <= 64) {
+        const UINT nf = std::min<UINT>(stride / 4, 8);
+        for (UINT k = 0; k < std::min<UINT>(verts, 6) && n < (int)sizeof line - 80; k++) {
+            const float* f = (const float*)((const BYTE*)v + (size_t)k * stride);
+            n += snprintf(line + n, sizeof line - n, " |");
+            for (UINT j = 0; j < nf && n < (int)sizeof line - 16; j++) n += snprintf(line + n, sizeof line - n, " %.4g", f[j]);
+        }
+    }
+    Log("%s", line);
+    g_promptCensusLines++;
 }
 static HRESULT STDMETHODCALLTYPE hk_SetSamplerState(IDirect3DDevice9* d, DWORD st, D3DSAMPLERSTATETYPE ty, DWORD v)
 {
@@ -5618,6 +5659,9 @@ static void TraceFrameBoundary(IDirect3DDevice9* dev)
     g_frameNo++;
     if (g_censusOn) { g_censusOn = false; CensusDump(); }
     if (g_censusArm) { g_censusArm = false; g_census.clear(); g_censusOn = true; }
+    if (g_promptCensusOn) { g_promptCensusOn = false; Log("census: prompt census done (%d draws, %d prompt textures known)", g_promptCensusLines, (int)g_btnAllTex.size()); }
+    if (g_promptCensusDelay && (int)(GetTickCount() - g_promptCensusDelay) >= 0) { g_promptCensusDelay = 0; g_promptCensusArm = true; }
+    if (g_promptCensusArm) { g_promptCensusArm = false; g_promptCensusLines = 0; g_promptCensusOn = true; }
     const bool key = (GetAsyncKeyState(cfg.toggleKey) & 0x8000) && (GetAsyncKeyState(VK_CONTROL) & 0x8000);
     const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     bool down = key && !shift, capDown = key && shift;
@@ -6456,7 +6500,7 @@ static void DrawMenu()
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 34, 0), ImGuiCond_FirstUseEver);
     bool open = true;
-    ImGui::Begin("APRenewal 0.24.1", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("APRenewal 0.24.2", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
 
     if (ImGui::BeginTabBar("tabs")) {
         if (ImGui::BeginTabItem("Video")) {
@@ -6879,6 +6923,7 @@ static void DrawMenu()
                 ImGui::TextDisabled("Used for APRenewal's own shaders: %s.", g_compilerUsed == 1 ? "d3dcompiler_47" : g_compilerUsed == 2 ? "the game's D3DX" : "none compiled yet");
             }
             if (ImGui::Button("Shader census (one frame)")) { g_censusArm = true; MenuNote("Shader list written to the log (census:)."); }
+            if (ImGui::Button("Prompt census (one frame, in 3 s)")) { g_promptCensusDelay = GetTickCount() + 3000; MenuNote("Close the menu - in 3 s the button prompts on screen are written to the log (census: prompt)."); }
             ImGui::SameLine();
             if (ImGui::Button("Trace one frame")) { g_traceArmed = true; g_wantCapture = false; MenuNote("Frame trace written to the log."); }
             ImGui::SameLine();
@@ -7323,7 +7368,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
         PathJoin(p, g_dir, "APRenewal\\APRenewal.log");
         g_log = fopen(p, "w");
 
-        Log("APRenewal 0.24.1 loaded. dir=%s", g_dir);
+        Log("APRenewal 0.24.2 loaded. dir=%s", g_dir);
         Log("config: chain='%s' borderless=%d vsync=%d fps=%d shLog=%d shDump=%d shOverride=%d",
             cfg.chain, cfg.borderless, cfg.vsync, cfg.fpsLimit, cfg.shLog, cfg.shDump, cfg.shOverride);
         DetectCompat();

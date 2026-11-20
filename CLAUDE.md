@@ -193,12 +193,16 @@ AO → SSS (2 passes) → SSR → light shafts → grade → SMAA/FXAA → TAA �
 - Presets (ApplyPreset): Performance / Balanced / Quality (= defaults) / Ultra over the heavy effects.
 - PS prompts: UI_ButtonIcons.upk ships PS3 art (Callouts.callout_{bottom,left,right}_btn, Callouts.top_btn,
   L1/L2/R1/R2/L3/R3, sticks, dpad, start/select; pda_optn_*) next to the Xbox art the PC build uses
-  (Generic.gp_*, PDA.gp_pda_*, gp_csa_*). Xbox gamepad icons draw only their top-left ~43/64 (XL/YL markup).
+  (Generic.gp_*, PDA.gp_pda_*, gp_csa_*). Xbox gamepad art fills only the top-left ~43/64 of its 64² texture.
   `tools/re/buttonicons.py <UI_ButtonIcons.upk>` → src/buttonicons.h (FNV-1a of mip 0 as uploaded, PS art
   placement). Texture vtable LockRect 19 / UnlockRect 20 hooked (BtnInstall, dummy DXT5 texture): DXT5 ≤ 64²
-  level-0 uploads hashed at unlock; matches AddRef'd. BtnBuild (Present) draws a 2x-size A8R8G8B8 copy with
-  the PS art in the Xbox art's box; hk_SetTexture swaps while PadIconsPS() (Sony input most recent, ties
+  level-0 uploads hashed at unlock; matches AddRef'd. BtnBuild (Present) draws a SAME-size A8R8G8B8 copy with
+  the PS art in the Xbox art's box (2x size showed only the top-left: the UI's UVs follow the D3D texture size); hk_SetTexture swaps while PadIconsPS() (Sony input most recent, ties
   within 500 ms to Sony, [Controller] ButtonIcons 0/1/2). Replacements released on Reset.
+- Prompt census (Diagnostics, 3 s delay): logs every draw with a UI_ButtonIcons texture at stage 0 (kBtnAll =
+  all DXT5 textures of the package, hash → name; blank ones share a hash), RT, viewport, first vertices. Pending:
+  the user's KBM log, to see whether the blank PC icons (csa_*, PDA.pda_*) are drawn behind the key-name text
+  (→ fill them with keycap art).
 - Shadow filter / contact noise rotates per frame (apTM.z) so TAA averages it; contact hits need
   df > 1 + 0.4 % of depth (dotted self-shadow patches near the camera).
 

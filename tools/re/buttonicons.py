@@ -54,6 +54,7 @@ def dxt5_image(w, h, data):
 
 p = Pkg(sys.argv[1]); d = p.d
 tex = {}
+allt = []
 for i, e in enumerate(p.exports):
     b = d[e['off']:e['off'] + e['size']]
     try:
@@ -62,6 +63,7 @@ for i, e in enumerate(p.exports):
         w, h, data = mip0(b, o)
         bb = dxt5_image(w, h, data).getchannel('A').point(lambda a: 255 if a > 20 else 0).getbbox() or (0, 0, w, h)
         tex[full(p, i)] = (fnv(data[:w * h]), w, h, bb)
+        allt.append((fnv(data[:w * h]), w, h, bb, full(p, i)))
     except Exception:
         pass
 PS = {'bottom': 'Callouts.callout_bottom_btn', 'left': 'Callouts.callout_left_btn', 'right': 'Callouts.callout_right_btn',
@@ -91,4 +93,10 @@ for n in sorted(tex):
     fx, fy = xb[0] + (dw - fw) / 2, xb[1] + (dh - fh) / 2
     dst = (fx / xw, fy / xhh, fw / xw, fh / xhh); src = (pb[0] / pw, pb[1] / phh, sw / pw, sh / phh)
     print('    { 0x%08xu, 0x%08xu, { %.4ff, %.4ff, %.4ff, %.4ff }, { %.4ff, %.4ff, %.4ff, %.4ff }, "%s" },' % ((xh, ph) + dst + src + (n,)))
+print('};')
+print('// every DXT5 texture in the package (hash, size, content box in texels, name) - for the prompt census')
+print('struct BtnTex { uint32_t hash; unsigned short w, h, bx0, by0, bx1, by1; const char* name; };')
+print('static const BtnTex kBtnAll[] = {')
+for hh, w, h, bb, n in sorted(allt, key=lambda t: t[4]):
+    print('    { 0x%08xu, %d, %d, %d, %d, %d, %d, "%s" },' % (hh, w, h, bb[0], bb[1], bb[2], bb[3], n))
 print('};')
